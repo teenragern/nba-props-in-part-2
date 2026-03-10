@@ -132,6 +132,37 @@ CREATE TABLE IF NOT EXISTS line_history (
 
 CREATE TABLE IF NOT EXISTS bookmaker_profiles (
     bookmaker TEXT PRIMARY KEY,
-    role TEXT, 
+    role TEXT,
     historical_clv_score REAL DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS referee_stats (
+    referee_name TEXT PRIMARY KEY,
+    avg_pace REAL DEFAULT 99.0,
+    avg_pfd_per_game REAL DEFAULT 0.0,
+    games_tracked INTEGER DEFAULT 0,
+    last_updated DATE
+);
+
+CREATE TABLE IF NOT EXISTS sgp_correlations (
+    player_name TEXT,
+    market_a TEXT,
+    market_b TEXT,
+    correlation REAL,
+    sample_size INTEGER,
+    last_updated DATE,
+    PRIMARY KEY (player_name, market_a, market_b)
+);
+
+CREATE TABLE IF NOT EXISTS team_opponent_stats (
+    team_name TEXT,
+    season TEXT,
+    opp_pts_pg REAL,
+    opp_reb_pg REAL,
+    opp_ast_pg REAL,
+    opp_fg3m_pg REAL,
+    pace REAL,
+    def_rating REAL,
+    last_updated DATE,
+    PRIMARY KEY (team_name, season)
 );
