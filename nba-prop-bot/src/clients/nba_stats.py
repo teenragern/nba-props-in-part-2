@@ -130,7 +130,7 @@ class NbaStatsClient:
         stats = leaguedashteamstats.LeagueDashTeamStats(
             season=self.season,
             measure_type_detailed_defense='Opponent',
-            per_mode_simple='PerGame'
+            per_mode_detailed='PerGame'
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
@@ -232,7 +232,7 @@ class NbaStatsClient:
 
     def is_home_team(self, player_team_abbr: str, home_team_full: str) -> bool:
         """Return True if the player's team is the home team in this event."""
-        if not player_team_abbr:
+        if not isinstance(player_team_abbr, str) or not player_team_abbr:
             return False
         player_full = _ABBR_TO_FULL.get(player_team_abbr.lower(), '')
         return player_full == home_team_full.lower()

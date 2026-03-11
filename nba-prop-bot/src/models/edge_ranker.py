@@ -33,7 +33,7 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         implied_prob = c.get('implied_prob', 0)
         odds         = c.get('odds',        0)
         proj_mins    = c.get('projected_minutes', 0)
-        status       = c.get('injury_status', 'healthy').lower()
+        status       = (c.get('injury_status') or 'healthy').lower()
         market       = c.get('market', '')
         mean         = c.get('mean',   0)
         line         = c.get('line',   0)

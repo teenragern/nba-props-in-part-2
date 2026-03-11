@@ -30,6 +30,7 @@ from src.models.devig import decimal_to_implied_prob, devig_two_way
 from src.models.edge_ranker import rank_edges, set_db as set_ranker_db
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert
+from src.pipelines.combos import generate_and_alert_combos
 
 logger = get_logger(__name__)
 _PROJECTIONS_CACHE: Dict[str, Any] = {}
@@ -188,9 +189,9 @@ def scan_props():
                     )
                     inj_row = cursor.fetchone()
                     if inj_row:
-                        injury_status = inj_row['status']
+                        injury_status = inj_row['status'] or 'Unknown'
 
-            if "out" in injury_status.lower():
+            if "out" in (injury_status or 'healthy').lower():
                 continue
 
             # ---- fetch / cache player game logs ----
@@ -326,6 +327,9 @@ def scan_props():
             f"@ {edge['book']} ({edge['odds']}) edge={edge['edge']:.2%}"
         )
         evaluate_and_alert(edge, db, bot)
+
+    # Multi-leg combo alerts (2–4 legs)
+    generate_and_alert_combos(actionable, bot)
 
 
 if __name__ == "__main__":

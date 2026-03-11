@@ -19,6 +19,10 @@ DB_PATH = os.getenv("DB_PATH", "props.db")
 BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 
+# Scheduler credit-conservation settings
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "90"))
+QUOTA_FLOOR = int(os.getenv("QUOTA_FLOOR", "30"))
+
 PROP_MARKETS = [
     "player_points",
     "player_rebounds",
