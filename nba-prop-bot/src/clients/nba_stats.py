@@ -272,6 +272,22 @@ class NbaStatsClient:
     #  Existing helpers                                                    #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def resolve_player_id(player_name: str) -> Optional[int]:
+        """
+        Return the NBA Stats player ID for a player name using the static
+        players lookup (no API call, no rate limiting needed).
+        Returns None if the name cannot be resolved.
+        """
+        try:
+            from nba_api.stats.static import players as _static_players
+            matches = _static_players.find_players_by_full_name(player_name)
+            if matches:
+                return int(matches[0]['id'])
+        except Exception:
+            pass
+        return None
+
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def get_player_info(self, player_id: int) -> Dict[str, Any]:
         info = commonplayerinfo.CommonPlayerInfo(player_id=player_id)

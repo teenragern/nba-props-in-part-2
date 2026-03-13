@@ -1,6 +1,6 @@
 import requests
 from typing import List, Dict, Any
-from src.config import ODDS_API_KEY, ODDS_REGION, BOOKMAKERS
+from src.config import ODDS_API_KEY, ODDS_REGION, BOOKMAKERS, SHARP_BOOKS
 from src.utils.retry import retry_with_backoff
 from src.utils.logging_utils import get_logger
 
@@ -43,7 +43,7 @@ class OddsApiClient:
             "apiKey": self.api_key,
             "regions": ODDS_REGION,
             "markets": ",".join(markets),
-            "bookmakers": ",".join(BOOKMAKERS) if BOOKMAKERS else None,
+            "bookmakers": ",".join(list(dict.fromkeys(BOOKMAKERS + SHARP_BOOKS))) or None,
             "oddsFormat": "decimal"
         }
         params = {k: v for k, v in params.items() if v is not None}

@@ -154,6 +154,21 @@ CREATE TABLE IF NOT EXISTS sgp_correlations (
     PRIMARY KEY (player_name, market_a, market_b)
 );
 
+CREATE TABLE IF NOT EXISTS on_off_splits (
+    player_id        INTEGER NOT NULL,
+    absent_player_id INTEGER NOT NULL,
+    season           TEXT    NOT NULL,
+    market           TEXT    NOT NULL,
+    games_processed  INTEGER NOT NULL DEFAULT 0,
+    minutes_with     REAL    NOT NULL DEFAULT 0.0,
+    minutes_without  REAL    NOT NULL DEFAULT 0.0,
+    rate_with        REAL    NOT NULL DEFAULT 0.0,
+    rate_without     REAL    NOT NULL DEFAULT 0.0,
+    usage_multiplier REAL,
+    last_updated     TEXT    NOT NULL,
+    PRIMARY KEY (player_id, absent_player_id, season, market)
+);
+
 CREATE TABLE IF NOT EXISTS team_opponent_stats (
     team_name TEXT,
     season TEXT,

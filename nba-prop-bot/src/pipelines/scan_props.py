@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 import dateutil.parser
 from dateutil import tz
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 from src.utils.logging_utils import get_logger
 from src.data.db import DatabaseClient
@@ -23,7 +23,7 @@ from src.clients.odds_api import OddsApiClient
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
-from src.config import PROP_MARKETS, EDGE_MIN
+from src.config import PROP_MARKETS, EDGE_MIN, SHARP_BOOKS, REC_BOOKS, SHARP_EDGE_MIN
 from src.models.projections import build_player_projection
 from src.models.distributions import get_probability_distribution
 from src.models.devig import decimal_to_implied_prob, devig_two_way
@@ -31,6 +31,7 @@ from src.models.edge_ranker import rank_edges, set_db as set_ranker_db
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert
 from src.pipelines.combos import generate_and_alert_combos
+from src.clients.on_off_splits import OnOffSplitsClient
 
 logger = get_logger(__name__)
 _PROJECTIONS_CACHE: Dict[str, Any] = {}
@@ -58,6 +59,80 @@ def get_best_odds(bookmakers: List[Dict], player_name: str,
     return best_over, best_under
 
 
+def _american(decimal_odds: float) -> str:
+    """Convert decimal odds to American odds string."""
+    if decimal_odds >= 2.0:
+        return f"+{int((decimal_odds - 1) * 100)}"
+    if decimal_odds <= 1.0:
+        return "N/A"
+    return f"-{int(100 / (decimal_odds - 1))}"
+
+
+def get_sharp_true_prob(
+    bookmakers: List[Dict], player_name: str, market_key: str, line: float
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Find the first sharp-book (e.g. Pinnacle) price for this player/market/line,
+    devig it, and return (true_over_prob, true_under_prob, book_name).
+    Returns (None, None, None) when no sharp book carries this line.
+    """
+    sharp_lower = [b.lower() for b in SHARP_BOOKS]
+    for book in bookmakers:
+        if book.get('title', '').lower() not in sharp_lower:
+            continue
+        over_price = under_price = None
+        for mkt in book.get('markets', []):
+            if mkt.get('key') != market_key:
+                continue
+            for outcome in mkt.get('outcomes', []):
+                if outcome.get('description', '').lower() != player_name.lower():
+                    continue
+                if abs(float(outcome.get('point', 0)) - line) > 0.01:
+                    continue
+                side = outcome.get('name', '').lower()
+                if side == 'over':
+                    over_price = float(outcome['price'])
+                elif side == 'under':
+                    under_price = float(outcome['price'])
+        if over_price and under_price:
+            raw_o = decimal_to_implied_prob(over_price)
+            raw_u = decimal_to_implied_prob(under_price)
+            true_o, true_u = devig_two_way(raw_o, raw_u)
+            return true_o, true_u, book['title']
+    return None, None, None
+
+
+def get_best_rec_price(
+    bookmakers: List[Dict], player_name: str,
+    market_key: str, line: float, side: str
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Return (best_decimal_price, book_name) for side across REC_BOOKS.
+    Returns (None, None) when no rec book carries this line.
+    """
+    rec_lower  = [b.lower() for b in REC_BOOKS]
+    best_price = None
+    best_book  = None
+    for book in bookmakers:
+        if book.get('title', '').lower() not in rec_lower:
+            continue
+        for mkt in book.get('markets', []):
+            if mkt.get('key') != market_key:
+                continue
+            for outcome in mkt.get('outcomes', []):
+                if outcome.get('description', '').lower() != player_name.lower():
+                    continue
+                if abs(float(outcome.get('point', 0)) - line) > 0.01:
+                    continue
+                if outcome.get('name', '').lower() != side.lower():
+                    continue
+                price = float(outcome['price'])
+                if best_price is None or price > best_price:
+                    best_price = price
+                    best_book  = book['title']
+    return best_price, best_book
+
+
 def _sync_injuries(db: DatabaseClient, injury_client: InjuryClient, game_date: str):
     """Priority 1: Fetch and persist today's injury report."""
     injuries = injury_client.get_injuries()
@@ -83,11 +158,12 @@ def _sync_injuries(db: DatabaseClient, injury_client: InjuryClient, game_date: s
 
 def scan_props():
     logger.info("Initializing scan pipeline (P1–P7 active)...")
-    db            = DatabaseClient()
-    odds_client   = OddsApiClient()
-    stats_client  = NbaStatsClient()
-    injury_client = InjuryClient()
-    bot           = TelegramBotClient()
+    db             = DatabaseClient()
+    odds_client    = OddsApiClient()
+    stats_client   = NbaStatsClient()
+    injury_client  = InjuryClient()
+    bot            = TelegramBotClient()
+    on_off_client  = OnOffSplitsClient()
 
     # Priority 7: give edge_ranker access to DB for per-book bias
     set_ranker_db(db)
@@ -168,12 +244,19 @@ def scan_props():
             )
             out_players = [r['player_name'] for r in cursor.fetchall()]
 
-        usage_bump = 0.15 if out_players else 0.0
+        # Resolve absent player IDs once per event for on/off lookup
+        absent_ids: List[int] = []
         if out_players:
-            logger.info(f"{away_team} @ {home_team}: OUT players {out_players}. +15% usage bump applied.")
+            for _nm in out_players:
+                _aid = NbaStatsClient.resolve_player_id(_nm)
+                if _aid:
+                    absent_ids.append(_aid)
+            logger.info(f"{away_team} @ {home_team}: OUT players {out_players}. Exact on/off splits active.")
 
         # Priority 2: fetch pace data for this matchup once per event
         pace_info = stats_client.get_team_pace(home_team, away_team)
+
+        sharp_alerted: set = set()   # dedup sharp alerts within this event scan
 
         for player_name in players_in_event:
             # ---- injury status ----
@@ -236,6 +319,22 @@ def scan_props():
 
                 for line in prices_by_market[mkt][player_name]:
 
+                    # Exact per-market on/off usage shift (replaces flat 15%)
+                    player_id_int = p_data.get("pid")
+                    if absent_ids and player_id_int:
+                        shifts = [
+                            on_off_client.get_usage_multiplier(
+                                target_player_id=int(player_id_int),
+                                absent_player_id=_aid,
+                                market=mkt,
+                                db=db,
+                            ) - 1.0
+                            for _aid in absent_ids
+                        ]
+                        _usage_shift = min(sum(shifts), 0.50)
+                    else:
+                        _usage_shift = 0.0
+
                     proj = build_player_projection(
                         player_id=player_name,
                         market=mkt,
@@ -246,7 +345,7 @@ def scan_props():
                         team_pace=pace_info['home_pace'] if home_flag else pace_info['away_pace'],
                         opp_pace=pace_info['away_pace'] if home_flag else pace_info['home_pace'],
                         opponent_multiplier=opp_multiplier,
-                        usage_shift=usage_bump,
+                        usage_shift=_usage_shift,
                         starter_flag=starter_flag,
                         b2b_flag=b2b_flag,
                         home_flag=home_flag,
@@ -275,7 +374,7 @@ def scan_props():
                     if best_over['price'] > 0 and best_under['price'] > 0:
                         raw_imp_o = decimal_to_implied_prob(best_over['price'])
                         raw_imp_u = decimal_to_implied_prob(best_under['price'])
-                        imp_over, imp_under = devig_two_way(raw_imp_o, raw_imp_u)
+                        imp_over, _ = devig_two_way(raw_imp_o, raw_imp_u)
                     else:
                         imp_over  = decimal_to_implied_prob(best_over['price'])
                         imp_under = decimal_to_implied_prob(best_under['price'])
@@ -303,18 +402,41 @@ def scan_props():
                             **over_metrics,
                         })
 
-                    if best_under['price'] > 0:
-                        under_metrics = db.get_market_metrics(player_name, mkt, line, "UNDER")
-                        candidates.append({
-                            **common,
-                            "side":         "UNDER",
-                            "book":         best_under['book'],
-                            "book_role":    db.get_bookmaker_role(best_under['book']),
-                            "odds":         best_under['price'],
-                            "model_prob":   dists['prob_under'],
-                            "implied_prob": imp_under,
-                            **under_metrics,
-                        })
+                    # Unders intentionally excluded — OVER only strategy
+
+                    # ── Top-down sharp vs rec comparison ─────────────────
+                    true_o, true_u, sharp_book = get_sharp_true_prob(
+                        bookmakers, player_name, mkt, line)
+
+                    if true_o is not None:
+                        mkt_label = mkt.replace('player_', '').replace('_', ' ').title()
+                        for chk_side, true_prob in (('Over', true_o),):
+                            rec_price, rec_book = get_best_rec_price(
+                                bookmakers, player_name, mkt, line, chk_side)
+                            if rec_price is None:
+                                continue
+                            rec_implied = decimal_to_implied_prob(rec_price)
+                            sharp_gap   = true_prob - rec_implied
+                            if sharp_gap < SHARP_EDGE_MIN:
+                                continue
+                            dedup_key = (player_name, mkt, line, chk_side)
+                            if dedup_key in sharp_alerted:
+                                continue
+                            sharp_alerted.add(dedup_key)
+                            msg = (
+                                f"🔪 <b>Sharp Alert: {player_name} "
+                                f"{chk_side} {line} {mkt_label}</b>\n\n"
+                                f"{sharp_book.title()} True: {true_prob:.1%}"
+                                f" → {rec_book.title()}: {rec_implied:.1%}\n"
+                                f"Gap: <b>+{sharp_gap:.1%}</b>"
+                                f" | {rec_book.title()} {_american(rec_price)}"
+                            )
+                            bot.send_message(msg)
+                            logger.info(
+                                f"Sharp alert: {player_name} {chk_side} {line} {mkt} "
+                                f"{sharp_book} {true_prob:.1%} vs "
+                                f"{rec_book} {rec_implied:.1%} gap={sharp_gap:.1%}"
+                            )
 
     ranked_edges = rank_edges(candidates)
     actionable   = [e for e in ranked_edges if e.get('edge', 0) >= EDGE_MIN]

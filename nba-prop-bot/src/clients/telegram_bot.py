@@ -25,5 +25,9 @@ class TelegramBotClient:
             "parse_mode": parse_mode
         }
         
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json().get("ok", False)
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            return response.json().get("ok", False)
+        except requests.exceptions.Timeout:
+            logger.warning("Telegram send_message timed out — skipping.")
+            return False

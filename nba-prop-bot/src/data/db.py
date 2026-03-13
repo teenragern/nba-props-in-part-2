@@ -294,6 +294,42 @@ class DatabaseClient:
             row = cursor.fetchone()
             return dict(row) if row else {}
 
+    def get_on_off_split(self, player_id: int, absent_player_id: int,
+                         market: str, season: str):
+        """Return cached on/off split row dict, or None if not yet computed."""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM on_off_splits
+                WHERE player_id = ? AND absent_player_id = ?
+                  AND market = ? AND season = ?
+                """,
+                (player_id, absent_player_id, market, season)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def upsert_on_off_split(self, player_id: int, absent_player_id: int,
+                             market: str, season: str,
+                             games_processed: int, minutes_with: float,
+                             minutes_without: float, rate_with: float,
+                             rate_without: float, usage_multiplier: float):
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO on_off_splits
+                    (player_id, absent_player_id, season, market,
+                     games_processed, minutes_with, minutes_without,
+                     rate_with, rate_without, usage_multiplier, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, date('now'))
+                """,
+                (player_id, absent_player_id, season, market,
+                 games_processed, minutes_with, minutes_without,
+                 rate_with, rate_without, usage_multiplier)
+            )
+
     def upsert_sgp_correlation(self, player_name: str, market_a: str,
                                 market_b: str, correlation: float, sample_size: int):
         with self.get_conn() as conn:
