@@ -38,7 +38,8 @@ def get_rest_days_factor(rest_days: int, b2b_flag: bool) -> float:
 
 def estimate_projected_minutes(recent_logs: pd.DataFrame, season_logs: pd.DataFrame,
                                 injury_status: str, starter_flag: bool = False,
-                                b2b_flag: bool = False, spread_magnitude: float = 0.0) -> float:
+                                b2b_flag: bool = False, spread_magnitude: float = 0.0,
+                                out_player_avg_mins: float = 0.0) -> float:
     if recent_logs.empty and season_logs.empty:
         return 0.0
 
@@ -50,10 +51,27 @@ def estimate_projected_minutes(recent_logs: pd.DataFrame, season_logs: pd.DataFr
     if pd.isna(recent_10_mins): recent_10_mins = season_mins
     if pd.isna(season_mins):    season_mins    = recent_5_mins
 
-    # Regression-style weighted estimator (50/30/20)
-    base_mins = (0.50 * recent_5_mins) + (0.30 * recent_10_mins) + (0.20 * season_mins)
+    # Trend detection: sharp upward trend signals a role change in progress
+    mins_trend = recent_5_mins - recent_10_mins
+    if mins_trend > 4.0:
+        # Weight heavily toward recent games (rotation expanding)
+        base_mins = (0.70 * recent_5_mins) + (0.20 * recent_10_mins) + (0.10 * season_mins)
+    else:
+        base_mins = (0.50 * recent_5_mins) + (0.30 * recent_10_mins) + (0.20 * season_mins)
 
-    if starter_flag:         base_mins += 3.0
+    # Rotation-aware minutes boost
+    if starter_flag:
+        if out_player_avg_mins > base_mins + 5.0:
+            # Player is being thrust into a bigger role than their average suggests.
+            # Primary backup absorbs ~55% of the missing starter's opportunity.
+            base_mins = 0.45 * base_mins + 0.55 * out_player_avg_mins
+        else:
+            # Regular starter or minor role change: flat boost
+            base_mins += 3.0
+    elif out_player_avg_mins > 0:
+        # Non-starter picks up overflow minutes
+        base_mins += out_player_avg_mins * 0.15
+
     if b2b_flag:             base_mins -= 1.5
     if spread_magnitude > 15.0: base_mins -= 2.0
 
@@ -96,12 +114,20 @@ def build_player_projection(player_id: str, market: str, line: float,
                              spread_magnitude: float = 0.0,
                              prior_weight: float = 15.0,
                              home_flag: bool = False,
-                             rest_days: int = 2) -> Dict[str, Any]:
-
-    proj_mins = estimate_projected_minutes(
-        recent_logs, season_logs, injury_status,
-        starter_flag, b2b_flag, spread_magnitude
-    )
+                             rest_days: int = 2,
+                             out_player_avg_mins: float = 0.0,
+                             projected_minutes_override: float = 0.0) -> Dict[str, Any]:
+    """
+    projected_minutes_override: when > 0, skips estimate_projected_minutes entirely
+    and uses this value directly (e.g. from the RotationModel's slot-based projection).
+    """
+    if projected_minutes_override > 0:
+        proj_mins = projected_minutes_override
+    else:
+        proj_mins = estimate_projected_minutes(
+            recent_logs, season_logs, injury_status,
+            starter_flag, b2b_flag, spread_magnitude, out_player_avg_mins
+        )
 
     if proj_mins <= 0:
         return {

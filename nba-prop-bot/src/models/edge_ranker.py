@@ -82,6 +82,19 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if book_role == 'sharp':
             edge *= 1.10  # validated by sharp line
 
+        # Consensus confirmation / contradiction
+        consensus_prob = c.get('consensus_prob')
+        if consensus_prob is not None and edge > 0:
+            # consensus_prob = true P(over); derive consensus edge for this side
+            if side.upper() == 'OVER':
+                consensus_edge = consensus_prob - implied_prob
+            else:
+                consensus_edge = (1.0 - consensus_prob) - implied_prob
+            if consensus_edge > 0.02:
+                edge *= 1.15   # consensus confirms — more confident
+            elif consensus_edge < -0.02:
+                edge *= 0.80   # consensus contradicts — reduce confidence
+
         # Priority 7: Per-book/market bias correction from historical results
         factor = get_market_feedback_factor(market, book)
         edge  *= factor

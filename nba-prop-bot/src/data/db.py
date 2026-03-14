@@ -1,8 +1,17 @@
 import sqlite3
 import os
 from contextlib import contextmanager
+from typing import Dict, Optional
 from src.config import DB_PATH
 from src.utils.logging_utils import get_logger
+
+# Default accuracy weights for consensus sharp books.
+# Based on industry research; overridden by DB once >= 20 samples accumulate.
+_SHARP_DEFAULT_WEIGHTS: Dict[str, float] = {
+    'pinnacle': 1.00,
+    'circa':    0.90,
+    'bookmaker': 0.82,
+}
 
 logger = get_logger(__name__)
 
@@ -139,23 +148,29 @@ class DatabaseClient:
             )
 
     def init_bookmaker_profiles(self):
+        # (bookmaker, role, default_clv_score)
+        # Non-zero default CLV seeds the weighting system for sharp books.
+        # INSERT OR IGNORE preserves any historically accumulated scores.
         profiles = [
-            ("pinnacle", "sharp"),
-            ("circa", "sharp"),
-            ("draftkings", "rec"),
-            ("fanduel", "rec"),
-            ("betmgm", "rec"),
-            ("caesars", "rec"),
-            ("bovada", "rec"),
-            ("betrivers", "rec"),
-            ("pointsbetus", "rec"),
+            ("pinnacle",    "sharp", _SHARP_DEFAULT_WEIGHTS['pinnacle']),
+            ("circa",       "sharp", _SHARP_DEFAULT_WEIGHTS['circa']),
+            ("bookmaker",   "sharp", _SHARP_DEFAULT_WEIGHTS['bookmaker']),
+            ("draftkings",  "rec",   0.0),
+            ("fanduel",     "rec",   0.0),
+            ("betmgm",      "rec",   0.0),
+            ("caesars",     "rec",   0.0),
+            ("bovada",      "rec",   0.0),
+            ("betrivers",   "rec",   0.0),
+            ("pointsbetus", "rec",   0.0),
         ]
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            for book, role in profiles:
+            for book, role, default_clv in profiles:
                 cursor.execute(
-                    "INSERT OR IGNORE INTO bookmaker_profiles (bookmaker, role) VALUES (?, ?)",
-                    (book, role)
+                    """INSERT OR IGNORE INTO bookmaker_profiles
+                           (bookmaker, role, historical_clv_score)
+                       VALUES (?, ?, ?)""",
+                    (book, role, default_clv)
                 )
 
     def get_bookmaker_role(self, bookmaker: str) -> str:
@@ -330,6 +345,57 @@ class DatabaseClient:
                  rate_with, rate_without, usage_multiplier)
             )
 
+    def get_rotation_slots(self, team_abbr: str, season: str) -> dict:
+        """
+        Return cached rotation slot matrix for a team, or {} if stale/missing.
+        Format: {player_id (int): {slot_key (str): probability (float)}}.
+        """
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT player_id, slot_key, slot_probability, last_updated "
+                "FROM rotation_slots WHERE team_abbr=? AND season=?",
+                (team_abbr, season)
+            )
+            rows = cursor.fetchall()
+        if not rows:
+            return {}
+        if rows[0]['last_updated'] != today:
+            return {}  # stale — caller will rebuild
+        result: dict = {}
+        for row in rows:
+            pid = int(row['player_id'])
+            if pid not in result:
+                result[pid] = {}
+            result[pid][row['slot_key']] = float(row['slot_probability'])
+        return result
+
+    def upsert_rotation_slots(self, team_abbr: str,
+                               team_slots: dict, games_processed: int,
+                               season: str, last_updated: str):
+        """Persist a full team rotation slot matrix to the DB."""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            # Remove stale rows for this team/season first
+            cursor.execute(
+                "DELETE FROM rotation_slots WHERE team_abbr=? AND season=?",
+                (team_abbr, season)
+            )
+            for player_id, slots in team_slots.items():
+                for slot_key, prob in slots.items():
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO rotation_slots
+                            (team_abbr, player_id, season, slot_key,
+                             slot_probability, games_processed, last_updated)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (team_abbr, int(player_id), season, slot_key,
+                         float(prob), games_processed, last_updated)
+                    )
+
     def upsert_sgp_correlation(self, player_name: str, market_a: str,
                                 market_b: str, correlation: float, sample_size: int):
         with self.get_conn() as conn:
@@ -342,3 +408,101 @@ class DatabaseClient:
                 """,
                 (player_name, market_a, market_b, correlation, sample_size)
             )
+
+    def get_sharp_book_weights(self) -> Dict[str, float]:
+        """
+        Return {bookmaker_lower: weight} for all sharp-role books.
+
+        Uses DB historical_clv_score when the book has accumulated meaningful
+        data (score > 0.10); otherwise falls back to _SHARP_DEFAULT_WEIGHTS.
+        Weights are normalized so the highest-weight book = 1.0.
+        """
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT bookmaker, historical_clv_score "
+                    "FROM bookmaker_profiles WHERE role = 'sharp'"
+                )
+                rows = cursor.fetchall()
+
+            if not rows:
+                return dict(_SHARP_DEFAULT_WEIGHTS)
+
+            weights: Dict[str, float] = {}
+            for row in rows:
+                book = str(row['bookmaker']).lower()
+                score = float(row['historical_clv_score'] or 0.0)
+                weights[book] = score if score > 0.10 else _SHARP_DEFAULT_WEIGHTS.get(book, 0.75)
+
+            # Normalize: max weight → 1.0
+            max_w = max(weights.values()) if weights else 1.0
+            if max_w > 0:
+                return {k: v / max_w for k, v in weights.items()}
+            return dict(_SHARP_DEFAULT_WEIGHTS)
+        except Exception:
+            return dict(_SHARP_DEFAULT_WEIGHTS)
+
+    def update_sharp_book_clv_score(self, book: str, brier_delta: float) -> None:
+        """
+        Update a sharp book's accuracy score via exponential moving average.
+
+        Call this after prop results settle.  `brier_delta` should be positive
+        when the book was well-calibrated and negative when it was off.
+        A slow EMA (α = 0.05) ensures the score adapts over many samples.
+        Score is clamped to [0.10, 2.00] to avoid extreme values.
+        """
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT historical_clv_score FROM bookmaker_profiles "
+                    "WHERE bookmaker = ? COLLATE NOCASE",
+                    (book,)
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return
+                current = float(row['historical_clv_score'] or 0.0)
+                if current <= 0.0:
+                    current = _SHARP_DEFAULT_WEIGHTS.get(book.lower(), 0.75)
+                new_score = max(0.10, min(2.00, current * 0.95 + brier_delta * 0.05))
+                cursor.execute(
+                    "UPDATE bookmaker_profiles SET historical_clv_score = ? "
+                    "WHERE bookmaker = ? COLLATE NOCASE",
+                    (new_score, book)
+                )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  Cross-player SGP correlations                                       #
+    # ------------------------------------------------------------------ #
+
+    def upsert_cross_player_correlation(
+        self, team: str, player_a: str, player_b: str,
+        market_a: str, market_b: str, correlation: float, n_games: int,
+    ) -> None:
+        with self.get_conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO cross_player_correlations
+                   (team, player_a, player_b, market_a, market_b,
+                    correlation, n_games, computed_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, date('now'))""",
+                (team, player_a, player_b, market_a, market_b, correlation, n_games),
+            )
+
+    def get_cross_player_correlation(
+        self, team: str, player_a: str, player_b: str,
+        market_a: str, market_b: str,
+    ) -> Optional[float]:
+        """Return cached correlation if computed within the last 7 days, else None."""
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """SELECT correlation FROM cross_player_correlations
+                   WHERE team = ? AND player_a = ? AND player_b = ?
+                   AND market_a = ? AND market_b = ?
+                   AND computed_date >= date('now', '-7 days')""",
+                (team, player_a, player_b, market_a, market_b),
+            ).fetchone()
+        return float(row['correlation']) if row else None

@@ -35,9 +35,9 @@ from src.pipelines.market_stats import analyze_market_stats
 from src.pipelines.steam import check_steam
 from src.pipelines.exposure import check_exposure
 from src.pipelines.timing_analysis import analyze_timing
-from src.clients.news_monitor import BreakingNewsMonitor
+from src.clients.twitter_monitor import TwitterNitterMonitor
 from src.pipelines.breaking_news import check_breaking_news
-from src.config import SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, NEWS_POLL_INTERVAL
+from src.config import SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL
 
 logger = get_logger(__name__)
 bot    = TelegramBotClient()
@@ -46,8 +46,8 @@ bot    = TelegramBotClient()
 _odds_client: OddsApiClient = OddsApiClient()
 # Number of NBA games scheduled for today (set by job_sync).
 _today_game_count: int = 0
-# Breaking news monitor — persists across polls to track seen items.
-_news_monitor: BreakingNewsMonitor = BreakingNewsMonitor()
+# Twitter/Nitter monitor — persists across polls to track seen tweet IDs.
+_news_monitor: TwitterNitterMonitor = TwitterNitterMonitor()
 
 ET = tz.gettz('America/New_York')
 
@@ -151,12 +151,12 @@ def job_steam():
 
 
 def job_breaking_news():
-    """Poll RSS feeds every NEWS_POLL_INTERVAL seconds. Trigger immediate scan if news found."""
+    """Poll Nitter/Twitter feeds every TWITTER_POLL_INTERVAL seconds. Trigger scan if news found."""
     if not _has_games():
         return
     found = check_breaking_news(_news_monitor, bot)
     if found and _quota_ok():
-        logger.info("Breaking news → immediate scan triggered.")
+        logger.info("Breaking tweet → immediate scan triggered.")
         notify("Scan [BREAKING]", scan_props)
 
 
@@ -190,7 +190,7 @@ def start_scheduler():
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # ~11 credits each
     schedule.every(120).minutes.do(job_clv)                     # ~11 credits each
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
-    schedule.every(NEWS_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (RSS)
+    schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
 
     # Run sync immediately so _today_game_count is set before first scan.
     job_sync()
@@ -201,6 +201,7 @@ def start_scheduler():
         f"Scheduler live. "
         f"Scan every {SCAN_INTERVAL_MINUTES}min | "
         f"Quota floor: {QUOTA_FLOOR} credits | "
+        f"Twitter poll: every {TWITTER_POLL_INTERVAL}s | "
         f"Active window: 11am–11pm ET on game days only."
     )
 

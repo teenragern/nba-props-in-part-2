@@ -169,6 +169,29 @@ CREATE TABLE IF NOT EXISTS on_off_splits (
     PRIMARY KEY (player_id, absent_player_id, season, market)
 );
 
+CREATE TABLE IF NOT EXISTS rotation_slots (
+    team_abbr        TEXT    NOT NULL,
+    player_id        INTEGER NOT NULL,
+    season           TEXT    NOT NULL,
+    slot_key         TEXT    NOT NULL,  -- "Q1_0" .. "Q4_5" (2-minute buckets)
+    slot_probability REAL    NOT NULL,  -- fraction of games player was on floor in slot
+    games_processed  INTEGER NOT NULL DEFAULT 0,
+    last_updated     TEXT    NOT NULL,
+    PRIMARY KEY (team_abbr, player_id, season, slot_key)
+);
+
+CREATE TABLE IF NOT EXISTS cross_player_correlations (
+    team          TEXT NOT NULL,
+    player_a      TEXT NOT NULL,
+    player_b      TEXT NOT NULL,
+    market_a      TEXT NOT NULL,
+    market_b      TEXT NOT NULL,
+    correlation   REAL NOT NULL,
+    n_games       INTEGER DEFAULT 0,
+    computed_date TEXT NOT NULL,
+    PRIMARY KEY (team, player_a, player_b, market_a, market_b)
+);
+
 CREATE TABLE IF NOT EXISTS team_opponent_stats (
     team_name TEXT,
     season TEXT,

@@ -5,7 +5,7 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, Optional
 from nba_api.stats.endpoints import (
-    playergamelogs, leaguedashteamstats,
+    playergamelogs, leaguedashteamstats, leaguedashplayerstats,
     commonplayerinfo, boxscoretraditionalv2
 )
 from src.utils.retry import retry_with_backoff
@@ -40,7 +40,10 @@ class NbaStatsClient:
         self.season = season
         self.cache_db = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'stats_cache.db')
         self._init_cache()
-        self._opp_stats_cache: Optional[pd.DataFrame] = None  # in-memory for current run
+        self._opp_stats_cache: Optional[pd.DataFrame] = None   # Opponent PerGame
+        self._adv_stats_cache: Optional[pd.DataFrame] = None   # Advanced (PACE, DEF_RATING, DREB_PCT)
+        self._def_stats_cache: Optional[pd.DataFrame] = None   # Defense dashboard (OPP_PTS_PAINT)
+        self._player_season_cache: Optional[pd.DataFrame] = None  # PerGame player stats (PG/big detection)
 
     def _init_cache(self):
         os.makedirs(os.path.dirname(self.cache_db), exist_ok=True)
@@ -54,6 +57,13 @@ class NbaStatsClient:
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS opp_stats_cache (
+                    season TEXT PRIMARY KEY,
+                    date_fetched TEXT,
+                    data_json TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS def_stats_cache (
                     season TEXT PRIMARY KEY,
                     date_fetched TEXT,
                     data_json TEXT
@@ -98,13 +108,116 @@ class NbaStatsClient:
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def get_team_stats(self) -> pd.DataFrame:
+        """Advanced stats: PACE, DEF_RATING, DREB_PCT, NET_RATING, etc."""
+        if self._adv_stats_cache is not None:
+            return self._adv_stats_cache
         logger.info("Fetching team advanced stats (pace, ratings)")
         stats = leaguedashteamstats.LeagueDashTeamStats(
             season=self.season,
             measure_type_detailed_defense='Advanced'
         )
         time.sleep(0.6)
-        return stats.get_data_frames()[0]
+        df = stats.get_data_frames()[0]
+        self._adv_stats_cache = df
+        return df
+
+    @retry_with_backoff(retries=3, backoff_in_seconds=2)
+    def get_team_defense_stats(self) -> pd.DataFrame:
+        """
+        Defense dashboard stats per game: OPP_PTS_PAINT, OPP_PTS_OFF_TOV, etc.
+        Cached in-memory and in SQLite (refreshed daily).
+        """
+        if self._def_stats_cache is not None:
+            return self._def_stats_cache
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        with sqlite3.connect(self.cache_db) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT date_fetched, data_json FROM def_stats_cache WHERE season = ?", (self.season,))
+            row = cursor.fetchone()
+            if row and row[0] == today:
+                import io
+                df = pd.read_json(io.StringIO(row[1]))
+                self._def_stats_cache = df
+                return df
+
+        logger.info("Fetching team defense dashboard stats from nba_api")
+        stats = leaguedashteamstats.LeagueDashTeamStats(
+            season=self.season,
+            measure_type_detailed_defense='Defense',
+            per_mode_detailed='PerGame',
+        )
+        time.sleep(0.6)
+        df = stats.get_data_frames()[0]
+
+        with sqlite3.connect(self.cache_db) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO def_stats_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
+                (self.season, today, df.to_json())
+            )
+
+        self._def_stats_cache = df
+        return df
+
+    def get_opponent_matchup_context(self, opp_team_name: str) -> Dict[str, float]:
+        """
+        Return normalized matchup context features for a given opponent team.
+        All values normalized so league average = 1.0.
+
+        Returns:
+            opp_pace:        opponent pace / league avg pace
+            opp_rebound_pct: opponent DREB_PCT / league avg DREB_PCT
+            opp_pts_paint:   opponent OPP_PTS_PAINT / league avg OPP_PTS_PAINT
+        """
+        result: Dict[str, float] = {
+            'opp_pace': 1.0,
+            'opp_rebound_pct': 1.0,
+            'opp_pts_paint': 1.0,
+            'opp_fta_rate': 1.0,   # normalized opponent FTA drawn (foul aggressiveness proxy)
+        }
+        try:
+            adv_df = self.get_team_stats()
+            def_df = self.get_team_defense_stats()
+            opp_df = self.get_opponent_stats()  # OPP_FTA lives here
+
+            opp_lower = opp_team_name.lower()
+
+            def _match(df: pd.DataFrame):
+                row = df[df['TEAM_NAME'].str.lower() == opp_lower]
+                if row.empty:
+                    row = df[df['TEAM_NAME'].str.lower().str.contains(
+                        opp_lower.split()[-1], na=False)]
+                return row.iloc[0] if not row.empty else None
+
+            adv_row = _match(adv_df)
+            def_row = _match(def_df)
+            opp_row = _match(opp_df)
+
+            if adv_row is not None:
+                if 'PACE' in adv_df.columns:
+                    league_avg = adv_df['PACE'].mean()
+                    if league_avg > 0:
+                        result['opp_pace'] = float(adv_row['PACE']) / league_avg
+                if 'DREB_PCT' in adv_df.columns:
+                    league_avg = adv_df['DREB_PCT'].mean()
+                    if league_avg > 0:
+                        result['opp_rebound_pct'] = float(adv_row['DREB_PCT']) / league_avg
+
+            if def_row is not None and 'OPP_PTS_PAINT' in def_df.columns:
+                league_avg = def_df['OPP_PTS_PAINT'].mean()
+                if league_avg > 0:
+                    result['opp_pts_paint'] = float(def_row['OPP_PTS_PAINT']) / league_avg
+
+            # OPP_FTA: free throw attempts drawn by the opponent per game.
+            # Higher → opponent's offense draws more fouls → elevated foul-trouble risk.
+            if opp_row is not None and 'OPP_FTA' in opp_df.columns:
+                league_avg = opp_df['OPP_FTA'].mean()
+                if league_avg > 0:
+                    result['opp_fta_rate'] = float(opp_row['OPP_FTA']) / league_avg
+
+        except Exception as e:
+            logger.warning(f"Could not build matchup context for {opp_team_name}: {e}")
+        return result
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def get_opponent_stats(self) -> pd.DataFrame:
@@ -143,6 +256,74 @@ class NbaStatsClient:
 
         self._opp_stats_cache = df
         return df
+
+    # ------------------------------------------------------------------ #
+    #  SGP cross-player: identify starting PG and C/PF by team            #
+    # ------------------------------------------------------------------ #
+
+    @retry_with_backoff(retries=3, backoff_in_seconds=2)
+    def _get_player_season_stats(self) -> pd.DataFrame:
+        """League-wide per-game player stats for the current season. Cached in memory."""
+        if self._player_season_cache is not None:
+            return self._player_season_cache
+        logger.info("Fetching league-wide player season stats (PerGame) for PG/big detection")
+        stats = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=self.season,
+            per_mode_simple='PerGame',
+        )
+        time.sleep(0.6)
+        df = stats.get_data_frames()[0]
+        self._player_season_cache = df
+        return df
+
+    def get_team_pg_and_big(self, team_name: str) -> Dict[str, Any]:
+        """
+        Identify the starting PG (highest AST/game) and C/PF (highest REB/game)
+        for the given team among qualified players (>= 15 GP, >= 20 MIN/game).
+
+        Returns:
+            {'pg':  {'id': int, 'name': str} or None,
+             'big': {'id': int, 'name': str} or None}
+        """
+        result: Dict[str, Any] = {'pg': None, 'big': None}
+        try:
+            df = self._get_player_season_stats()
+            if df.empty:
+                return result
+
+            # Match team by abbreviation or by full-name suffix
+            team_lower = team_name.lower()
+            team_df = df[df['TEAM_ABBREVIATION'].str.lower() == team_lower]
+            if team_df.empty:
+                # team_name might be a full name — resolve to abbreviation
+                for abbr, full in _ABBR_TO_FULL.items():
+                    if full == team_lower or team_lower.split()[-1] in full:
+                        team_df = df[df['TEAM_ABBREVIATION'].str.lower() == abbr]
+                        break
+            if team_df.empty:
+                return result
+
+            # Qualified starters: >= 15 GP and >= 20 MIN per game
+            qualified = team_df[(team_df['GP'] >= 15) & (team_df['MIN'] >= 20.0)]
+            if qualified.empty:
+                qualified = team_df[team_df['GP'] >= 10]
+            if qualified.empty:
+                return result
+
+            # PG = highest AST/game
+            pg_row = qualified.nlargest(1, 'AST').iloc[0]
+            result['pg'] = {'id': int(pg_row['PLAYER_ID']), 'name': str(pg_row['PLAYER_NAME'])}
+
+            # C/PF = highest REB/game among remaining players
+            non_pg = qualified[qualified['PLAYER_ID'] != pg_row['PLAYER_ID']]
+            if non_pg.empty:
+                return result
+            big_row = non_pg.nlargest(1, 'REB').iloc[0]
+            result['big'] = {'id': int(big_row['PLAYER_ID']), 'name': str(big_row['PLAYER_NAME'])}
+
+        except Exception as e:
+            logger.warning(f"Could not identify PG/big for {team_name}: {e}")
+        return result
 
     # ------------------------------------------------------------------ #
     #  Priority 2: Opponent defensive multiplier per market                #

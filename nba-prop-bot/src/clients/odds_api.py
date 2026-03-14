@@ -1,5 +1,5 @@
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from src.config import ODDS_API_KEY, ODDS_REGION, BOOKMAKERS, SHARP_BOOKS
 from src.utils.retry import retry_with_backoff
 from src.utils.logging_utils import get_logger
@@ -53,3 +53,31 @@ class OddsApiClient:
         response.raise_for_status()
         self._update_quota(response.headers)
         return response.json()
+
+    @staticmethod
+    def extract_consensus_spread(bookmakers: List[Dict], home_team: str) -> Optional[float]:
+        """
+        Return the median spread for the home team across all books that carry
+        the spreads market.  Convention matches the Odds API: negative = home
+        team is favored (e.g. -6.5 means home gives 6.5 points).
+        Returns None when no spread data is present.
+        """
+        spreads: List[float] = []
+        home_lower = home_team.lower()
+        for book in bookmakers:
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'spreads':
+                    continue
+                for outcome in mkt.get('outcomes', []):
+                    if outcome.get('name', '').lower() == home_lower:
+                        point = outcome.get('point')
+                        if point is not None:
+                            spreads.append(float(point))
+        if not spreads:
+            return None
+        # Median across books to filter out outliers
+        spreads.sort()
+        mid = len(spreads) // 2
+        if len(spreads) % 2 == 0:
+            return (spreads[mid - 1] + spreads[mid]) / 2.0
+        return spreads[mid]

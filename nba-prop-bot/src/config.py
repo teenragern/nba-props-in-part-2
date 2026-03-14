@@ -22,7 +22,8 @@ KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 # Scheduler credit-conservation settings
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "90"))
 QUOTA_FLOOR = int(os.getenv("QUOTA_FLOOR", "30"))
-NEWS_POLL_INTERVAL = int(os.getenv("NEWS_POLL_INTERVAL", "60"))  # seconds between RSS polls
+NEWS_POLL_INTERVAL     = int(os.getenv("NEWS_POLL_INTERVAL",     "60"))   # seconds (legacy RSS, kept for reference)
+TWITTER_POLL_INTERVAL  = int(os.getenv("TWITTER_POLL_INTERVAL",  "15"))   # seconds between Nitter polls
 
 # Sharp-line devigging — top-down signal
 SHARP_BOOKS_RAW = os.getenv("SHARP_BOOKS", "pinnacle")
@@ -30,6 +31,10 @@ SHARP_BOOKS     = [b.strip() for b in SHARP_BOOKS_RAW.split(",") if b.strip()]
 REC_BOOKS_RAW   = os.getenv("REC_BOOKS", "draftkings,fanduel")
 REC_BOOKS       = [b.strip() for b in REC_BOOKS_RAW.split(",") if b.strip()]
 SHARP_EDGE_MIN  = float(os.getenv("SHARP_EDGE_MIN", "0.03"))
+
+# Books used for synthetic consensus line — devigged independently then weighted
+CONSENSUS_BOOKS_RAW = os.getenv("CONSENSUS_BOOKS", "pinnacle,circa,bookmaker")
+CONSENSUS_BOOKS     = [b.strip().lower() for b in CONSENSUS_BOOKS_RAW.split(",") if b.strip()]
 
 PROP_MARKETS = [
     "player_points",

@@ -10,7 +10,7 @@ from itertools import combinations
 from math import prod
 from typing import List, Dict, Any
 
-from src.models.sgp_correlations import get_sgp_edge
+from src.models.sgp_correlations import get_sgp_edge, adjust_joint_probability
 from src.clients.telegram_bot import TelegramBotClient
 from src.utils.logging_utils import get_logger
 
@@ -50,35 +50,60 @@ def _compatible(legs: List[Dict]) -> bool:
     return True
 
 
-def _combo_edge(legs: List[Dict]) -> Dict:
+def _combo_edge(legs: List[Dict], db=None) -> Dict:
     """
     Compute joint edge for a combo.
 
-    Same-player combos: use SGP correlation model (league-avg correlations).
-    Different-player combos: assume independence (standard parlay math).
+    Same-player combos: use intra-player SGP correlation model.
+    Same-team, different-player combos (2-leg): look up cross-player
+      historical correlation from DB (PG assists ↔ C/PF points, etc.).
+    All other multi-player combos: assume independence.
     """
     sgp_legs = [
         {
-            'market':      leg['market'],
-            'side':        leg['side'],
-            'prob':        leg['model_prob'],
+            'market':       leg['market'],
+            'side':         leg['side'],
+            'prob':         leg['model_prob'],
             'implied_prob': leg['implied_prob'],
         }
         for leg in legs
     ]
 
     player_ids = {leg['player_id'] for leg in legs}
+
     if len(player_ids) == 1:
-        # Same player — use correlation-adjusted joint probability
+        # Same player — intra-player correlation model
         return get_sgp_edge(sgp_legs, player_logs=None)
 
-    # Different players — assume independent events
-    jt = prod(l['prob']          for l in sgp_legs)
-    jb = prod(l['implied_prob']  for l in sgp_legs)
+    # Two legs from different players on the same team → cross-player lookup
+    if db is not None and len(legs) == 2 and len(player_ids) == 2:
+        team_a = legs[0].get('team_name', '')
+        team_b = legs[1].get('team_name', '')
+        if team_a and team_a == team_b:
+            pa, pb = legs[0]['player_id'], legs[1]['player_id']
+            ma, mb = legs[0]['market'],    legs[1]['market']
+            corr = db.get_cross_player_correlation(team_a, pa, pb, ma, mb)
+            if corr is None:
+                # Try swapped order (a/b symmetric in DB key)
+                corr = db.get_cross_player_correlation(team_a, pb, pa, mb, ma)
+            if corr is not None:
+                jt = adjust_joint_probability(
+                    legs[0]['model_prob'], legs[1]['model_prob'], corr)
+                jb = prod(l['implied_prob'] for l in sgp_legs)
+                return {
+                    'joint_true_prob':     jt,
+                    'joint_book_prob':     jb,
+                    'sgp_edge':            jt - jb,
+                    'correlation_applied': corr,
+                }
+
+    # Default: assume independence
+    jt = prod(l['prob']         for l in sgp_legs)
+    jb = prod(l['implied_prob'] for l in sgp_legs)
     return {
-        'joint_true_prob':    jt,
-        'joint_book_prob':    jb,
-        'sgp_edge':           jt - jb,
+        'joint_true_prob':     jt,
+        'joint_book_prob':     jb,
+        'sgp_edge':            jt - jb,
         'correlation_applied': 0.0,
     }
 
@@ -100,6 +125,7 @@ def _format_combo(legs: List[Dict], edge: float, joint_prob: float) -> str:
 def generate_and_alert_combos(
     actionable: List[Dict[str, Any]],
     bot: TelegramBotClient,
+    db=None,
 ) -> None:
     """
     Generate 2–4 leg combos from the top actionable edges and send to Telegram.
@@ -119,7 +145,7 @@ def generate_and_alert_combos(
             legs = list(combo)
             if not _compatible(legs):
                 continue
-            result = _combo_edge(legs)
+            result = _combo_edge(legs, db=db)
             combo_edge = result.get('sgp_edge', 0)
             if combo_edge < COMBO_EDGE_MIN:
                 continue

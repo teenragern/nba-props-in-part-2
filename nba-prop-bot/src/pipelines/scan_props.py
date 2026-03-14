@@ -23,15 +23,21 @@ from src.clients.odds_api import OddsApiClient
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
-from src.config import PROP_MARKETS, EDGE_MIN, SHARP_BOOKS, REC_BOOKS, SHARP_EDGE_MIN
+from src.config import PROP_MARKETS, EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN, CONSENSUS_BOOKS
 from src.models.projections import build_player_projection
-from src.models.distributions import get_probability_distribution
-from src.models.devig import decimal_to_implied_prob, devig_two_way
+from src.models.distributions import (
+    get_probability_distribution,
+    spread_to_blowout_prob,
+    compute_player_foul_rate,
+)
+from src.models.devig import decimal_to_implied_prob, devig_two_way, build_consensus_true_prob
 from src.models.edge_ranker import rank_edges, set_db as set_ranker_db
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert
 from src.pipelines.combos import generate_and_alert_combos
+from src.models.sgp_correlations import build_team_correlation_matrix
 from src.clients.on_off_splits import OnOffSplitsClient
+from src.clients.rotation_model import RotationModel
 
 logger = get_logger(__name__)
 _PROJECTIONS_CACHE: Dict[str, Any] = {}
@@ -68,17 +74,23 @@ def _american(decimal_odds: float) -> str:
     return f"-{int(100 / (decimal_odds - 1))}"
 
 
-def get_sharp_true_prob(
-    bookmakers: List[Dict], player_name: str, market_key: str, line: float
+def get_consensus_true_prob(
+    bookmakers: List[Dict], player_name: str, market_key: str, line: float,
+    book_weights: Dict,
 ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     """
-    Find the first sharp-book (e.g. Pinnacle) price for this player/market/line,
-    devig it, and return (true_over_prob, true_under_prob, book_name).
-    Returns (None, None, None) when no sharp book carries this line.
+    Build a synthetic consensus true probability by independently devigging all
+    available consensus books (Pinnacle, Circa, Bookmaker), then weighting each
+    by its historical CLV accuracy score.
+
+    Returns (consensus_over, consensus_under, label) or (None, None, None)
+    when no consensus book carries this line.
     """
-    sharp_lower = [b.lower() for b in SHARP_BOOKS]
+    consensus_lower = {b.lower() for b in CONSENSUS_BOOKS}
+    book_probs = []
     for book in bookmakers:
-        if book.get('title', '').lower() not in sharp_lower:
+        title_lower = book.get('title', '').lower()
+        if title_lower not in consensus_lower:
             continue
         over_price = under_price = None
         for mkt in book.get('markets', []):
@@ -98,8 +110,12 @@ def get_sharp_true_prob(
             raw_o = decimal_to_implied_prob(over_price)
             raw_u = decimal_to_implied_prob(under_price)
             true_o, true_u = devig_two_way(raw_o, raw_u)
-            return true_o, true_u, book['title']
-    return None, None, None
+            weight = book_weights.get(title_lower, 0.5)
+            book_probs.append({'book': book['title'], 'over': true_o, 'under': true_u, 'weight': weight})
+    if not book_probs:
+        return None, None, None
+    cons_o, cons_u, label = build_consensus_true_prob(book_probs)
+    return cons_o, cons_u, label
 
 
 def get_best_rec_price(
@@ -163,11 +179,13 @@ def scan_props():
     stats_client   = NbaStatsClient()
     injury_client  = InjuryClient()
     bot            = TelegramBotClient()
-    on_off_client  = OnOffSplitsClient()
+    on_off_client   = OnOffSplitsClient()
+    rotation_model  = RotationModel(stats_client)
 
     # Priority 7: give edge_ranker access to DB for per-book bias
     set_ranker_db(db)
     db.init_bookmaker_profiles()
+    _book_weights = db.get_sharp_book_weights()
 
     today      = datetime.now().strftime('%Y-%m-%d')
     local_zone = tz.tzlocal()
@@ -195,13 +213,25 @@ def scan_props():
         game_date  = today
 
         try:
-            odds_data = odds_client.get_event_odds(event_id=event_id, markets=PROP_MARKETS)
+            odds_data = odds_client.get_event_odds(
+                event_id=event_id, markets=[*PROP_MARKETS, 'spreads'])
         except Exception:
             continue
 
         bookmakers = odds_data.get('bookmakers', [])
         if not bookmakers:
             continue
+
+        # Blowout probability for the whole event (shared by all players in this game)
+        _home_spread = OddsApiClient.extract_consensus_spread(bookmakers, home_team)
+        _blowout_prob = spread_to_blowout_prob(_home_spread) if _home_spread is not None else 0.0
+
+        # Build cross-player correlation matrix for both teams (7-day DB cache)
+        for _team in (home_team, away_team):
+            try:
+                build_team_correlation_matrix(_team, stats_client, db)
+            except Exception as _cme:
+                logger.debug(f"Cross-player corr skipped for {_team}: {_cme}")
 
         players_in_event: set = set()
         prices_by_market: Dict[str, Dict] = {}
@@ -246,12 +276,23 @@ def scan_props():
 
         # Resolve absent player IDs once per event for on/off lookup
         absent_ids: List[int] = []
+        _out_player_avg_mins: float = 0.0
         if out_players:
             for _nm in out_players:
                 _aid = NbaStatsClient.resolve_player_id(_nm)
                 if _aid:
                     absent_ids.append(_aid)
-            logger.info(f"{away_team} @ {home_team}: OUT players {out_players}. Exact on/off splits active.")
+                    try:
+                        _out_logs = stats_client.get_player_game_logs(_aid)
+                        if not _out_logs.empty and 'MIN' in _out_logs.columns:
+                            _avg = _out_logs['MIN'].head(10).mean()
+                            if _avg == _avg:  # not NaN
+                                _out_player_avg_mins += float(_avg)
+                    except Exception:
+                        pass
+            _out_player_avg_mins = min(_out_player_avg_mins, 40.0)
+            logger.info(f"{away_team} @ {home_team}: OUT players {out_players}. "
+                        f"Absent avg mins={_out_player_avg_mins:.1f}. On/off splits active.")
 
         # Priority 2: fetch pace data for this matchup once per event
         pace_info = stats_client.get_team_pace(home_team, away_team)
@@ -307,6 +348,28 @@ def scan_props():
             # ---- determine opponent team for defensive multiplier ----
             opp_team = away_team if home_flag else home_team
 
+            # Advanced matchup context for ML features (cached internally; no extra API calls)
+            _opp_ctx = stats_client.get_opponent_matchup_context(opp_team)
+
+            # Foul-trouble rate for this player (PF per minute, last 15 games)
+            _player_foul_rate = compute_player_foul_rate(logs)
+
+            # ---- Rotation model: slot-based minutes projection ----
+            # Computed once per player (market-agnostic); used in every market loop.
+            # Falls back to 0.0 → projections.py uses its own estimate_projected_minutes.
+            _rotation_mins = 0.0
+            if absent_ids and player_id_int:
+                try:
+                    _rotation_mins = rotation_model.get_projected_minutes(
+                        target_player_id=int(player_id_int),
+                        absent_player_ids=absent_ids,
+                        logs=logs,
+                        season=stats_client.season,
+                        db=db,
+                    )
+                except Exception as _re:
+                    logger.debug(f"Rotation model error for {player_name}: {_re}")
+
             for mkt in PROP_MARKETS:
                 if player_name not in prices_by_market[mkt]:
                     continue
@@ -350,14 +413,26 @@ def scan_props():
                         b2b_flag=b2b_flag,
                         home_flag=home_flag,
                         rest_days=rest_days,
+                        out_player_avg_mins=_out_player_avg_mins,
+                        projected_minutes_override=_rotation_mins,
                     )
 
                     if not proj or proj.get('mean', 0) == 0:
                         continue
 
                     # Priority 6: blend Bayesian mean with XGBoost projection
+                    _league_avg_pace = 99.0
+                    _pace_factor = (
+                        (pace_info['home_pace'] + pace_info['away_pace'])
+                        / (2.0 * _league_avg_pace)
+                    )
                     ml_mean = get_ml_projection(
-                        mkt, logs, proj['projected_minutes'], home_flag, rest_days
+                        mkt, logs, proj['projected_minutes'], home_flag, rest_days,
+                        opp_def_rating=opp_multiplier,
+                        pace_factor=_pace_factor,
+                        opp_pace=_opp_ctx['opp_pace'],
+                        opp_rebound_pct=_opp_ctx['opp_rebound_pct'],
+                        opp_pts_paint=_opp_ctx['opp_pts_paint'],
                     )
                     if ml_mean is not None and ml_mean > 0:
                         proj['mean'] = 0.5 * proj['mean'] + 0.5 * ml_mean
@@ -366,7 +441,11 @@ def scan_props():
                     dists = get_probability_distribution(
                         mkt, proj['mean'], line,
                         logs=logs,
-                        variance_scale=proj.get('variance_scale', 1.0)
+                        variance_scale=proj.get('variance_scale', 1.0),
+                        proj_minutes=proj['projected_minutes'],
+                        blowout_prob=_blowout_prob,
+                        player_foul_rate=_player_foul_rate,
+                        opp_foul_rate=_opp_ctx['opp_fta_rate'],
                     )
 
                     best_over, best_under = get_best_odds(bookmakers, player_name, mkt, line)
@@ -377,16 +456,21 @@ def scan_props():
                         imp_over, _ = devig_two_way(raw_imp_o, raw_imp_u)
                     else:
                         imp_over  = decimal_to_implied_prob(best_over['price'])
-                        imp_under = decimal_to_implied_prob(best_under['price'])
+
+                    _consensus_o, _consensus_u, _consensus_label = get_consensus_true_prob(
+                        bookmakers, player_name, mkt, line, _book_weights)
 
                     common = {
                         **proj,
-                        "home_team": home_team,
-                        "away_team": away_team,
-                        "game_date": game_date,
-                        "event_id":  event_id,
-                        "home_away": "HOME" if home_flag else "AWAY",
-                        "rest_days": rest_days,
+                        "home_team":       home_team,
+                        "away_team":       away_team,
+                        "game_date":       game_date,
+                        "event_id":        event_id,
+                        "home_away":       "HOME" if home_flag else "AWAY",
+                        "rest_days":       rest_days,
+                        "team_name":       home_team if home_flag else away_team,
+                        "consensus_prob":  _consensus_o,
+                        "consensus_label": _consensus_label,
                     }
 
                     if best_over['price'] > 0:
@@ -404,13 +488,10 @@ def scan_props():
 
                     # Unders intentionally excluded — OVER only strategy
 
-                    # ── Top-down sharp vs rec comparison ─────────────────
-                    true_o, true_u, sharp_book = get_sharp_true_prob(
-                        bookmakers, player_name, mkt, line)
-
-                    if true_o is not None:
+                    # ── Top-down consensus sharp vs rec comparison ────────
+                    if _consensus_o is not None:
                         mkt_label = mkt.replace('player_', '').replace('_', ' ').title()
-                        for chk_side, true_prob in (('Over', true_o),):
+                        for chk_side, true_prob in (('Over', _consensus_o),):
                             rec_price, rec_book = get_best_rec_price(
                                 bookmakers, player_name, mkt, line, chk_side)
                             if rec_price is None:
@@ -426,7 +507,7 @@ def scan_props():
                             msg = (
                                 f"🔪 <b>Sharp Alert: {player_name} "
                                 f"{chk_side} {line} {mkt_label}</b>\n\n"
-                                f"{sharp_book.title()} True: {true_prob:.1%}"
+                                f"Consensus ({_consensus_label}) True: {true_prob:.1%}"
                                 f" → {rec_book.title()}: {rec_implied:.1%}\n"
                                 f"Gap: <b>+{sharp_gap:.1%}</b>"
                                 f" | {rec_book.title()} {_american(rec_price)}"
@@ -434,7 +515,7 @@ def scan_props():
                             bot.send_message(msg)
                             logger.info(
                                 f"Sharp alert: {player_name} {chk_side} {line} {mkt} "
-                                f"{sharp_book} {true_prob:.1%} vs "
+                                f"{_consensus_label} {true_prob:.1%} vs "
                                 f"{rec_book} {rec_implied:.1%} gap={sharp_gap:.1%}"
                             )
 
@@ -450,8 +531,8 @@ def scan_props():
         )
         evaluate_and_alert(edge, db, bot)
 
-    # Multi-leg combo alerts (2–4 legs)
-    generate_and_alert_combos(actionable, bot)
+    # Multi-leg combo alerts (2–4 legs) — pass db for cross-player correlation lookups
+    generate_and_alert_combos(actionable, bot, db=db)
 
 
 if __name__ == "__main__":

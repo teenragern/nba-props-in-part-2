@@ -16,7 +16,11 @@ Usage:
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 # League-wide default correlations between stat pairs (empirically calibrated)
 # Key = tuple of sorted market names; value = Pearson correlation
@@ -146,3 +150,121 @@ def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -
         'sgp_edge':         float(sgp_edge),
         'correlation_applied': float(corr_applied),
     }
+
+
+# ── Cross-player (SGP teammate) correlations ──────────────────────────────────
+
+# Market pairs we compute for the PG→Big relationship.
+# Tuple layout: (market_a, market_b, pg_col, big_col)
+_CROSS_PAIRS = [
+    ('player_assists',  'player_points',   'PG_AST',  'BIG_PTS'),
+    ('player_assists',  'player_rebounds', 'PG_AST',  'BIG_REB'),
+    ('player_points',   'player_points',   'PG_PTS',  'BIG_PTS'),
+]
+
+# League-wide fallback when we don't have enough shared games
+CROSS_PLAYER_DEFAULTS: Dict[Tuple[str, str], float] = {
+    ('player_assists', 'player_points'):   0.22,   # PnR: PG dime → C bucket
+    ('player_assists', 'player_rebounds'): 0.05,
+    ('player_points',  'player_points'):   0.10,   # co-movement from pace/game script
+}
+
+
+def compute_cross_player_correlations(
+    pg_logs: pd.DataFrame,
+    big_logs: pd.DataFrame,
+    min_games: int = 20,
+) -> Dict[Tuple[str, str], Tuple[float, int]]:
+    """
+    Align two players' game logs on GAME_ID and compute cross-player Pearson
+    correlations.  Primary signal: PG assists ↔ C/PF points (pick-and-roll).
+
+    Returns
+    -------
+    {(market_a, market_b): (pearson_correlation, n_aligned_games)}
+    Empty dict when fewer than `min_games` shared games exist.
+    """
+    if pg_logs.empty or big_logs.empty:
+        return {}
+    if 'GAME_ID' not in pg_logs.columns or 'GAME_ID' not in big_logs.columns:
+        return {}
+
+    needed_pg  = {'GAME_ID', 'AST', 'PTS', 'REB'}
+    needed_big = {'GAME_ID', 'PTS', 'REB', 'AST'}
+    if not needed_pg.issubset(pg_logs.columns) or not needed_big.issubset(big_logs.columns):
+        return {}
+
+    pg_slim = pg_logs[['GAME_ID', 'AST', 'PTS', 'REB']].rename(
+        columns={'AST': 'PG_AST', 'PTS': 'PG_PTS', 'REB': 'PG_REB'})
+    big_slim = big_logs[['GAME_ID', 'PTS', 'REB', 'AST']].rename(
+        columns={'PTS': 'BIG_PTS', 'REB': 'BIG_REB', 'AST': 'BIG_AST'})
+
+    merged = pd.merge(pg_slim, big_slim, on='GAME_ID')
+    if len(merged) < min_games:
+        return {}
+
+    result: Dict[Tuple[str, str], Tuple[float, int]] = {}
+    for mkt_a, mkt_b, col_a, col_b in _CROSS_PAIRS:
+        if col_a not in merged.columns or col_b not in merged.columns:
+            continue
+        corr = merged[col_a].corr(merged[col_b])
+        if pd.notna(corr):
+            result[(mkt_a, mkt_b)] = (float(corr), len(merged))
+
+    return result
+
+
+def build_team_correlation_matrix(
+    team_name: str,
+    stats_client: Any,
+    db: Any,
+) -> None:
+    """
+    Identify the team's starting PG and C/PF, compute cross-player correlations
+    from their shared game logs, and persist to DB (7-day TTL).
+
+    Skips silently when:
+      • The PG or big cannot be identified (roster data unavailable).
+      • A fresh DB record already exists (avoids redundant API calls).
+    """
+    roster = stats_client.get_team_pg_and_big(team_name)
+    pg  = roster.get('pg')
+    big = roster.get('big')
+    if not pg or not big:
+        logger.debug(f"build_team_correlation_matrix: no PG/big found for '{team_name}'")
+        return
+
+    # Skip recomputation if DB already has a fresh record for the primary pair
+    if db.get_cross_player_correlation(
+        team_name, pg['name'], big['name'], 'player_assists', 'player_points'
+    ) is not None:
+        return
+
+    try:
+        pg_logs  = stats_client.get_player_game_logs(pg['id'])
+        big_logs = stats_client.get_player_game_logs(big['id'])
+    except Exception as e:
+        logger.warning(f"build_team_correlation_matrix: log fetch failed for {team_name}: {e}")
+        return
+
+    corr_pairs = compute_cross_player_correlations(pg_logs, big_logs)
+
+    if not corr_pairs:
+        # Not enough shared games — store league defaults so we don't retry every scan
+        for (mkt_a, mkt_b), default in CROSS_PLAYER_DEFAULTS.items():
+            db.upsert_cross_player_correlation(
+                team_name, pg['name'], big['name'], mkt_a, mkt_b, default, 0)
+        logger.debug(f"{team_name}: insufficient shared games; stored league-avg cross-player defaults")
+        return
+
+    for (mkt_a, mkt_b), (corr, n) in corr_pairs.items():
+        db.upsert_cross_player_correlation(
+            team_name, pg['name'], big['name'], mkt_a, mkt_b, corr, n)
+    logger.info(
+        f"Cross-player corr computed for {team_name}: "
+        f"{pg['name']} ↔ {big['name']} — "
+        + ", ".join(
+            f"{m_a.split('_')[1]}/{m_b.split('_')[1]}={c:.3f}(n={n})"
+            for (m_a, m_b), (c, n) in corr_pairs.items()
+        )
+    )
