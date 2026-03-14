@@ -5,29 +5,35 @@ Trains one XGBRegressor per market (points/rebounds/assists/threes) on
 historical player game logs. Predictions are blended 50/50 with the
 Bayesian model in scan_props.py.
 
-Feature vector per game prediction:
-  - rate_5g:          per-minute rate over last 5 games
-  - rate_10g:         per-minute rate over last 10 games
-  - rate_season:      season-long per-minute rate
-  - avg_min_5g:       average minutes last 5 games
-  - std_min_5g:       std-dev of minutes last 5 games (consistency)
-  - home_flag:        1 = home, 0 = away
-  - rest_days:        days since last game (capped at 7)
-  - b2b_flag:         1 = back-to-back
-  - games_played:     total season games (proxy for small-sample risk)
-  - opp_def_rating:   opponent defensive strength for this market (1.0 = league avg)
-  - pace_factor:      (team_pace + opp_pace) / (2 * league_avg) — game tempo
-  - opp_pace:         opponent team's raw pace normalized to league avg (1.0 = avg)
-  - opp_rebound_pct:  opponent team's DREB_PCT normalized to league avg
-  - opp_pts_paint:    opponent points allowed in paint per game, normalized
+Feature vector per game prediction (18 features):
+  Base rates:
+    rate_5g          per-minute rate over last 5 games
+    rate_10g         per-minute rate over last 10 games
+    rate_season      season-long per-minute rate
+    ewm_rate_5g      exponentially-weighted rate (alpha=0.3) over last 5 games
+  Minutes:
+    avg_min_5g       average minutes last 5 games
+    std_min_5g       std-dev of minutes last 5 games (consistency)
+  Situational:
+    home_flag        1 = home, 0 = away
+    rest_days        days since last game (capped at 7)
+    b2b_flag         1 = back-to-back
+    games_played     total season games (proxy for small-sample risk)
+    streak_factor    rate last 3 games / rate games 4-10 (hot/cold momentum, clamped 0.5–2.0)
+    home_rate_delta  historical home per-min rate minus away per-min rate
+    usage_proxy_5g   (FGA + 0.44*FTA + TOV) / MIN over last 5 games (shot/possession volume)
+  Matchup context:
+    opp_def_rating   opponent defensive strength for this market (1.0 = league avg)
+    pace_factor      (team_pace + opp_pace) / (2 * league_avg) — game tempo
+    opp_pace         opponent team's raw pace normalized to league avg (1.0 = avg)
+    opp_rebound_pct  opponent team's DREB_PCT normalized to league avg
+    opp_pts_paint    opponent points allowed in paint per game, normalized
 
 Target: per-minute rate for the specific stat.
 Final projection = predicted_rate * projected_minutes.
 
-Matchup context lets XGBoost learn non-linear interactions such as:
-  "A Center's rebound rate drops against teams with high opp_rebound_pct"
-  "Player X only underperforms on back-to-backs when facing top defensive teams"
-  "Player Y's three-point rate spikes in fast-paced games, but only at home"
+NOTE: Adding features invalidates previously trained .pkl models.
+      Run `train_ml` pipeline to retrain after any feature change.
 """
 
 import os
@@ -46,9 +52,14 @@ _MARKET_COL = {
 }
 
 FEATURE_NAMES = [
-    'rate_5g', 'rate_10g', 'rate_season',
+    # Base rates
+    'rate_5g', 'rate_10g', 'rate_season', 'ewm_rate_5g',
+    # Minutes
     'avg_min_5g', 'std_min_5g',
+    # Situational
     'home_flag', 'rest_days', 'b2b_flag', 'games_played',
+    'streak_factor', 'home_rate_delta', 'usage_proxy_5g',
+    # Matchup context
     'opp_def_rating', 'pace_factor',
     'opp_pace', 'opp_rebound_pct', 'opp_pts_paint',
 ]
@@ -112,6 +123,51 @@ class PropMLModel:
             return 0.0
         return float(df_slice[self.col].sum() / total_min) if self.col in df_slice.columns else 0.0
 
+    def _ewm_rate(self, logs: pd.DataFrame, n: int = 5, alpha: float = 0.3) -> float:
+        """Exponentially-weighted per-minute rate over the last n games (newest first)."""
+        recent = logs.head(n)
+        if recent.empty or self.col not in recent.columns or 'MIN' not in recent.columns:
+            return 0.0
+        rates = []
+        for _, row in recent.iterrows():
+            m = float(row.get('MIN', 0) or 0)
+            s = float(row.get(self.col, 0) or 0)
+            if m > 0:
+                rates.append(s / m)
+        if not rates:
+            return 0.0
+        # Newest first in logs → reverse to oldest-first for EWM then take last value
+        return float(pd.Series(rates[::-1]).ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+
+    def _usage_proxy(self, logs: pd.DataFrame, n: int = 5) -> float:
+        """(FGA + 0.44·FTA + TOV) / MIN averaged over last n games — possession volume proxy."""
+        recent = logs.head(n)
+        if recent.empty or 'MIN' not in recent.columns:
+            return 0.0
+        total_min = recent['MIN'].sum()
+        if total_min <= 0:
+            return 0.0
+        fga = recent.get('FGA', pd.Series([0] * len(recent))).sum()
+        fta = recent.get('FTA', pd.Series([0] * len(recent))).sum()
+        tov = recent.get('TOV', pd.Series([0] * len(recent))).sum()
+        return float((fga + 0.44 * fta + tov) / total_min)
+
+    def _streak_factor(self, logs: pd.DataFrame) -> float:
+        """Rate last 3 games / rate games 4-10. Captures hot/cold streaks. Clamped [0.5, 2.0]."""
+        recent_3 = self._safe_rate(logs.head(3))
+        prev_7   = self._safe_rate(logs.iloc[3:10])
+        if prev_7 <= 0:
+            return 1.0
+        return float(max(0.5, min(2.0, recent_3 / prev_7)))
+
+    def _home_rate_delta(self, logs: pd.DataFrame) -> float:
+        """Historical per-minute rate in home games minus away games (up to last 30 of each)."""
+        if 'MATCHUP' not in logs.columns:
+            return 0.0
+        home_logs = logs[logs['MATCHUP'].str.contains('vs\\.', na=False)].head(30)
+        away_logs = logs[logs['MATCHUP'].str.contains('@', na=False)].head(30)
+        return self._safe_rate(home_logs) - self._safe_rate(away_logs)
+
     def build_features(self, logs: pd.DataFrame,
                        home_flag: bool = False,
                        rest_days: int = 2,
@@ -132,15 +188,23 @@ class PropMLModel:
         std_min = r5['MIN'].std() if len(r5) > 1 else 0.0
 
         return {
+            # Base rates
             'rate_5g':          self._safe_rate(r5),
             'rate_10g':         self._safe_rate(r10),
             'rate_season':      self._safe_rate(logs),
+            'ewm_rate_5g':      self._ewm_rate(logs, n=5),
+            # Minutes
             'avg_min_5g':       float(avg_min) if not pd.isna(avg_min) else 0.0,
             'std_min_5g':       float(std_min) if not pd.isna(std_min) else 0.0,
+            # Situational
             'home_flag':        int(home_flag),
             'rest_days':        min(rest_days, 7),
             'b2b_flag':         int(rest_days == 0),
             'games_played':     len(logs),
+            'streak_factor':    self._streak_factor(logs),
+            'home_rate_delta':  self._home_rate_delta(logs),
+            'usage_proxy_5g':   self._usage_proxy(logs, n=5),
+            # Matchup context
             'opp_def_rating':   float(opp_def_rating),
             'pace_factor':      float(pace_factor),
             'opp_pace':         float(opp_pace),

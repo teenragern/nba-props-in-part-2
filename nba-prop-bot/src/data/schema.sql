@@ -192,6 +192,21 @@ CREATE TABLE IF NOT EXISTS cross_player_correlations (
     PRIMARY KEY (team, player_a, player_b, market_a, market_b)
 );
 
+CREATE TABLE IF NOT EXISTS backtest_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name TEXT NOT NULL,
+    season TEXT NOT NULL,
+    market TEXT NOT NULL,
+    game_date TEXT NOT NULL,
+    simulated_line REAL NOT NULL,
+    model_mean REAL NOT NULL,
+    model_prob_over REAL NOT NULL,
+    actual_stat REAL NOT NULL,
+    hit INTEGER NOT NULL,       -- 1 if actual > simulated_line
+    edge REAL NOT NULL,         -- model_prob_over - 0.5
+    run_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS team_opponent_stats (
     team_name TEXT,
     season TEXT,

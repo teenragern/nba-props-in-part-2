@@ -102,6 +102,70 @@ class NbaStatsClient:
 
         return df
 
+    def get_player_game_logs_season(self, player_id: int, season: str) -> pd.DataFrame:
+        """
+        Fetch game logs for a specific season string (e.g. '2022-23').
+        Persisted in a separate backtest cache table — never expires so historical
+        data is only downloaded once.
+        """
+        cache_key = f"{player_id}_{season}"
+        with sqlite3.connect(self.cache_db) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS backtest_logs_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    data_json TEXT
+                )
+            """)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT data_json FROM backtest_logs_cache WHERE cache_key = ?",
+                (cache_key,)
+            )
+            row = cursor.fetchone()
+            if row:
+                import io
+                return pd.read_json(io.StringIO(row[0]))
+
+        logger.info(f"Fetching historical logs: player={player_id} season={season}")
+        try:
+            logs = playergamelogs.PlayerGameLogs(
+                player_id_nullable=player_id,
+                season_nullable=season,
+            )
+            time.sleep(0.7)
+            df = logs.get_data_frames()[0]
+        except Exception as e:
+            logger.warning(f"Historical log fetch failed ({player_id}/{season}): {e}")
+            return pd.DataFrame()
+
+        with sqlite3.connect(self.cache_db) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO backtest_logs_cache (cache_key, data_json) VALUES (?, ?)",
+                (cache_key, df.to_json()),
+            )
+        return df
+
+    def get_all_active_player_ids(self, min_gp: int = 20) -> list:
+        """
+        Return list of player IDs for all active players with >= min_gp games
+        this season. Used by backtest and train_ml pipelines.
+        """
+        try:
+            from nba_api.stats.endpoints import leaguedashplayerstats
+            stats = leaguedashplayerstats.LeagueDashPlayerStats(
+                season=self.season,
+                per_mode_simple='Totals',
+            )
+            time.sleep(0.6)
+            df = stats.get_data_frames()[0]
+            if df.empty or 'GP' not in df.columns:
+                return []
+            qualified = df[df['GP'] >= min_gp]
+            return qualified['PLAYER_ID'].tolist()
+        except Exception as e:
+            logger.warning(f"Could not fetch active player list: {e}")
+            return []
+
     # ------------------------------------------------------------------ #
     #  Team stats (pace / ratings)                                         #
     # ------------------------------------------------------------------ #

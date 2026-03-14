@@ -333,8 +333,9 @@ def scan_props():
                 except Exception:
                     continue
 
-            p_data    = _PROJECTIONS_CACHE[cache_key]
-            logs      = p_data["logs"]
+            p_data       = _PROJECTIONS_CACHE[cache_key]
+            logs         = p_data["logs"]
+            player_id_int = p_data.get("pid")   # resolve once per player, used in rotation + on/off
 
             # ---- Priority 4: home/away + rest days ----
             player_team_abbr = logs.iloc[0]['TEAM_ABBREVIATION'] if not logs.empty else None
@@ -383,7 +384,6 @@ def scan_props():
                 for line in prices_by_market[mkt][player_name]:
 
                     # Exact per-market on/off usage shift (replaces flat 15%)
-                    player_id_int = p_data.get("pid")
                     if absent_ids and player_id_int:
                         shifts = [
                             on_off_client.get_usage_multiplier(

@@ -506,3 +506,85 @@ class DatabaseClient:
                 (team, player_a, player_b, market_a, market_b),
             ).fetchone()
         return float(row['correlation']) if row else None
+
+    # ------------------------------------------------------------------ #
+    #  Backtesting                                                         #
+    # ------------------------------------------------------------------ #
+
+    def insert_backtest_results_batch(self, records: list) -> None:
+        """
+        Bulk-insert backtest simulation rows.
+        Each record: (player_name, season, market, game_date, simulated_line,
+                      model_mean, model_prob_over, actual_stat, hit, edge)
+        """
+        with self.get_conn() as conn:
+            conn.executemany(
+                """
+                INSERT INTO backtest_results
+                    (player_name, season, market, game_date, simulated_line,
+                     model_mean, model_prob_over, actual_stat, hit, edge)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                records,
+            )
+
+    def get_backtest_summary(self) -> dict:
+        """
+        Return aggregate backtest metrics:
+          - per-market: bets, hits, hit_rate, roi (at -110 odds)
+          - per-edge-bucket: bets, hits, hit_rate
+          - calibration: list of (prob_bin, actual_hit_rate, n)
+        """
+        with self.get_conn() as conn:
+            # Per-market
+            mkt_rows = conn.execute(
+                """
+                SELECT market,
+                       COUNT(*)             AS bets,
+                       SUM(hit)             AS hits,
+                       AVG(hit)             AS hit_rate,
+                       SUM(CASE WHEN hit=1 THEN 0.909 ELSE -1.0 END) AS profit
+                FROM backtest_results
+                GROUP BY market
+                ORDER BY market
+                """
+            ).fetchall()
+
+            # Per-edge-bucket (0-3%, 3-6%, 6-10%, 10%+)
+            bucket_rows = conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN edge < 0.03 THEN '0-3%'
+                        WHEN edge < 0.06 THEN '3-6%'
+                        WHEN edge < 0.10 THEN '6-10%'
+                        ELSE '10%+'
+                    END AS bucket,
+                    COUNT(*) AS bets,
+                    SUM(hit) AS hits,
+                    AVG(hit) AS hit_rate
+                FROM backtest_results
+                WHERE edge > 0
+                GROUP BY bucket
+                ORDER BY bucket
+                """
+            ).fetchall()
+
+            # Calibration: model_prob_over binned into 5% bands
+            cal_rows = conn.execute(
+                """
+                SELECT
+                    ROUND(model_prob_over / 0.05) * 0.05 AS prob_bin,
+                    AVG(hit)  AS actual_hit_rate,
+                    COUNT(*)  AS n
+                FROM backtest_results
+                GROUP BY prob_bin
+                ORDER BY prob_bin
+                """
+            ).fetchall()
+
+        return {
+            'markets':     [dict(r) for r in mkt_rows],
+            'buckets':     [dict(r) for r in bucket_rows],
+            'calibration': [dict(r) for r in cal_rows],
+        }
