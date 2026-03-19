@@ -154,7 +154,7 @@ class NbaStatsClient:
             from nba_api.stats.endpoints import leaguedashplayerstats
             stats = leaguedashplayerstats.LeagueDashPlayerStats(
                 season=self.season,
-                per_mode_simple='Totals',
+                per_mode_detailed='Totals',
             )
             time.sleep(0.6)
             df = stats.get_data_frames()[0]
@@ -333,7 +333,7 @@ class NbaStatsClient:
         logger.info("Fetching league-wide player season stats (PerGame) for PG/big detection")
         stats = leaguedashplayerstats.LeagueDashPlayerStats(
             season=self.season,
-            per_mode_simple='PerGame',
+            per_mode_detailed='PerGame',
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]

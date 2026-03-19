@@ -55,6 +55,28 @@ class OddsApiClient:
         return response.json()
 
     @staticmethod
+    def extract_consensus_total(bookmakers: List[Dict]) -> Optional[float]:
+        """
+        Return the median over/under game total across all books that carry
+        the totals market. Returns None when no totals data is present.
+        """
+        totals: List[float] = []
+        for book in bookmakers:
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'totals':
+                    continue
+                for outcome in mkt.get('outcomes', []):
+                    point = outcome.get('point')
+                    if point is not None:
+                        totals.append(float(point))
+                        break  # only need one side per book
+        if not totals:
+            return None
+        totals.sort()
+        mid = len(totals) // 2
+        return (totals[mid - 1] + totals[mid]) / 2.0 if len(totals) % 2 == 0 else totals[mid]
+
+    @staticmethod
     def extract_consensus_spread(bookmakers: List[Dict], home_team: str) -> Optional[float]:
         """
         Return the median spread for the home team across all books that carry

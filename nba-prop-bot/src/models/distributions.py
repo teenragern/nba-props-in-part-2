@@ -103,11 +103,20 @@ def compute_player_foul_rate(logs: pd.DataFrame) -> float:
     return float(max(0.0, recent['PF'].sum() / total_min))
 
 
+_NBA_AVG_TOTAL    = 220.0
+_Q3_TIME_FRACTION = 0.75
+_Q3_MARGIN_SIGMA  = 11.0 * np.sqrt(_Q3_TIME_FRACTION)   # ≈ 9.53 pts
+_BLOWOUT_MARGIN   = 15.0
+
+
 def monte_carlo_over_under(
     mean_proj: float,
     proj_minutes: float,
     line: float,
+    spread: float = 0.0,
+    total: float = 0.0,
     blowout_prob: float = 0.0,
+    blowout_minute_cap: float = 28.0,
     player_foul_rate: float = 0.0,
     opp_foul_rate: float = 1.0,
     n_sims: int = 1000,
@@ -116,10 +125,17 @@ def monte_carlo_over_under(
     """
     Vectorized Monte Carlo simulation over n_sims game scenarios.
 
-    Blowout model
-    ─────────────
-    With probability `blowout_prob`, starters play only 65–85 % of their
-    projected minutes (4th-quarter rest in a blowout).
+    Blowout model — two modes
+    ─────────────────────────
+    Mode A (preferred): spread + total provided.
+      Each sim independently draws a Q3-end margin:
+          q3_margin ~ N(|spread| × 0.75,  σ_q3)
+      where σ_q3 = 9.53 × √(total / 220) scales with game pace.
+      If |q3_margin| > 15, starter sits Q4:
+          sim_min = min(proj_minutes, blowout_minute_cap=28)
+
+    Mode B (fallback): blowout_prob scalar provided.
+      P(blowout) gate → same minute cap (no random 65-85% factor).
 
     Foul-trouble model (two-phase Poisson)
     ──────────────────────────────────────
@@ -148,10 +164,22 @@ def monte_carlo_over_under(
     # ── 1. Simulate effective minutes ──────────────────────────────────────
     sim_min = np.full(n_sims, proj_minutes, dtype=np.float64)
 
-    if blowout_prob > 0.0:
+    if spread != 0.0 and total > 0.0:
+        # Mode A: per-sim Q3 game state derived from spread + total.
+        # Higher totals (faster pace) → more quarter-level variance.
+        pace_scale = np.sqrt(max(total, 180.0) / _NBA_AVG_TOTAL)
+        q3_sigma   = _Q3_MARGIN_SIGMA * pace_scale
+        q3_margin  = rng.normal(abs(spread) * _Q3_TIME_FRACTION, q3_sigma, n_sims)
+        is_blowout = np.abs(q3_margin) > _BLOWOUT_MARGIN
+        sim_min    = np.where(is_blowout,
+                              np.minimum(sim_min, blowout_minute_cap),
+                              sim_min)
+    elif blowout_prob > 0.0:
+        # Mode B: precomputed scalar probability (legacy / backtest path).
         is_blowout = rng.random(n_sims) < blowout_prob
-        factors = rng.uniform(0.65, 0.85, n_sims)
-        sim_min = np.where(is_blowout, sim_min * factors, sim_min)
+        sim_min    = np.where(is_blowout,
+                              np.minimum(sim_min, blowout_minute_cap),
+                              sim_min)
 
     adj_foul_rate = player_foul_rate * max(0.5, float(opp_foul_rate))
     if adj_foul_rate > 0.0:
@@ -208,6 +236,8 @@ def get_probability_distribution(
     logs: Optional[pd.DataFrame] = None,
     variance_scale: float = 1.0,
     proj_minutes: float = 0.0,
+    spread: float = 0.0,
+    total: float = 0.0,
     blowout_prob: float = 0.0,
     player_foul_rate: float = 0.0,
     opp_foul_rate: float = 1.0,
@@ -215,19 +245,27 @@ def get_probability_distribution(
     """
     Return {prob_over, prob_under} for a player prop.
 
-    When `proj_minutes > 0` and either `blowout_prob > 0` or
-    `player_foul_rate > 0`, a Monte Carlo simulation is run to account for
-    game-state-driven minute reductions (blowouts, foul trouble).
+    Monte Carlo path engages when proj_minutes > 0 AND any of:
+      - spread + total provided  (per-sim Q3 game simulation)
+      - blowout_prob > 0         (scalar fallback)
+      - player_foul_rate > 0     (foul-trouble model)
 
-    Falls back to the existing parametric / bootstrap methods otherwise.
+    Falls back to parametric / bootstrap when none of the above apply.
     """
     if mean <= 0:
         return {"prob_over": 0.0, "prob_under": 1.0}
 
     # Monte Carlo path — engaged when meaningful contextual signals exist
-    if proj_minutes > 0.0 and (blowout_prob > 0.0 or player_foul_rate > 0.0):
+    _use_mc = proj_minutes > 0.0 and (
+        (spread != 0.0 and total > 0.0)
+        or blowout_prob > 0.0
+        or player_foul_rate > 0.0
+    )
+    if _use_mc:
         return monte_carlo_over_under(
             mean, proj_minutes, line,
+            spread=spread,
+            total=total,
             blowout_prob=blowout_prob,
             player_foul_rate=player_foul_rate,
             opp_foul_rate=opp_foul_rate,

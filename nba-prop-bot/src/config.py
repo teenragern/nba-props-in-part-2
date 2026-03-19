@@ -35,6 +35,9 @@ SHARP_EDGE_MIN  = float(os.getenv("SHARP_EDGE_MIN", "0.03"))
 # Books used for synthetic consensus line — devigged independently then weighted
 CONSENSUS_BOOKS_RAW = os.getenv("CONSENSUS_BOOKS", "pinnacle,circa,bookmaker")
 CONSENSUS_BOOKS     = [b.strip().lower() for b in CONSENSUS_BOOKS_RAW.split(",") if b.strip()]
+# Max theoretical hold before a sharp book is excluded from consensus.
+# A spike above their normal ~4% signals a defensive placeholder, not a real line.
+CONSENSUS_HOLD_MAX  = float(os.getenv("CONSENSUS_HOLD_MAX", "0.06"))  # 6%
 
 PROP_MARKETS = [
     "player_points",

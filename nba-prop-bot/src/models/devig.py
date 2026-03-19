@@ -6,6 +6,16 @@ def decimal_to_implied_prob(odds: float) -> float:
     return 1.0 / odds
 
 
+def get_theoretical_hold(prob_over_raw: float, prob_under_raw: float) -> float:
+    """
+    Return the theoretical hold (overround) for a two-way market.
+    Normal sharp-book range: ~0.02–0.04 on props.
+    A spike to 0.07+ signals the book is protecting itself (injury news,
+    stale line) — the price is no longer a reliable signal.
+    """
+    return (prob_over_raw + prob_under_raw) - 1.0
+
+
 def devig_two_way(prob_over_raw: float, prob_under_raw: float) -> Tuple[float, float]:
     total = prob_over_raw + prob_under_raw
     if total == 0: return 0.0, 0.0
@@ -24,12 +34,16 @@ def build_consensus_true_prob(
         over   (float) — deviggged true P(over) from that book
         under  (float) — deviggged true P(under) from that book
         weight (float) — accuracy weight (higher = more trusted)
+        hold   (float) — raw theoretical hold before devigging (informational)
+
+    Books with elevated holds should already be filtered by the caller
+    (see CONSENSUS_HOLD_MAX in config.py) before being passed here.
 
     Returns
     -------
     consensus_over  : float   weighted-average P(over), clamped to [0.01, 0.99]
     consensus_under : float   1 - consensus_over
-    label           : str     e.g. "Pinnacle+Circa" — books that contributed
+    label           : str     e.g. "Pinnacle+Circa (hold≈3.1%)" — books that contributed
     """
     if not book_probs:
         return 0.5, 0.5, ''
@@ -41,5 +55,7 @@ def build_consensus_true_prob(
     consensus_over = sum(b['over'] * b['weight'] for b in book_probs) / total_weight
     consensus_over = float(max(0.01, min(0.99, consensus_over)))
 
-    label = '+'.join(b['book'] for b in book_probs)
+    avg_hold = sum(b.get('hold', 0.0) for b in book_probs) / len(book_probs)
+    book_names = '+'.join(b['book'] for b in book_probs)
+    label = f"{book_names} (hold≈{avg_hold:.1%})"
     return consensus_over, 1.0 - consensus_over, label

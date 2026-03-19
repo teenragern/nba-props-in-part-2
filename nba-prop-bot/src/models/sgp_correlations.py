@@ -5,9 +5,22 @@ Books price SGPs assuming prop legs are independent — they aren't.
 This module computes Pearson correlations between a player's stat lines
 from historical game logs and uses them to estimate true joint probability.
 
-Adjustment formula (bivariate normal approximation):
-  P(A AND B) ≈ P(A)*P(B) + corr(A,B) * σ(A) * σ(B)
-  where σ(X) = sqrt(P(X) * (1 - P(X)))
+Two joint-probability methods are available:
+
+1. Gaussian Copula + Poisson marginals (low-count props, line ≤ 3.5)
+   Used for threes, steals, blocks — anything that is bounded at zero,
+   heavily right-skewed, and hits single-digit values most of the time.
+   The bivariate normal formula wildly overestimates P(both rare events)
+   in this regime because it ignores the probability mass at zero.
+
+   Steps:
+     u_i = poisson.cdf(floor(line_i), mu=mean_i)   # marginal CDF
+     z_i = Φ⁻¹(u_i)                                # standard-normal quantile
+     P(A>line, B>line) = 1 − u_a − u_b + Φ₂(z_a, z_b, ρ)
+
+2. Bivariate normal approximation (all other props):
+   P(A AND B) ≈ P(A)·P(B) + ρ·σ(A)·σ(B)
+   where σ(X) = sqrt(P(X)·(1−P(X)))
 
 Usage:
   from src.models.sgp_correlations import get_sgp_edge
@@ -16,6 +29,7 @@ Usage:
 
 import numpy as np
 import pandas as pd
+from scipy.stats import poisson, norm, multivariate_normal
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.logging_utils import get_logger
@@ -92,11 +106,72 @@ def get_pairwise_correlation(market_a: str, market_b: str,
     return LEAGUE_AVG_CORRELATIONS.get(key, 0.0)
 
 
-def adjust_joint_probability(prob_a: float, prob_b: float, correlation: float) -> float:
+# Props with lines at or below this threshold use the Poisson–Gaussian copula
+# instead of the bivariate normal approximation.
+_LOW_COUNT_LINE = 3.5
+
+
+def _gaussian_copula_joint(
+    mean_a: float, mean_b: float,
+    line_a: float, line_b: float,
+    correlation: float,
+) -> float:
     """
-    Bivariate normal adjustment for correlated binary outcomes.
-    P(A AND B) ≈ P(A)*P(B) + corr * σ(A) * σ(B)
+    P(X_a > line_a, X_b > line_b) via Gaussian copula with Poisson marginals.
+
+    Transforms each Poisson CDF value to a standard-normal quantile, then
+    evaluates the bivariate normal upper-orthant probability:
+
+        u_i = P(X_i ≤ floor(line_i))  [Poisson CDF]
+        z_i = Φ⁻¹(u_i)
+        P(both over) = 1 − u_a − u_b + Φ₂(z_a, z_b, ρ)
+
+    Returns the bivariate normal approximation as a fallback if either mean
+    is non-positive.
     """
+    if mean_a <= 0 or mean_b <= 0:
+        return 0.0
+
+    _EPS = 1e-9
+    u_a = float(np.clip(poisson.cdf(int(np.floor(line_a)), mu=mean_a), _EPS, 1 - _EPS))
+    u_b = float(np.clip(poisson.cdf(int(np.floor(line_b)), mu=mean_b), _EPS, 1 - _EPS))
+
+    z_a = float(norm.ppf(u_a))
+    z_b = float(norm.ppf(u_b))
+
+    rho = float(np.clip(correlation, -0.999, 0.999))
+    cov = [[1.0, rho], [rho, 1.0]]
+    joint_cdf = float(multivariate_normal.cdf([z_a, z_b], mean=[0.0, 0.0], cov=cov))
+
+    # P(A > line_a, B > line_b) = 1 - u_a - u_b + Φ₂(z_a, z_b, ρ)
+    return float(np.clip(1.0 - u_a - u_b + joint_cdf, 0.001, 0.999))
+
+
+def adjust_joint_probability(
+    prob_a: float,
+    prob_b: float,
+    correlation: float,
+    mean_a: Optional[float] = None,
+    mean_b: Optional[float] = None,
+    line_a: Optional[float] = None,
+    line_b: Optional[float] = None,
+) -> float:
+    """
+    Return P(leg_a hits AND leg_b hits) adjusted for correlation.
+
+    Uses the Gaussian copula with Poisson marginals when either prop line is
+    ≤ 3.5 (threes, steals, blocks) and both Poisson means are available.
+    Falls back to the bivariate normal approximation otherwise.
+    """
+    use_copula = (
+        mean_a is not None and mean_b is not None
+        and line_a is not None and line_b is not None
+        and (line_a <= _LOW_COUNT_LINE or line_b <= _LOW_COUNT_LINE)
+    )
+    if use_copula:
+        return _gaussian_copula_joint(mean_a, mean_b, line_a, line_b, correlation)
+
+    # Bivariate normal approximation
     prob_a = float(np.clip(prob_a, 0.001, 0.999))
     prob_b = float(np.clip(prob_b, 0.001, 0.999))
     sigma_a = np.sqrt(prob_a * (1 - prob_a))
@@ -128,15 +203,27 @@ def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -
 
     if len(legs) == 2:
         corr = get_pairwise_correlation(legs[0]['market'], legs[1]['market'], player_logs)
-        joint_true = adjust_joint_probability(true_probs[0], true_probs[1], corr)
+        joint_true = adjust_joint_probability(
+            true_probs[0], true_probs[1], corr,
+            mean_a=legs[0].get('mean'), mean_b=legs[1].get('mean'),
+            line_a=legs[0].get('line'), line_b=legs[1].get('line'),
+        )
         corr_applied = corr
     else:
-        # Multi-leg: sequentially apply pairwise corrections
+        # Multi-leg: sequentially apply pairwise corrections.
+        # Copula is applied for the first pair when means/lines are present;
+        # subsequent steps use bivariate normal (joint_true has no Poisson mean).
         joint_true = true_probs[0]
         corr_applied = 0.0
         for i in range(1, len(legs)):
             corr = get_pairwise_correlation(legs[i - 1]['market'], legs[i]['market'], player_logs)
-            joint_true = adjust_joint_probability(joint_true, true_probs[i], corr)
+            mean_a = legs[i - 1].get('mean') if i == 1 else None
+            line_a = legs[i - 1].get('line') if i == 1 else None
+            joint_true = adjust_joint_probability(
+                joint_true, true_probs[i], corr,
+                mean_a=mean_a, mean_b=legs[i].get('mean'),
+                line_a=line_a, line_b=legs[i].get('line'),
+            )
             corr_applied += corr
         corr_applied /= len(legs) - 1
 

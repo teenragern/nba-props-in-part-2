@@ -2,24 +2,30 @@
 Multi-leg combo (parlay) generator.
 
 After single-leg edges are ranked, this module composes 2–4 leg combos
-from the top actionable edges, computes joint probability (with correlation
-adjustments for same-player combos), and sends the best combos to Telegram.
+from the top actionable edges per game, computes joint probability (with
+correlation adjustments for same-team combos), and sends the best combo
+for each game on the slate.
+
+Rules:
+  • One parlay per game — the highest-edge combo across all leg counts.
+  • All legs must be from different players (no intra-player SGPs).
+  • Same-team 2-leg pairs use cross-player historical correlation from DB.
+  • Opposing-team / 3+ player combos assume independence.
 """
 
 from itertools import combinations
 from math import prod
 from typing import List, Dict, Any
 
-from src.models.sgp_correlations import get_sgp_edge, adjust_joint_probability
+from src.models.sgp_correlations import adjust_joint_probability
 from src.clients.telegram_bot import TelegramBotClient
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-MAX_LEGS           = 4    # maximum legs per combo
-MAX_INPUT_EDGES    = 12   # only consider top-N edges as candidates
-MAX_COMBOS_TO_SEND = 5    # anti-spam: max Telegram messages per scan
-COMBO_EDGE_MIN     = 0.03  # minimum joint edge to alert on
+MAX_LEGS        = 4     # maximum legs per combo
+MAX_INPUT_EDGES = 15    # top-N edges per game considered as candidates
+COMBO_EDGE_MIN  = 0.02  # minimum joint edge to alert on
 
 _MARKET_LABELS: Dict[str, str] = {
     'player_points':                  'Points',
@@ -40,22 +46,19 @@ def _american(decimal_odds: float) -> str:
 
 
 def _compatible(legs: List[Dict]) -> bool:
-    """Return False if the same player+market appears on opposing sides."""
-    seen: Dict = {}
-    for leg in legs:
-        key = (leg['player_id'], leg['market'])
-        if key in seen and seen[key] != leg['side']:
-            return False
-        seen[key] = leg['side']
-    return True
+    """
+    Return True only when all legs are from different players.
+    Intra-player parlays (same player, different markets) are excluded —
+    books price those in their SGP builder with hidden holds.
+    """
+    return len({leg['player_id'] for leg in legs}) == len(legs)
 
 
 def _combo_edge(legs: List[Dict], db=None) -> Dict:
     """
     Compute joint edge for a combo.
 
-    Same-player combos: use intra-player SGP correlation model.
-    Same-team, different-player combos (2-leg): look up cross-player
+    Same-team, different-player 2-leg combos: look up cross-player
       historical correlation from DB (PG assists ↔ C/PF points, etc.).
     All other multi-player combos: assume independence.
     """
@@ -65,15 +68,13 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
             'side':         leg['side'],
             'prob':         leg['model_prob'],
             'implied_prob': leg['implied_prob'],
+            'mean':         leg.get('mean'),
+            'line':         leg.get('line'),
         }
         for leg in legs
     ]
 
     player_ids = {leg['player_id'] for leg in legs}
-
-    if len(player_ids) == 1:
-        # Same player — intra-player correlation model
-        return get_sgp_edge(sgp_legs, player_logs=None)
 
     # Two legs from different players on the same team → cross-player lookup
     if db is not None and len(legs) == 2 and len(player_ids) == 2:
@@ -84,11 +85,13 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
             ma, mb = legs[0]['market'],    legs[1]['market']
             corr = db.get_cross_player_correlation(team_a, pa, pb, ma, mb)
             if corr is None:
-                # Try swapped order (a/b symmetric in DB key)
                 corr = db.get_cross_player_correlation(team_a, pb, pa, mb, ma)
             if corr is not None:
                 jt = adjust_joint_probability(
-                    legs[0]['model_prob'], legs[1]['model_prob'], corr)
+                    legs[0]['model_prob'], legs[1]['model_prob'], corr,
+                    mean_a=legs[0].get('mean'), mean_b=legs[1].get('mean'),
+                    line_a=legs[0].get('line'), line_b=legs[1].get('line'),
+                )
                 jb = prod(l['implied_prob'] for l in sgp_legs)
                 return {
                     'joint_true_prob':     jt,
@@ -97,7 +100,7 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
                     'correlation_applied': corr,
                 }
 
-    # Default: assume independence
+    # Default: assume independence across different players / teams
     jt = prod(l['prob']         for l in sgp_legs)
     jb = prod(l['implied_prob'] for l in sgp_legs)
     return {
@@ -108,17 +111,18 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
     }
 
 
-def _format_combo(legs: List[Dict], edge: float, joint_prob: float) -> str:
+def _format_combo(legs: List[Dict], edge: float, joint_prob: float,
+                  away_team: str, home_team: str) -> str:
     combined = prod(leg['odds'] for leg in legs)
-    lines = [f"🎯 <b>{len(legs)}-Leg Combo</b>\n"]
+    header = f"🎯 <b>{len(legs)}-Leg Parlay — {away_team} @ {home_team}</b>\n"
+    lines = [header]
     for leg in legs:
         market = _MARKET_LABELS.get(leg['market'], leg['market'])
         lines.append(
             f"• <b>{leg['player_id']}</b> {leg['side']} {leg['line']} {market}"
             f" @ {leg.get('book', '')} ({_american(leg['odds'])})"
         )
-    lines.append(f"\nCombined Odds: {_american(combined)} | Edge: {edge:.1%}")
-    lines.append(f"Joint Probability: {joint_prob:.1%}")
+    lines.append(f"\nCombined: {_american(combined)} | Edge: {edge:.1%} | Hit Prob: {joint_prob:.1%}")
     return "\n".join(lines)
 
 
@@ -128,7 +132,11 @@ def generate_and_alert_combos(
     db=None,
 ) -> None:
     """
-    Generate 2–4 leg combos from the top actionable edges and send to Telegram.
+    Generate the best diverse parlay for each game on the slate.
+
+    Groups actionable edges by event_id, then for each game finds the
+    highest-edge 2–4 leg combo where every leg comes from a different player.
+    Sends exactly one Telegram message per game (skips games with < 2 edges).
 
     Args:
         actionable: ranked list of edge dicts (from rank_edges), best first.
@@ -137,39 +145,48 @@ def generate_and_alert_combos(
     if len(actionable) < 2:
         return
 
-    pool = actionable[:MAX_INPUT_EDGES]
-    candidates = []
-
-    for size in range(2, MAX_LEGS + 1):
-        for combo in combinations(pool, size):
-            legs = list(combo)
-            if not _compatible(legs):
-                continue
-            result = _combo_edge(legs, db=db)
-            combo_edge = result.get('sgp_edge', 0)
-            if combo_edge < COMBO_EDGE_MIN:
-                continue
-            candidates.append({
-                'legs':       legs,
-                'edge':       combo_edge,
-                'joint_prob': result.get('joint_true_prob', 0),
-            })
-
-    candidates.sort(key=lambda x: x['edge'], reverse=True)
+    # Group edges by game
+    games: Dict[str, List[Dict]] = {}
+    for edge in actionable:
+        eid = edge.get('event_id', 'unknown')
+        games.setdefault(eid, []).append(edge)
 
     sent = 0
-    for c in candidates:
-        if sent >= MAX_COMBOS_TO_SEND:
-            break
-        msg = _format_combo(c['legs'], c['edge'], c['joint_prob'])
+    for event_id, edges in games.items():
+        if len(edges) < 2:
+            continue
+
+        pool = edges[:MAX_INPUT_EDGES]
+        best: Dict = {}
+
+        for size in range(2, MAX_LEGS + 1):
+            for combo in combinations(pool, size):
+                legs = list(combo)
+                if not _compatible(legs):
+                    continue
+                result = _combo_edge(legs, db=db)
+                combo_edge = result.get('sgp_edge', 0)
+                if combo_edge < COMBO_EDGE_MIN:
+                    continue
+                if not best or combo_edge > best['edge']:
+                    best = {
+                        'legs':       legs,
+                        'edge':       combo_edge,
+                        'joint_prob': result.get('joint_true_prob', 0),
+                    }
+
+        if not best:
+            continue
+
+        away = best['legs'][0].get('away_team', '')
+        home = best['legs'][0].get('home_team', '')
+        msg = _format_combo(best['legs'], best['edge'], best['joint_prob'], away, home)
         bot.send_message(msg)
         logger.info(
-            f"Combo alert sent: {len(c['legs'])}-leg, edge={c['edge']:.2%}, "
-            f"joint_prob={c['joint_prob']:.2%}"
+            f"Game parlay sent: {away} @ {home} | "
+            f"{len(best['legs'])}-leg | edge={best['edge']:.2%} | "
+            f"joint_prob={best['joint_prob']:.2%}"
         )
         sent += 1
 
-    if sent:
-        logger.info(f"Total combo alerts sent this scan: {sent}")
-    else:
-        logger.info("No qualifying combos found this scan.")
+    logger.info(f"Game parlays sent: {sent}/{len(games)} games on slate.")

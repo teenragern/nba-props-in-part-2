@@ -23,14 +23,16 @@ from src.clients.odds_api import OddsApiClient
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
-from src.config import PROP_MARKETS, EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN, CONSENSUS_BOOKS
+from src.config import PROP_MARKETS, EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN, CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX
 from src.models.projections import build_player_projection
 from src.models.distributions import (
     get_probability_distribution,
-    spread_to_blowout_prob,
     compute_player_foul_rate,
 )
-from src.models.devig import decimal_to_implied_prob, devig_two_way, build_consensus_true_prob
+from src.models.devig import (
+    decimal_to_implied_prob, devig_two_way,
+    build_consensus_true_prob, get_theoretical_hold,
+)
 from src.models.edge_ranker import rank_edges, set_db as set_ranker_db
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert
@@ -109,9 +111,19 @@ def get_consensus_true_prob(
         if over_price and under_price:
             raw_o = decimal_to_implied_prob(over_price)
             raw_u = decimal_to_implied_prob(under_price)
+            hold  = get_theoretical_hold(raw_o, raw_u)
+            if hold > CONSENSUS_HOLD_MAX:
+                logger.debug(
+                    f"Skip {book['title']} consensus ({player_name} {market_key} {line}): "
+                    f"hold={hold:.1%} > threshold {CONSENSUS_HOLD_MAX:.1%} — defensive placeholder"
+                )
+                continue
             true_o, true_u = devig_two_way(raw_o, raw_u)
             weight = book_weights.get(title_lower, 0.5)
-            book_probs.append({'book': book['title'], 'over': true_o, 'under': true_u, 'weight': weight})
+            book_probs.append({
+                'book': book['title'], 'over': true_o, 'under': true_u,
+                'weight': weight, 'hold': hold,
+            })
     if not book_probs:
         return None, None, None
     cons_o, cons_u, label = build_consensus_true_prob(book_probs)
@@ -214,7 +226,7 @@ def scan_props():
 
         try:
             odds_data = odds_client.get_event_odds(
-                event_id=event_id, markets=[*PROP_MARKETS, 'spreads'])
+                event_id=event_id, markets=[*PROP_MARKETS, 'spreads', 'totals'])
         except Exception:
             continue
 
@@ -222,9 +234,9 @@ def scan_props():
         if not bookmakers:
             continue
 
-        # Blowout probability for the whole event (shared by all players in this game)
+        # Game context for Monte Carlo (shared by all players in this game)
         _home_spread = OddsApiClient.extract_consensus_spread(bookmakers, home_team)
-        _blowout_prob = spread_to_blowout_prob(_home_spread) if _home_spread is not None else 0.0
+        _game_total  = OddsApiClient.extract_consensus_total(bookmakers)
 
         # Build cross-player correlation matrix for both teams (7-day DB cache)
         for _team in (home_team, away_team):
@@ -443,7 +455,8 @@ def scan_props():
                         logs=logs,
                         variance_scale=proj.get('variance_scale', 1.0),
                         proj_minutes=proj['projected_minutes'],
-                        blowout_prob=_blowout_prob,
+                        spread=_home_spread or 0.0,
+                        total=_game_total or 0.0,
                         player_foul_rate=_player_foul_rate,
                         opp_foul_rate=_opp_ctx['opp_fta_rate'],
                     )
