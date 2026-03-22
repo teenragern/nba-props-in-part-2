@@ -5,7 +5,7 @@ Trains one XGBRegressor per market (points/rebounds/assists/threes) on
 historical player game logs. Predictions are blended 50/50 with the
 Bayesian model in scan_props.py.
 
-Feature vector per game prediction (18 features):
+Feature vector per game prediction (21 features):
   Base rates:
     rate_5g          per-minute rate over last 5 games
     rate_10g         per-minute rate over last 10 games
@@ -22,6 +22,10 @@ Feature vector per game prediction (18 features):
     streak_factor    rate last 3 games / rate games 4-10 (hot/cold momentum, clamped 0.5–2.0)
     home_rate_delta  historical home per-min rate minus away per-min rate
     usage_proxy_5g   (FGA + 0.44*FTA + TOV) / MIN over last 5 games (shot/possession volume)
+  Travel fatigue:
+    travel_miles     straight-line miles traveled since last game
+    tz_shift_hours   hours shifted east (+) or west (-) vs. last arena
+    altitude_flag    1 if tonight's venue ≥ 4 000 ft (Denver/Utah)
   Matchup context:
     opp_def_rating   opponent defensive strength for this market (1.0 = league avg)
     pace_factor      (team_pace + opp_pace) / (2 * league_avg) — game tempo
@@ -41,6 +45,8 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Dict, List, Tuple
 
+from src.clients.travel_fatigue import travel_features_for_game
+
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'xgb')
 MIN_TRAIN_SAMPLES = 50
 
@@ -49,6 +55,8 @@ _MARKET_COL = {
     'player_rebounds': 'REB',
     'player_assists':  'AST',
     'player_threes':   'FG3M',
+    'player_blocks':   'BLK',
+    'player_steals':   'STL',
 }
 
 FEATURE_NAMES = [
@@ -59,6 +67,8 @@ FEATURE_NAMES = [
     # Situational
     'home_flag', 'rest_days', 'b2b_flag', 'games_played',
     'streak_factor', 'home_rate_delta', 'usage_proxy_5g',
+    # Travel fatigue
+    'travel_miles', 'tz_shift_hours', 'altitude_flag',
     # Matchup context
     'opp_def_rating', 'pace_factor',
     'opp_pace', 'opp_rebound_pct', 'opp_pts_paint',
@@ -175,7 +185,10 @@ class PropMLModel:
                        pace_factor: float = 1.0,
                        opp_pace: float = 1.0,
                        opp_rebound_pct: float = 1.0,
-                       opp_pts_paint: float = 1.0) -> Optional[Dict]:
+                       opp_pts_paint: float = 1.0,
+                       travel_miles: float = 0.0,
+                       tz_shift_hours: int = 0,
+                       altitude_flag: bool = False) -> Optional[Dict]:
         """Build feature dict from game logs. Returns None if insufficient data."""
         if logs.empty or len(logs) < 3:
             return None
@@ -204,6 +217,10 @@ class PropMLModel:
             'streak_factor':    self._streak_factor(logs),
             'home_rate_delta':  self._home_rate_delta(logs),
             'usage_proxy_5g':   self._usage_proxy(logs, n=5),
+            # Travel fatigue
+            'travel_miles':     float(travel_miles),
+            'tz_shift_hours':   int(tz_shift_hours),
+            'altitude_flag':    int(altitude_flag),
             # Matchup context
             'opp_def_rating':   float(opp_def_rating),
             'pace_factor':      float(pace_factor),
@@ -276,9 +293,15 @@ class PropMLModel:
             opp_paint   = (opp_pts_paint_lookup.get(opp_abbr, 1.0)
                            if opp_pts_paint_lookup else 1.0)
 
+            # Travel features: current game arena vs. previous game arena
+            own_abbr = str(current.get('TEAM_ABBREVIATION', '')).upper()
+            prev_matchup = str(chron.iloc[i - 1].get('MATCHUP', ''))
+            t_miles, t_tz, t_alt = travel_features_for_game(matchup, prev_matchup, own_abbr)
+
             feats = self.build_features(
                 history, is_home, rest, opp_def, pace,
                 opp_pace_norm, opp_reb_pct, opp_paint,
+                travel_miles=t_miles, tz_shift_hours=t_tz, altitude_flag=t_alt,
             )
             if feats is None:
                 continue
@@ -330,7 +353,10 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
                       pace_factor: float = 1.0,
                       opp_pace: float = 1.0,
                       opp_rebound_pct: float = 1.0,
-                      opp_pts_paint: float = 1.0) -> Optional[float]:
+                      opp_pts_paint: float = 1.0,
+                      travel_miles: float = 0.0,
+                      tz_shift_hours: int = 0,
+                      altitude_flag: bool = False) -> Optional[float]:
     """
     Public API: return ML mean projection for a player/market.
     Returns None if model is untrained or data insufficient.
@@ -346,20 +372,26 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
     if proj_minutes <= 0:
         return None
 
+    _travel_kwargs = dict(travel_miles=travel_miles, tz_shift_hours=tz_shift_hours,
+                          altitude_flag=altitude_flag)
+
     if market == 'player_points_rebounds_assists':
         pts = get_ml_projection('player_points',  logs, proj_minutes, home_flag, rest_days,
-                                opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint)
+                                opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
+                                **_travel_kwargs)
         reb = get_ml_projection('player_rebounds', logs, proj_minutes, home_flag, rest_days,
-                                opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint)
+                                opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
+                                **_travel_kwargs)
         ast = get_ml_projection('player_assists',  logs, proj_minutes, home_flag, rest_days,
-                                opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint)
+                                opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
+                                **_travel_kwargs)
         if any(v is None for v in [pts, reb, ast]):
             return None
         return pts + reb + ast
 
     model = PropMLModel(market)
     feats = model.build_features(logs, home_flag, rest_days, opp_def_rating, pace_factor,
-                                 opp_pace, opp_rebound_pct, opp_pts_paint)
+                                 opp_pace, opp_rebound_pct, opp_pts_paint, **_travel_kwargs)
     if feats is None:
         return None
 

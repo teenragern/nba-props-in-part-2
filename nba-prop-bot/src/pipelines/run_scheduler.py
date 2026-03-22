@@ -148,7 +148,7 @@ def job_clv():
 def job_steam():
     if not _has_games():
         return
-    notify("Steam", check_steam)
+    notify("Steam", check_steam, bot)
 
 
 def job_breaking_news():

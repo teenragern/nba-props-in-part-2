@@ -15,10 +15,11 @@ Rules:
 
 from itertools import combinations
 from math import prod
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from src.models.sgp_correlations import adjust_joint_probability
 from src.clients.telegram_bot import TelegramBotClient
+from src.pipelines.send_alerts import send_parlay_alert
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -27,12 +28,19 @@ MAX_LEGS        = 4     # maximum legs per combo
 MAX_INPUT_EDGES = 15    # top-N edges per game considered as candidates
 COMBO_EDGE_MIN  = 0.02  # minimum joint edge to alert on
 
+# Reality-tax: scale down joint probability to account for unknown unknowns
+# (correlated blowouts, last-second lineup news, model mis-calibration).
+# Applied only to the high-prob slate-wide parlays, not per-game combos.
+_REALITY_TAX: Dict[int, float] = {4: 0.88, 8: 0.75}
+
 _MARKET_LABELS: Dict[str, str] = {
     'player_points':                  'Points',
     'player_rebounds':                'Rebounds',
     'player_assists':                 'Assists',
     'player_threes':                  'Threes',
     'player_points_rebounds_assists': 'PRA',
+    'player_blocks':                  'Blocks',
+    'player_steals':                  'Steals',
 }
 
 
@@ -91,6 +99,7 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
                     legs[0]['model_prob'], legs[1]['model_prob'], corr,
                     mean_a=legs[0].get('mean'), mean_b=legs[1].get('mean'),
                     line_a=legs[0].get('line'), line_b=legs[1].get('line'),
+                    side_a=legs[0].get('side', 'OVER'), side_b=legs[1].get('side', 'OVER'),
                 )
                 jb = prod(l['implied_prob'] for l in sgp_legs)
                 return {
@@ -108,6 +117,48 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
         'joint_book_prob':     jb,
         'sgp_edge':            jt - jb,
         'correlation_applied': 0.0,
+    }
+
+
+def build_highest_prob_parlays(
+    actionable: List[Dict], n_legs: int, db=None
+) -> Optional[Dict]:
+    """
+    Build the n_legs parlay with the highest individual model_prob legs.
+
+    Greedy selection: sort by model_prob descending, take the first n legs
+    where all players are unique. Legs may span multiple games; cross-game
+    independence is assumed.
+
+    Returns None when fewer than n_legs unique-player edges are available.
+    Returns a dict with keys: legs, joint_prob, joint_book_prob, edge.
+    """
+    sorted_edges = sorted(actionable, key=lambda e: e.get('model_prob', 0), reverse=True)
+
+    legs: List[Dict] = []
+    seen_players: set = set()
+    for edge in sorted_edges:
+        if edge['player_id'] in seen_players:
+            continue
+        legs.append(edge)
+        seen_players.add(edge['player_id'])
+        if len(legs) == n_legs:
+            break
+
+    if len(legs) < n_legs:
+        return None
+
+    result = _combo_edge(legs, db=db)
+    raw_prob = result.get('joint_true_prob', 0)
+    # Apply reality tax: long parlays are harder to hit than pure math implies.
+    # Each additional leg introduces variance the model can't fully account for.
+    dampening = _REALITY_TAX.get(n_legs, 0.75)
+    dampened_prob = raw_prob * dampening
+    return {
+        'legs':            legs,
+        'joint_prob':      dampened_prob,
+        'joint_book_prob': result.get('joint_book_prob', 0),
+        'edge':            dampened_prob - result.get('joint_book_prob', 0),
     }
 
 
@@ -156,7 +207,13 @@ def generate_and_alert_combos(
         if len(edges) < 2:
             continue
 
-        pool = edges[:MAX_INPUT_EDGES]
+        # Balanced pool: right-skew bias means Unders dominate a naïve top-15.
+        # Force representation by capping each side independently before
+        # assembling the candidate pool (7 best Overs + 8 best Unders = 15).
+        _overs  = [e for e in edges if e.get('side', '').upper() == 'OVER'][:7]
+        _unders = [e for e in edges if e.get('side', '').upper() == 'UNDER'][:8]
+        pool = sorted(_overs + _unders,
+                      key=lambda e: e.get('risk_adjusted_ev', 0), reverse=True)
         best: Dict = {}
 
         for size in range(2, MAX_LEGS + 1):
@@ -190,3 +247,16 @@ def generate_and_alert_combos(
         sent += 1
 
     logger.info(f"Game parlays sent: {sent}/{len(games)} games on slate.")
+
+    # Slate-wide high-probability parlays — best 4-leg and 8-leg across all games
+    for n in (4, 8):
+        prob_result = build_highest_prob_parlays(actionable, n, db=db)
+        if prob_result:
+            send_parlay_alert(
+                legs=prob_result['legs'],
+                joint_true_prob=prob_result['joint_prob'],
+                joint_book_prob=prob_result['joint_book_prob'],
+                bot=bot,
+            )
+        else:
+            logger.info(f"{n}-leg high-prob parlay skipped — not enough unique-player edges.")

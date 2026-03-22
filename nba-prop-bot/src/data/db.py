@@ -508,6 +508,186 @@ class DatabaseClient:
         return float(row['correlation']) if row else None
 
     # ------------------------------------------------------------------ #
+    #  Steam detection                                                     #
+    # ------------------------------------------------------------------ #
+
+    def detect_steam_moves(
+        self,
+        window_minutes: int = 120,
+        sharp_move_threshold: float = 0.04,
+        stale_threshold: float = 0.01,
+        sharp_books: tuple = ('pinnacle', 'circa', 'bookmaker'),
+        soft_books: tuple = ('draftkings', 'fanduel', 'betmgm', 'caesars'),
+    ) -> list:
+        """
+        Detect sharp steam moves: a sharp book has moved its implied probability
+        by >= sharp_move_threshold within the window AND at least one soft book
+        is still priced near its original level (<= stale_threshold change).
+
+        Returns a list of dicts — one per detected steam opportunity — with keys:
+            player_name, market, side, line,
+            sharp_book, sharp_delta, sharp_first_prob, sharp_current_prob,
+            stale_book, stale_odds, stale_current_prob,
+            direction ('OVER' or 'UNDER'), elapsed_minutes
+        """
+        import pandas as pd
+
+        with self.get_conn() as conn:
+            try:
+                df = pd.read_sql_query(
+                    """
+                    SELECT player_name, market, side, line,
+                           bookmaker, odds, implied_prob, timestamp
+                    FROM line_history
+                    WHERE timestamp >= datetime('now', ?)
+                    ORDER BY timestamp ASC
+                    """,
+                    conn,
+                    params=(f'-{window_minutes} minutes',),
+                )
+            except Exception:
+                return []
+
+        if df.empty or len(df) < 4:
+            return []
+
+        df['bookmaker'] = df['bookmaker'].str.lower().str.strip()
+
+        moves = []
+
+        for (player, market, line, side), prop_df in df.groupby(
+            ['player_name', 'market', 'line', 'side'], sort=False
+        ):
+            book_stats: dict = {}
+            for book, book_df in prop_df.groupby('bookmaker', sort=False):
+                book_df = book_df.sort_values('timestamp')
+                n = len(book_df)
+                first_prob = float(book_df.iloc[0]['implied_prob'])
+                last_prob  = float(book_df.iloc[-1]['implied_prob'])
+                last_odds  = float(book_df.iloc[-1]['odds'])
+                delta      = last_prob - first_prob
+                elapsed    = 0.0
+                if n > 1:
+                    try:
+                        elapsed = (
+                            pd.to_datetime(book_df.iloc[-1]['timestamp'])
+                            - pd.to_datetime(book_df.iloc[0]['timestamp'])
+                        ).total_seconds() / 60.0
+                    except Exception:
+                        elapsed = 0.0
+                book_stats[book] = {
+                    'first_prob': first_prob,
+                    'last_prob':  last_prob,
+                    'last_odds':  last_odds,
+                    'delta':      delta,
+                    'elapsed':    elapsed,
+                    'n_obs':      n,
+                }
+
+            # Sharp books need ≥2 observations to confirm a real move
+            sharp_moves = {
+                b: s for b, s in book_stats.items()
+                if b in sharp_books
+                and s['n_obs'] >= 2
+                and abs(s['delta']) >= sharp_move_threshold
+            }
+            if not sharp_moves:
+                continue
+
+            # Soft books: stale when their delta is ≤ stale_threshold
+            stale_softs = {
+                b: s for b, s in book_stats.items()
+                if b in soft_books and abs(s['delta']) <= stale_threshold
+            }
+            if not stale_softs:
+                continue
+
+            best_sharp = max(sharp_moves, key=lambda b: abs(sharp_moves[b]['delta']))
+            sharp_info = sharp_moves[best_sharp]
+            direction  = 'OVER' if sharp_info['delta'] > 0 else 'UNDER'
+
+            # Best stale soft book = lowest implied_prob (highest decimal odds)
+            best_stale = min(stale_softs, key=lambda b: stale_softs[b]['last_prob'])
+            stale_info = stale_softs[best_stale]
+
+            moves.append({
+                'player_name':        player,
+                'market':             market,
+                'side':               side,
+                'line':               line,
+                'sharp_book':         best_sharp,
+                'sharp_delta':        round(sharp_info['delta'], 4),
+                'sharp_first_prob':   round(sharp_info['first_prob'], 4),
+                'sharp_current_prob': round(sharp_info['last_prob'], 4),
+                'stale_book':         best_stale,
+                'stale_odds':         stale_info['last_odds'],
+                'stale_current_prob': round(stale_info['last_prob'], 4),
+                'direction':          direction,
+                'elapsed_minutes':    round(sharp_info['elapsed'], 1),
+            })
+
+        return moves
+
+    def check_recent_steam_alert(
+        self, player_name: str, market: str, side: str, minutes: int = 30
+    ) -> bool:
+        """Return True if a steam alert for this player/market/side was already sent
+        within the last `minutes` minutes (deduplication guard)."""
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM steam_alerts
+                WHERE player_name = ? AND market = ? AND side = ?
+                  AND timestamp >= datetime('now', ?)
+                """,
+                (player_name, market, side, f'-{minutes} minutes'),
+            ).fetchone()
+        return row is not None
+
+    def insert_steam_alert(
+        self, player_name: str, market: str, side: str, line: float,
+        sharp_book: str, sharp_delta: float, sharp_current_prob: float,
+        stale_book: str, stale_odds: float, stale_current_prob: float,
+        direction: str,
+    ) -> None:
+        with self.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO steam_alerts
+                    (player_name, market, side, line, sharp_book, sharp_delta,
+                     sharp_current_prob, stale_book, stale_odds, stale_current_prob,
+                     direction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (player_name, market, side, line, sharp_book, sharp_delta,
+                 sharp_current_prob, stale_book, stale_odds, stale_current_prob,
+                 direction),
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Referee stats                                                       #
+    # ------------------------------------------------------------------ #
+
+    def get_referee_foul_rates(self, ref_names: list) -> list:
+        """
+        Return avg_pfd_per_game values for known referees.
+        Skips refs with no data (avg_pfd_per_game = 0.0 means unknown).
+        """
+        if not ref_names:
+            return []
+        placeholders = ",".join("?" * len(ref_names))
+        try:
+            with self.get_conn() as conn:
+                rows = conn.execute(
+                    f"SELECT avg_pfd_per_game FROM referee_stats "
+                    f"WHERE referee_name IN ({placeholders}) AND avg_pfd_per_game > 0",
+                    ref_names,
+                ).fetchall()
+            return [float(r["avg_pfd_per_game"]) for r in rows]
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------ #
     #  Backtesting                                                         #
     # ------------------------------------------------------------------ #
 

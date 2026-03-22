@@ -5,6 +5,33 @@ from src.models.distributions import get_probability_distribution
 # Priority 7: db is optional — set once from scan_props
 _state: Dict[str, Any] = {'db': None}
 
+# Time-based edge thresholds
+# Early-morning lines carry more pre-game uncertainty (injury news not yet priced in).
+# Close to tip-off the line is efficient but late info (scratches, warm-up reports)
+# can create real, low-latency edges that justify a looser threshold.
+_EARLY_EDGE_MIN  = 0.05   # > 4 hours to tip
+_LATE_EDGE_MIN   = 0.02   # < 1 hour to tip
+_EARLY_HOURS     = 4.0
+_LATE_HOURS      = 1.0
+
+
+def compute_dynamic_edge_min(hours_to_tipoff: float) -> float:
+    """
+    Scale the minimum edge requirement based on how close tip-off is.
+
+    Returns:
+        0.05  when hours_to_tipoff >= 4  (early — require strong edge)
+        0.02  when hours_to_tipoff <= 1  (pre-game — accept thin edge)
+        Linear interpolation between 1 and 4 hours.
+    """
+    if hours_to_tipoff >= _EARLY_HOURS:
+        return _EARLY_EDGE_MIN
+    if hours_to_tipoff <= _LATE_HOURS:
+        return _LATE_EDGE_MIN
+    # Linear blend: 0.02 at 1hr, 0.05 at 4hr
+    t = (hours_to_tipoff - _LATE_HOURS) / (_EARLY_HOURS - _LATE_HOURS)
+    return round(_LATE_EDGE_MIN + t * (_EARLY_EDGE_MIN - _LATE_EDGE_MIN), 4)
+
 
 def set_db(db):
     """Call once from scan_props to give edge_ranker access to DB for bias lookups."""
@@ -74,6 +101,10 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif velocity < -0.02 and edge > 0:
             edge *= 0.80  # fade anti-steam
 
+        # Real-time stale line: sharp repriced within 2 min, retail hasn't caught up
+        if c.get('timestamp_stale') and edge > 0:
+            edge *= 1.20  # velocity premium — chase before retail wakes up
+
         if dispersion > 0.04:
             edge *= 1.05  # inefficient market
         elif 0.0 < dispersion < 0.015:
@@ -113,10 +144,18 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         c['edge']                    = edge
         c['ev']                      = ev
         c['feedback_factor_applied'] = factor
+        c['edge_min_applied']        = compute_dynamic_edge_min(c.get('hours_to_tipoff', 4.0))
 
         # Risk-Adjusted EV (sort key)
         variance = (mean * 1.25) * var_scale if mean > 0 else 1.0
         c['risk_adjusted_ev'] = ev / variance if variance > 0 else ev
+
+        # Under Tax: NBA stat distributions are right-skewed (bounded at 0,
+        # unbounded above). The median is naturally below the mean, so Unders
+        # are mechanically over-represented in top rankings even without real
+        # edge. A 15% haircut lets high-quality Overs compete fairly.
+        if side.upper() == 'UNDER':
+            c['risk_adjusted_ev'] *= 0.85
 
         ranked.append(c)
 

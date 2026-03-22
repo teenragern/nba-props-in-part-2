@@ -4,13 +4,18 @@ import pandas as pd
 from typing import Dict, Optional
 
 
+POISSON_MARKETS = {'player_blocks', 'player_steals'}
+
+
 def get_market_col(market: str) -> str:
     market_map = {
         "player_points": "PTS",
         "player_rebounds": "REB",
         "player_assists": "AST",
         "player_threes": "FG3M",
-        "player_points_rebounds_assists": "PRA"
+        "player_points_rebounds_assists": "PRA",
+        "player_blocks": "BLK",
+        "player_steals": "STL",
     }
     return market_map.get(market, "")
 
@@ -30,6 +35,52 @@ def negative_binomial_over_under(mean: float, variance: float, line: float) -> D
     n = (mean ** 2) / (variance - mean)
 
     prob_under = nbinom.cdf(np.floor(line), n, p)
+    return {"prob_over": 1.0 - prob_under, "prob_under": prob_under}
+
+
+def estimate_zero_inflate(logs: pd.DataFrame, col: str) -> float:
+    """
+    Estimate the structural zero-inflation parameter π for a discrete stat.
+
+    π represents the probability of a structural zero beyond what a pure
+    Poisson distribution would predict (e.g. player never gets a chance to
+    block/steal in some games regardless of ability).
+
+    Method: method-of-moments — match empirical zero fraction to ZIP formula.
+      π = (empirical_zeros - e^(-λ)) / (1 - e^(-λ))  where λ = sample mean.
+    """
+    if logs.empty or col not in logs.columns or len(logs) < 5:
+        return 0.0
+    data = logs[col].dropna().values
+    if len(data) < 5:
+        return 0.0
+    sample_mean = float(np.mean(data))
+    if sample_mean <= 0:
+        return 0.0
+    empirical_zeros = float(np.mean(data == 0))
+    expected_zeros  = float(np.exp(-sample_mean))
+    pi = (empirical_zeros - expected_zeros) / max(1.0 - expected_zeros, 1e-6)
+    return float(np.clip(pi, 0.0, 0.50))
+
+
+def zip_over_under(mean: float, line: float, zero_inflate: float = 0.0) -> Dict[str, float]:
+    """
+    Zero-Inflated Poisson P(X > line).
+
+    Parameterisation:
+      π  = structural zero probability (estimated from logs)
+      λ  = Poisson rate such that E[X] = (1-π)·λ = mean  →  λ = mean/(1-π)
+      P(X ≤ k) = π + (1-π)·Poisson.cdf(k, λ)
+
+    Degenerates to standard Poisson when zero_inflate == 0.
+    """
+    if mean <= 0:
+        return {"prob_over": 0.0, "prob_under": 1.0}
+    pi  = float(np.clip(zero_inflate, 0.0, 0.50))
+    lam = mean / max(1.0 - pi, 0.50)
+    k   = int(np.floor(line))
+    prob_under = pi + (1.0 - pi) * float(poisson.cdf(k, mu=lam))
+    prob_under = float(np.clip(prob_under, 0.0, 1.0))
     return {"prob_over": 1.0 - prob_under, "prob_under": prob_under}
 
 
@@ -61,8 +112,10 @@ def bootstrap_over_under(logs: pd.DataFrame, col: str, line: float, num_draws: i
 
 DISPERSION_ALPHAS = {
     'player_rebounds': 0.15,
-    'player_assists': 0.12,
-    'player_threes': 0.20,
+    'player_assists':  0.12,
+    'player_threes':   0.20,
+    'player_blocks':   0.45,   # highly bursty — rim protectors vs. perimeter
+    'player_steals':   0.35,   # opportunity-driven, game-script dependent
 }
 
 
@@ -109,6 +162,25 @@ _Q3_MARGIN_SIGMA  = 11.0 * np.sqrt(_Q3_TIME_FRACTION)   # ≈ 9.53 pts
 _BLOWOUT_MARGIN   = 15.0
 
 
+def classify_bench_tier(proj_minutes: float) -> int:
+    """
+    Classify a player into a bench tier based on projected minutes.
+
+    Returns:
+        0 – Star         (≥ 32 min)
+        1 – Starter      (≥ 24 min)
+        2 – Rotation     (≥ 15 min)
+        3 – Bench        (<  15 min)  ← garbage-time beneficiary
+    """
+    if proj_minutes >= 32:
+        return 0
+    if proj_minutes >= 24:
+        return 1
+    if proj_minutes >= 15:
+        return 2
+    return 3
+
+
 def monte_carlo_over_under(
     mean_proj: float,
     proj_minutes: float,
@@ -121,6 +193,7 @@ def monte_carlo_over_under(
     opp_foul_rate: float = 1.0,
     n_sims: int = 1000,
     market: str = 'player_points',
+    bench_tier: int = 1,
 ) -> Dict[str, float]:
     """
     Vectorized Monte Carlo simulation over n_sims game scenarios.
@@ -171,15 +244,25 @@ def monte_carlo_over_under(
         q3_sigma   = _Q3_MARGIN_SIGMA * pace_scale
         q3_margin  = rng.normal(abs(spread) * _Q3_TIME_FRACTION, q3_sigma, n_sims)
         is_blowout = np.abs(q3_margin) > _BLOWOUT_MARGIN
-        sim_min    = np.where(is_blowout,
-                              np.minimum(sim_min, blowout_minute_cap),
-                              sim_min)
+        if bench_tier == 3:
+            # Garbage-time beneficiary: minutes rise to 12–15 in blowouts
+            garbage_min = rng.uniform(12.0, 15.0, n_sims)
+            sim_min = np.where(is_blowout, garbage_min, sim_min)
+        else:
+            # Stars / starters / rotation players sit in blowouts
+            sim_min = np.where(is_blowout,
+                               np.minimum(sim_min, blowout_minute_cap),
+                               sim_min)
     elif blowout_prob > 0.0:
         # Mode B: precomputed scalar probability (legacy / backtest path).
         is_blowout = rng.random(n_sims) < blowout_prob
-        sim_min    = np.where(is_blowout,
-                              np.minimum(sim_min, blowout_minute_cap),
-                              sim_min)
+        if bench_tier == 3:
+            garbage_min = rng.uniform(12.0, 15.0, n_sims)
+            sim_min = np.where(is_blowout, garbage_min, sim_min)
+        else:
+            sim_min = np.where(is_blowout,
+                               np.minimum(sim_min, blowout_minute_cap),
+                               sim_min)
 
     adj_foul_rate = player_foul_rate * max(0.5, float(opp_foul_rate))
     if adj_foul_rate > 0.0:
@@ -195,6 +278,17 @@ def monte_carlo_over_under(
         bench_5th = rng.uniform(4.0, 7.0, n_sims)
         sim_min = np.where(fouls_1h + fouls_2h >= 5,
                            np.maximum(0.0, sim_min - bench_5th), sim_min)
+
+    # ── 1b. Re-centre rate so E[sim_min * rate] = mean_proj ─────────────────
+    # mean_proj already incorporates average blowout/DNP risk. The MC
+    # stochastically removes minutes on top of that, double-counting downside
+    # and biasing the distribution toward Under. Rescaling the per-minute rate
+    # so that mean(sim_min) × rate == mean_proj preserves the projected mean as
+    # the distribution centre while retaining the variance shape from blowout /
+    # foul-trouble spread.
+    sim_min_mean = float(np.mean(sim_min))
+    if sim_min_mean > 1e-6:
+        rate = mean_proj / sim_min_mean
 
     # ── 2. Sample stat outcome (Gamma-Poisson mixture) ─────────────────────
     expected = np.maximum(rate * sim_min, 0.0)
@@ -241,6 +335,7 @@ def get_probability_distribution(
     blowout_prob: float = 0.0,
     player_foul_rate: float = 0.0,
     opp_foul_rate: float = 1.0,
+    bench_tier: int = 1,
 ) -> Dict[str, float]:
     """
     Return {prob_over, prob_under} for a player prop.
@@ -252,8 +347,18 @@ def get_probability_distribution(
 
     Falls back to parametric / bootstrap when none of the above apply.
     """
+    # Hard cap: no single leg can ever exceed 85% to account for unknown unknowns
+    # (unexpected hot games, stale lines, last-minute lineup changes, etc.)
+    _MAX_SINGLE_PROB = 0.85
+
     if mean <= 0:
-        return {"prob_over": 0.0, "prob_under": 1.0}
+        return {"prob_over": 0.0, "prob_under": min(1.0, _MAX_SINGLE_PROB)}
+
+    def _cap(result: Dict[str, float]) -> Dict[str, float]:
+        return {
+            "prob_over":  min(result["prob_over"],  _MAX_SINGLE_PROB),
+            "prob_under": min(result["prob_under"], _MAX_SINGLE_PROB),
+        }
 
     # Monte Carlo path — engaged when meaningful contextual signals exist
     _use_mc = proj_minutes > 0.0 and (
@@ -262,7 +367,7 @@ def get_probability_distribution(
         or player_foul_rate > 0.0
     )
     if _use_mc:
-        return monte_carlo_over_under(
+        return _cap(monte_carlo_over_under(
             mean, proj_minutes, line,
             spread=spread,
             total=total,
@@ -271,7 +376,8 @@ def get_probability_distribution(
             opp_foul_rate=opp_foul_rate,
             n_sims=1000,
             market=market,
-        )
+            bench_tier=bench_tier,
+        ))
 
     # ── Parametric fallback ─────────────────────────────────────────────────
     if market in ['player_points', 'player_points_rebounds_assists']:
@@ -279,15 +385,22 @@ def get_probability_distribution(
             col = get_market_col(market)
             bootstrapped = bootstrap_over_under(logs.head(20), col, line)
             if bootstrapped:
-                return bootstrapped
+                return _cap(bootstrapped)
         variance = max(mean * 1.25, 4.0) * variance_scale
-        return normal_over_under(mean, variance, line)
+        return _cap(normal_over_under(mean, variance, line))
 
     elif market in ['player_rebounds', 'player_assists', 'player_threes']:
         alpha = DISPERSION_ALPHAS.get(market, 0.1)
         variance = (mean + (alpha * (mean ** 2))) * variance_scale
-        return negative_binomial_over_under(mean, variance, line)
+        return _cap(negative_binomial_over_under(mean, variance, line))
+
+    elif market in POISSON_MARKETS:
+        col      = get_market_col(market)
+        zero_inf = 0.0
+        if logs is not None and not logs.empty and col:
+            zero_inf = estimate_zero_inflate(logs.head(20), col)
+        return _cap(zip_over_under(mean, line, zero_inflate=zero_inf))
 
     else:
         variance = max(mean * 1.25, 4.0) * variance_scale
-        return normal_over_under(mean, variance, line)
+        return _cap(normal_over_under(mean, variance, line))

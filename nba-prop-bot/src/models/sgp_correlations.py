@@ -42,9 +42,15 @@ LEAGUE_AVG_CORRELATIONS: Dict[Tuple[str, str], float] = {
     ('player_assists',  'player_points'):   0.25,   # usage-correlated
     ('player_assists',  'player_rebounds'): 0.05,
     ('player_assists',  'player_threes'):   0.10,
+    ('player_blocks',   'player_points'):  -0.05,   # rim protectors rarely score much
+    ('player_blocks',   'player_rebounds'): 0.30,   # both tied to interior presence
+    ('player_blocks',   'player_steals'):   0.10,   # weak positive — defensive versatility
     ('player_points',   'player_rebounds'): 0.15,
+    ('player_points',   'player_steals'):   0.10,   # guards who score also pressure ball
     ('player_points',   'player_threes'):   0.55,   # threes are a subset of points
+    ('player_rebounds', 'player_steals'):  -0.05,
     ('player_rebounds', 'player_threes'):  -0.10,
+    ('player_steals',   'player_threes'):   0.05,
 }
 
 _MARKET_COL = {
@@ -52,6 +58,8 @@ _MARKET_COL = {
     'player_rebounds': 'REB',
     'player_assists':  'AST',
     'player_threes':   'FG3M',
+    'player_blocks':   'BLK',
+    'player_steals':   'STL',
 }
 
 
@@ -115,19 +123,23 @@ def _gaussian_copula_joint(
     mean_a: float, mean_b: float,
     line_a: float, line_b: float,
     correlation: float,
+    side_a: str = 'OVER',
+    side_b: str = 'OVER',
 ) -> float:
     """
-    P(X_a > line_a, X_b > line_b) via Gaussian copula with Poisson marginals.
+    Joint probability of two bets both hitting via Gaussian copula with Poisson marginals.
 
-    Transforms each Poisson CDF value to a standard-normal quantile, then
-    evaluates the bivariate normal upper-orthant probability:
-
-        u_i = P(X_i ≤ floor(line_i))  [Poisson CDF]
+    Let u_i = P(X_i ≤ floor(line_i))  [Poisson CDF = "under" probability]
         z_i = Φ⁻¹(u_i)
-        P(both over) = 1 − u_a − u_b + Φ₂(z_a, z_b, ρ)
+        Φ₂  = P(X_a ≤ line_a AND X_b ≤ line_b)  [joint under CDF]
 
-    Returns the bivariate normal approximation as a fallback if either mean
-    is non-positive.
+    Exact formulas for all four side combinations derived from inclusion-exclusion:
+        OVER  / OVER  :  1 − u_a − u_b + Φ₂
+        OVER  / UNDER :  u_b − Φ₂
+        UNDER / OVER  :  u_a − Φ₂
+        UNDER / UNDER :  Φ₂
+
+    These four expressions partition the probability space and sum to 1.
     """
     if mean_a <= 0 or mean_b <= 0:
         return 0.0
@@ -141,10 +153,22 @@ def _gaussian_copula_joint(
 
     rho = float(np.clip(correlation, -0.999, 0.999))
     cov = [[1.0, rho], [rho, 1.0]]
+    # joint_cdf = P(X_a ≤ line_a AND X_b ≤ line_b)
     joint_cdf = float(multivariate_normal.cdf([z_a, z_b], mean=[0.0, 0.0], cov=cov))
 
-    # P(A > line_a, B > line_b) = 1 - u_a - u_b + Φ₂(z_a, z_b, ρ)
-    return float(np.clip(1.0 - u_a - u_b + joint_cdf, 0.001, 0.999))
+    a_over = side_a.upper() == 'OVER'
+    b_over = side_b.upper() == 'OVER'
+
+    if a_over and b_over:
+        result = 1.0 - u_a - u_b + joint_cdf
+    elif a_over and not b_over:
+        result = u_b - joint_cdf
+    elif not a_over and b_over:
+        result = u_a - joint_cdf
+    else:
+        result = joint_cdf
+
+    return float(np.clip(result, 0.001, 0.999))
 
 
 def adjust_joint_probability(
@@ -155,13 +179,20 @@ def adjust_joint_probability(
     mean_b: Optional[float] = None,
     line_a: Optional[float] = None,
     line_b: Optional[float] = None,
+    side_a: str = 'OVER',
+    side_b: str = 'OVER',
 ) -> float:
     """
     Return P(leg_a hits AND leg_b hits) adjusted for correlation.
 
-    Uses the Gaussian copula with Poisson marginals when either prop line is
-    ≤ 3.5 (threes, steals, blocks) and both Poisson means are available.
-    Falls back to the bivariate normal approximation otherwise.
+    Correlation sign:
+      Same side (both OVER or both UNDER): positive stat correlation → bets
+        move together → use raw correlation.
+      Mixed sides (one OVER, one UNDER): positive stat correlation means if
+        stat_a is high, stat_b is also high → OVER_a is more likely AND
+        UNDER_b is less likely → outcomes are negatively correlated.
+        The bivariate normal path negates the correlation automatically.
+        The copula path derives the exact formula from inclusion-exclusion.
     """
     use_copula = (
         mean_a is not None and mean_b is not None
@@ -169,14 +200,22 @@ def adjust_joint_probability(
         and (line_a <= _LOW_COUNT_LINE or line_b <= _LOW_COUNT_LINE)
     )
     if use_copula:
-        return _gaussian_copula_joint(mean_a, mean_b, line_a, line_b, correlation)
+        return _gaussian_copula_joint(
+            mean_a, mean_b, line_a, line_b, correlation, side_a, side_b)
 
-    # Bivariate normal approximation
+    # Bivariate normal approximation.
+    # Negate the stat correlation when sides differ: a positive Pearson
+    # correlation between statistics becomes a negative correlation between
+    # bet outcomes when one is OVER and the other is UNDER.
+    effective_corr = (
+        correlation if side_a.upper() == side_b.upper() else -correlation
+    )
+
     prob_a = float(np.clip(prob_a, 0.001, 0.999))
     prob_b = float(np.clip(prob_b, 0.001, 0.999))
     sigma_a = np.sqrt(prob_a * (1 - prob_a))
     sigma_b = np.sqrt(prob_b * (1 - prob_b))
-    joint = prob_a * prob_b + correlation * sigma_a * sigma_b
+    joint = prob_a * prob_b + effective_corr * sigma_a * sigma_b
     return float(np.clip(joint, 0.001, 0.999))
 
 
@@ -207,6 +246,7 @@ def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -
             true_probs[0], true_probs[1], corr,
             mean_a=legs[0].get('mean'), mean_b=legs[1].get('mean'),
             line_a=legs[0].get('line'), line_b=legs[1].get('line'),
+            side_a=legs[0].get('side', 'OVER'), side_b=legs[1].get('side', 'OVER'),
         )
         corr_applied = corr
     else:
@@ -223,6 +263,7 @@ def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -
                 joint_true, true_probs[i], corr,
                 mean_a=mean_a, mean_b=legs[i].get('mean'),
                 line_a=line_a, line_b=legs[i].get('line'),
+                side_a=legs[i - 1].get('side', 'OVER'), side_b=legs[i].get('side', 'OVER'),
             )
             corr_applied += corr
         corr_applied /= len(legs) - 1

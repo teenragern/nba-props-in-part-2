@@ -14,6 +14,8 @@ def get_market_col(market: str) -> str:
         "player_rebounds": "REB",
         "player_assists":  "AST",
         "player_threes":   "FG3M",
+        "player_blocks":   "BLK",
+        "player_steals":   "STL",
     }.get(market, "")
 
 
@@ -116,7 +118,8 @@ def build_player_projection(player_id: str, market: str, line: float,
                              home_flag: bool = False,
                              rest_days: int = 2,
                              out_player_avg_mins: float = 0.0,
-                             projected_minutes_override: float = 0.0) -> Dict[str, Any]:
+                             projected_minutes_override: float = 0.0,
+                             fatigue_multiplier: float = 1.0) -> Dict[str, Any]:
     """
     projected_minutes_override: when > 0, skips estimate_projected_minutes entirely
     and uses this value directly (e.g. from the RotationModel's slot-based projection).
@@ -172,18 +175,23 @@ def build_player_projection(player_id: str, market: str, line: float,
     rest_factor = get_rest_days_factor(rest_days, b2b_flag)
     adj_rate *= rest_factor
 
+    # Travel fatigue reduces projected minutes (and thus the mean proportionally)
+    if fatigue_multiplier < 1.0:
+        proj_mins = proj_mins * fatigue_multiplier
+
     mean_proj = proj_mins * adj_rate
     variance_scale = get_market_variance_calibration(market)
 
     return {
-        "player_id": player_id,
-        "market": market,
-        "line": line,
-        "mean": mean_proj,
-        "projected_minutes": proj_mins,
-        "injury_status": injury_status,
-        "usage_boost": usage_shift,
-        "variance_scale": variance_scale,
-        "home_flag": home_flag,
-        "rest_days": rest_days,
+        "player_id":          player_id,
+        "market":             market,
+        "line":               line,
+        "mean":               mean_proj,
+        "projected_minutes":  proj_mins,
+        "injury_status":      injury_status,
+        "usage_boost":        usage_shift,
+        "variance_scale":     variance_scale,
+        "home_flag":          home_flag,
+        "rest_days":          rest_days,
+        "fatigue_multiplier": fatigue_multiplier,
     }

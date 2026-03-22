@@ -44,5 +44,7 @@ PROP_MARKETS = [
     "player_rebounds",
     "player_assists",
     "player_threes",
-    "player_points_rebounds_assists"
+    "player_points_rebounds_assists",
+    "player_blocks",
+    "player_steals",
 ]

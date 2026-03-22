@@ -13,10 +13,46 @@ Usage:
 
 import time
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Any
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+# League-wide average total personal fouls per game (both teams combined).
+# Used to normalise each crew's historical foul rate into a multiplier.
+_LEAGUE_AVG_FOULS = 44.0
+_TIGHT_WHISTLE_THRESHOLD = _LEAGUE_AVG_FOULS * 1.10   # ≥ 48.4 fouls/game
+
+
+def get_crew_foul_factor(ref_names: List[str], db=None) -> Dict[str, Any]:
+    """
+    Look up each referee's historical avg_pfd_per_game from the DB and return
+    a foul-rate adjustment factor for the full crew.
+
+    Returns:
+        foul_rate_multiplier  – crew_avg / LEAGUE_AVG, clamped to [0.85, 1.15]
+        tight_whistle         – True when crew avg ≥ TIGHT_WHISTLE_THRESHOLD
+
+    Falls back to {foul_rate_multiplier: 1.0, tight_whistle: False} when the
+    crew is unknown or the DB has no data for them yet.
+    """
+    if not ref_names or db is None:
+        return {"foul_rate_multiplier": 1.0, "tight_whistle": False}
+
+    pfd_values = db.get_referee_foul_rates(ref_names)
+    if not pfd_values:
+        return {"foul_rate_multiplier": 1.0, "tight_whistle": False}
+
+    crew_avg   = sum(pfd_values) / len(pfd_values)
+    multiplier = crew_avg / _LEAGUE_AVG_FOULS
+    multiplier = round(max(0.85, min(1.15, multiplier)), 3)
+
+    return {
+        "foul_rate_multiplier": multiplier,
+        "tight_whistle":        crew_avg >= _TIGHT_WHISTLE_THRESHOLD,
+        "crew_avg_fouls":       round(crew_avg, 1),
+        "ref_count":            len(pfd_values),
+    }
 
 
 def get_referees_for_game(game_id: str) -> List[str]:

@@ -219,3 +219,26 @@ CREATE TABLE IF NOT EXISTS team_opponent_stats (
     last_updated DATE,
     PRIMARY KEY (team_name, season)
 );
+
+CREATE TABLE IF NOT EXISTS steam_alerts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name         TEXT    NOT NULL,
+    market              TEXT    NOT NULL,
+    side                TEXT    NOT NULL,
+    line                REAL    NOT NULL,
+    sharp_book          TEXT    NOT NULL,
+    sharp_delta         REAL    NOT NULL,   -- prob change at sharp book (signed)
+    sharp_current_prob  REAL    NOT NULL,   -- latest implied_prob at sharp book
+    stale_book          TEXT    NOT NULL,   -- soft book that hasn't moved yet
+    stale_odds          REAL    NOT NULL,   -- decimal odds still on offer
+    stale_current_prob  REAL    NOT NULL,   -- implied_prob at stale book
+    direction           TEXT    NOT NULL,   -- 'OVER' or 'UNDER'
+    timestamp           DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes to accelerate the steam detection query (scans last 120 min)
+CREATE INDEX IF NOT EXISTS idx_line_history_ts
+    ON line_history(timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_steam_alerts_dedup
+    ON steam_alerts(player_name, market, side, timestamp);

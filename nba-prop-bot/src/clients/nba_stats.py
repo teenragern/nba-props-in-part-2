@@ -34,6 +34,46 @@ _MARKET_OPP_COL = {
     'player_points_rebounds_assists':  None,
 }
 
+# ---------------------------------------------------------------------------
+# Positional defensive efficiency
+# ---------------------------------------------------------------------------
+# For each position group, encodes how sensitive each prop market is to the
+# OPPONENT team's defensive strength relative to the average player.
+# Factor > 1.0  → this position benefits MORE from a weak opponent defense.
+# Factor < 1.0  → this position is less impacted (e.g. guards vs REB defense).
+_POSITION_FACTORS: dict = {
+    'Guard': {
+        'player_points':                  1.05,
+        'player_rebounds':                0.50,
+        'player_assists':                 1.30,
+        'player_threes':                  1.25,
+        'player_blocks':                  0.25,
+        'player_steals':                  1.20,
+        'player_points_rebounds_assists': 0.90,
+    },
+    'Forward': {
+        'player_points':                  1.00,
+        'player_rebounds':                0.85,
+        'player_assists':                 0.70,
+        'player_threes':                  0.95,
+        'player_blocks':                  0.65,
+        'player_steals':                  0.85,
+        'player_points_rebounds_assists': 0.90,
+    },
+    'Center': {
+        'player_points':                  0.95,
+        'player_rebounds':                1.50,
+        'player_assists':                 0.40,
+        'player_threes':                  0.20,
+        'player_blocks':                  1.80,
+        'player_steals':                  0.55,
+        'player_points_rebounds_assists': 1.05,
+    },
+}
+# How much the positional factor modulates the team-level multiplier.
+# 0.25 → 25% of deviation from 1.0 comes from positional adjustment.
+_POSITION_BLEND = 0.25
+
 
 class NbaStatsClient:
     def __init__(self, season: str = "2024-25"):
@@ -452,6 +492,67 @@ class NbaStatsClient:
             return round(float(match.iloc[0]['_pra']) / league_avg, 4)
         except Exception:
             return 1.0
+
+    @staticmethod
+    def infer_position_group(logs: pd.DataFrame) -> str:
+        """
+        Infer position group (Guard / Forward / Center) from a player's
+        recent game-log stat profile.
+
+        Heuristic — in priority order:
+          1. AST ≥ 4.5 /game  → Guard  (primary ball-handlers)
+          2. REB ≥ 7.5 /game  → Center (rim anchors)
+          3. REB ≥ 4.5 /game  → Forward
+          4. AST ≥ 2.5 /game  → Guard  (wing-guard types)
+          5. default          → Forward
+        """
+        if logs is None or logs.empty or len(logs) < 3:
+            return 'Forward'
+        recent   = logs.head(15)
+        avg_ast  = float(recent['AST'].mean()) if 'AST' in recent.columns else 0.0
+        avg_reb  = float(recent['REB'].mean()) if 'REB' in recent.columns else 0.0
+        if avg_ast >= 4.5:
+            return 'Guard'
+        if avg_reb >= 7.5:
+            return 'Center'
+        if avg_reb >= 4.5:
+            return 'Forward'
+        if avg_ast >= 2.5:
+            return 'Guard'
+        return 'Forward'
+
+    def get_positional_def_multiplier(
+        self, opp_team: str, market: str, position_group: str
+    ) -> float:
+        """
+        Positional defensive efficiency multiplier.
+
+        Combines the team's overall defensive strength for this market (existing
+        logic) with a static position factor that encodes how much each position
+        group is impacted by that defensive dimension.
+
+        Formula:
+            blend   = (1 - BLEND) + BLEND × position_factor
+            result  = team_overall_mult × blend
+            clamped to [0.70, 1.30]
+
+        Example — Center vs Lakers (strong rebounding defense, OPP_REB mult = 0.82):
+            blend  = 0.75 + 0.25 × 1.50 = 1.125
+            result = 0.82 × 1.125 = 0.923   ← bigger penalty for the Center
+
+        Example — Guard in same game (REB mult = 0.82):
+            blend  = 0.75 + 0.25 × 0.50 = 0.875
+            result = 0.82 × 0.875 = 0.718   ← guard barely affected
+        """
+        # Base team-level multiplier (existing market-level logic)
+        if market == 'player_points_rebounds_assists':
+            base = self.get_opponent_def_multiplier_pra(opp_team)
+        else:
+            base = self.get_opponent_def_multiplier(opp_team, market)
+
+        pf    = _POSITION_FACTORS.get(position_group, {}).get(market, 1.0)
+        blend = (1.0 - _POSITION_BLEND) + _POSITION_BLEND * pf
+        return round(max(0.70, min(1.30, base * blend)), 4)
 
     def get_team_pace(self, home_team: str, away_team: str) -> Dict[str, float]:
         """Return pace for both teams. Used to replace hardcoded 99.0."""

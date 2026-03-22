@@ -12,7 +12,7 @@ Wires up all Priority 1-6 improvements:
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import dateutil.parser
 from dateutil import tz
 from typing import List, Dict, Any, Tuple, Optional
@@ -40,9 +40,93 @@ from src.pipelines.combos import generate_and_alert_combos
 from src.models.sgp_correlations import build_team_correlation_matrix
 from src.clients.on_off_splits import OnOffSplitsClient
 from src.clients.rotation_model import RotationModel
+from src.clients.travel_fatigue import compute_travel_fatigue, TEAM_NAME_TO_ABBR
+from src.clients.referee_client import fetch_today_assignments, match_event_refs
+from src.models.referee_stats import get_crew_foul_factor
+from src.models.distributions import classify_bench_tier
 
 logger = get_logger(__name__)
 _PROJECTIONS_CACHE: Dict[str, Any] = {}
+
+_SHARP_TS_BOOKS      = {'pinnacle', 'circa', 'bookmaker'}
+_SOFT_TS_BOOKS       = {'draftkings', 'fanduel', 'betmgm', 'caesars'}
+_STALE_THRESHOLD_SEC = 60    # retail must be ≥60s behind sharp
+_SHARP_RECENT_SEC    = 120   # sharp move must be within 2 min of now
+
+
+def _check_timestamp_staleness(
+    bookmakers: List[Dict], market_key: str, soft_book: Optional[str]
+) -> Dict[str, Any]:
+    """
+    Detect when a sharp book has recently repriced a market but the
+    recreational book's timestamp is significantly older (stale line).
+
+    Returns {'timestamp_stale': bool, 'lag_seconds': float}.
+    Both fields default to False/0.0 when data is missing or non-applicable.
+    """
+    _no_signal = {'timestamp_stale': False, 'lag_seconds': 0.0}
+
+    if not soft_book or soft_book.lower() not in _SOFT_TS_BOOKS:
+        return _no_signal
+
+    now = datetime.now(timezone.utc)
+
+    # Most recent sharp-book market timestamp across all sharp books
+    sharp_ts: Optional[datetime] = None
+    for book in bookmakers:
+        if book.get('title', '').lower() not in _SHARP_TS_BOOKS:
+            continue
+        for mkt in book.get('markets', []):
+            if mkt.get('key') != market_key:
+                continue
+            ts_str = mkt.get('last_update') or book.get('last_update')
+            if not ts_str:
+                continue
+            try:
+                ts = dateutil.parser.isoparse(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if sharp_ts is None or ts > sharp_ts:
+                    sharp_ts = ts
+            except Exception:
+                pass
+
+    if sharp_ts is None:
+        return _no_signal
+
+    # Sharp move must be fresh — older moves are already priced into retail
+    if (now - sharp_ts).total_seconds() > _SHARP_RECENT_SEC:
+        return _no_signal
+
+    # Soft book's market timestamp
+    soft_ts: Optional[datetime] = None
+    soft_lower = soft_book.lower()
+    for book in bookmakers:
+        if book.get('title', '').lower() != soft_lower:
+            continue
+        for mkt in book.get('markets', []):
+            if mkt.get('key') != market_key:
+                continue
+            ts_str = mkt.get('last_update') or book.get('last_update')
+            if not ts_str:
+                continue
+            try:
+                soft_ts = dateutil.parser.isoparse(ts_str)
+                if soft_ts.tzinfo is None:
+                    soft_ts = soft_ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+        if soft_ts:
+            break
+
+    if soft_ts is None:
+        return _no_signal
+
+    lag = (sharp_ts - soft_ts).total_seconds()
+    return {
+        'timestamp_stale': lag >= _STALE_THRESHOLD_SEC,
+        'lag_seconds':     float(max(0.0, lag)),
+    }
 
 
 def get_best_odds(bookmakers: List[Dict], player_name: str,
@@ -216,6 +300,9 @@ def scan_props():
         logger.error(f"Failed to fetch events: {e}")
         return
 
+    # Priority 9: fetch today's referee assignments once (0 API credits)
+    _all_ref_assignments = fetch_today_assignments()
+
     candidates = []
 
     for event in today_events:
@@ -237,6 +324,24 @@ def scan_props():
         # Game context for Monte Carlo (shared by all players in this game)
         _home_spread = OddsApiClient.extract_consensus_spread(bookmakers, home_team)
         _game_total  = OddsApiClient.extract_consensus_total(bookmakers)
+
+        # Hours until tip-off (used by edge_ranker to scale EDGE_MIN)
+        _commence_dt = dateutil.parser.isoparse(event['commence_time'])
+        if _commence_dt.tzinfo is None:
+            _commence_dt = _commence_dt.replace(tzinfo=timezone.utc)
+        _hours_to_tip = max(
+            0.0,
+            (_commence_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+        )
+
+        # Priority 9: referee whistle factor for this game
+        _event_refs  = match_event_refs(home_team, away_team, _all_ref_assignments)
+        _crew_factor = get_crew_foul_factor(_event_refs, db)
+        if _crew_factor["tight_whistle"]:
+            logger.info(
+                f"Tight whistle crew ({away_team} @ {home_team}): "
+                f"{_event_refs} — avg {_crew_factor.get('crew_avg_fouls', '?')} fouls/game"
+            )
 
         # Build cross-player correlation matrix for both teams (7-day DB cache)
         for _team in (home_team, away_team):
@@ -355,6 +460,15 @@ def scan_props():
             rest_days  = NbaStatsClient.calculate_rest_days(logs)
             b2b_flag   = rest_days == 0
 
+            # ---- Travel fatigue (arena distance, timezone, altitude) ----
+            _home_abbr  = TEAM_NAME_TO_ABBR.get(home_team, '')
+            _fatigue    = compute_travel_fatigue(
+                player_team_abbr=player_team_abbr or '',
+                today_arena_abbr=_home_abbr,   # games always played at home team's arena
+                logs=logs,
+                b2b_flag=b2b_flag,
+            )
+
             # ---- Priority 5: starter flag from minutes ----
             starter_flag = NbaStatsClient.infer_starter_flag(logs)
 
@@ -383,15 +497,17 @@ def scan_props():
                 except Exception as _re:
                     logger.debug(f"Rotation model error for {player_name}: {_re}")
 
+            # Positional defensive efficiency: Guard / Forward / Center
+            _position_group = NbaStatsClient.infer_position_group(logs)
+
             for mkt in PROP_MARKETS:
                 if player_name not in prices_by_market[mkt]:
                     continue
 
-                # Priority 2: get market-specific opponent def multiplier
-                if mkt == 'player_points_rebounds_assists':
-                    opp_multiplier = stats_client.get_opponent_def_multiplier_pra(opp_team)
-                else:
-                    opp_multiplier = stats_client.get_opponent_def_multiplier(opp_team, mkt)
+                # Priority 2+: position-aware opponent defensive multiplier
+                opp_multiplier = stats_client.get_positional_def_multiplier(
+                    opp_team, mkt, _position_group
+                )
 
                 for line in prices_by_market[mkt][player_name]:
 
@@ -427,9 +543,22 @@ def scan_props():
                         rest_days=rest_days,
                         out_player_avg_mins=_out_player_avg_mins,
                         projected_minutes_override=_rotation_mins,
+                        fatigue_multiplier=_fatigue['fatigue_multiplier'],
                     )
 
                     if not proj or proj.get('mean', 0) == 0:
+                        continue
+
+                    # Skip players with too few projected minutes — their lines are
+                    # likely stale/void candidates, not real betting opportunities.
+                    # A voided bet returns stake (not a win), so treating it as 100%
+                    # probability of going under inflates parlay confidence badly.
+                    if proj.get('projected_minutes', 0) < 10:
+                        logger.debug(
+                            f"Skipping {player_name} {mkt}: only "
+                            f"{proj.get('projected_minutes', 0):.1f} proj mins "
+                            f"(below 10-min threshold — possible void/DNP)"
+                        )
                         continue
 
                     # Priority 6: blend Bayesian mean with XGBoost projection
@@ -445,10 +574,43 @@ def scan_props():
                         opp_pace=_opp_ctx['opp_pace'],
                         opp_rebound_pct=_opp_ctx['opp_rebound_pct'],
                         opp_pts_paint=_opp_ctx['opp_pts_paint'],
+                        travel_miles=_fatigue['miles_traveled'],
+                        tz_shift_hours=_fatigue['tz_shift_hours'],
+                        altitude_flag=_fatigue['altitude_flag'],
                     )
                     if ml_mean is not None and ml_mean > 0:
                         proj['mean'] = 0.5 * proj['mean'] + 0.5 * ml_mean
                         proj['ml_blend'] = True
+
+                    # Priority 9: tight whistle → +2% projected points (more FTs drawn)
+                    if _crew_factor["tight_whistle"] and mkt in {
+                        "player_points", "player_points_rebounds_assists"
+                    }:
+                        proj['mean'] *= 1.02
+
+                    # Travel & Elevation Fatigue: B2B + >800 miles + high-altitude arena
+                    # Thin air reduces shooting efficiency (threes -5%) and jump fatigue
+                    # reduces rebounding explosiveness (-3%) for visiting teams.
+                    if (
+                        b2b_flag
+                        and _fatigue['altitude_flag']
+                        and _fatigue['miles_traveled'] > 800
+                        and not home_flag          # only visiting team is affected
+                    ):
+                        if mkt == 'player_threes':
+                            proj['mean'] *= 0.95
+                            logger.debug(
+                                f"Altitude+B2B fatigue: {player_name} threes "
+                                f"-5% ({_fatigue['miles_traveled']:.0f} mi traveled)"
+                            )
+                        elif mkt == 'player_rebounds':
+                            proj['mean'] *= 0.97
+                            logger.debug(
+                                f"Altitude+B2B fatigue: {player_name} rebounds "
+                                f"-3% ({_fatigue['miles_traveled']:.0f} mi traveled)"
+                            )
+
+                    _bench_tier = classify_bench_tier(proj['projected_minutes'])
 
                     dists = get_probability_distribution(
                         mkt, proj['mean'], line,
@@ -458,17 +620,22 @@ def scan_props():
                         spread=_home_spread or 0.0,
                         total=_game_total or 0.0,
                         player_foul_rate=_player_foul_rate,
-                        opp_foul_rate=_opp_ctx['opp_fta_rate'],
+                        opp_foul_rate=_opp_ctx['opp_fta_rate'] * _crew_factor["foul_rate_multiplier"],
+                        bench_tier=_bench_tier,
                     )
 
                     best_over, best_under = get_best_odds(bookmakers, player_name, mkt, line)
 
+                    imp_over  = 0.0
+                    imp_under = 0.0
                     if best_over['price'] > 0 and best_under['price'] > 0:
                         raw_imp_o = decimal_to_implied_prob(best_over['price'])
                         raw_imp_u = decimal_to_implied_prob(best_under['price'])
-                        imp_over, _ = devig_two_way(raw_imp_o, raw_imp_u)
-                    else:
+                        imp_over, imp_under = devig_two_way(raw_imp_o, raw_imp_u)
+                    elif best_over['price'] > 0:
                         imp_over  = decimal_to_implied_prob(best_over['price'])
+                    elif best_under['price'] > 0:
+                        imp_under = decimal_to_implied_prob(best_under['price'])
 
                     _consensus_o, _consensus_u, _consensus_label = get_consensus_true_prob(
                         bookmakers, player_name, mkt, line, _book_weights)
@@ -484,10 +651,12 @@ def scan_props():
                         "team_name":       home_team if home_flag else away_team,
                         "consensus_prob":  _consensus_o,
                         "consensus_label": _consensus_label,
+                        "hours_to_tipoff": _hours_to_tip,
                     }
 
-                    if best_over['price'] > 0:
+                    if best_over['price'] > 0 and imp_over > 0:
                         over_metrics = db.get_market_metrics(player_name, mkt, line, "OVER")
+                        _ts_over = _check_timestamp_staleness(bookmakers, mkt, best_over['book'])
                         candidates.append({
                             **common,
                             "side":         "OVER",
@@ -497,14 +666,31 @@ def scan_props():
                             "model_prob":   dists['prob_over'],
                             "implied_prob": imp_over,
                             **over_metrics,
+                            **_ts_over,
                         })
 
-                    # Unders intentionally excluded — OVER only strategy
+                    if best_under['price'] > 0 and imp_under > 0:
+                        under_metrics = db.get_market_metrics(player_name, mkt, line, "UNDER")
+                        _ts_under = _check_timestamp_staleness(bookmakers, mkt, best_under['book'])
+                        candidates.append({
+                            **common,
+                            "side":         "UNDER",
+                            "book":         best_under['book'],
+                            "book_role":    db.get_bookmaker_role(best_under['book']),
+                            "odds":         best_under['price'],
+                            "model_prob":   dists['prob_under'],
+                            "implied_prob": imp_under,
+                            **under_metrics,
+                            **_ts_under,
+                        })
 
                     # ── Top-down consensus sharp vs rec comparison ────────
                     if _consensus_o is not None:
                         mkt_label = mkt.replace('player_', '').replace('_', ' ').title()
-                        for chk_side, true_prob in (('Over', _consensus_o),):
+                        _sharp_sides = [('Over', _consensus_o)]
+                        if _consensus_u is not None:
+                            _sharp_sides.append(('Under', _consensus_u))
+                        for chk_side, true_prob in _sharp_sides:
                             rec_price, rec_book = get_best_rec_price(
                                 bookmakers, player_name, mkt, line, chk_side)
                             if rec_price is None:
@@ -533,7 +719,7 @@ def scan_props():
                             )
 
     ranked_edges = rank_edges(candidates)
-    actionable   = [e for e in ranked_edges if e.get('edge', 0) >= EDGE_MIN]
+    actionable   = [e for e in ranked_edges if e.get('edge', 0) >= e.get('edge_min_applied', EDGE_MIN)]
 
     logger.info(f"Scan complete: {len(candidates)} candidates, {len(actionable)} actionable edges.")
 
