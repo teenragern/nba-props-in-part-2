@@ -1,11 +1,22 @@
 from math import prod
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from src.utils.logging_utils import get_logger
 from src.clients.telegram_bot import TelegramBotClient
 from src.data.db import DatabaseClient
 from src.config import BANKROLL, KELLY_FRACTION
 
 logger = get_logger(__name__)
+
+# Compact market labels used in digest one-liners.
+_MARKET_SHORT: Dict[str, str] = {
+    'player_points':                  'Pts',
+    'player_rebounds':                'Reb',
+    'player_assists':                 'Ast',
+    'player_threes':                  '3PM',
+    'player_points_rebounds_assists': 'PRA',
+    'player_blocks':                  'Blk',
+    'player_steals':                  'Stl',
+}
 
 
 def _camouflage_stake(stake: float) -> float:
@@ -19,7 +30,7 @@ def _camouflage_stake(stake: float) -> float:
     return round(stake / 50) * 50
 
 
-def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, bot: TelegramBotClient):
+def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: TelegramBotClient):
     player    = edge_data.get('player_id', 'Unknown')
     market    = edge_data.get('market',    'Unknown')
     line      = edge_data.get('line',      0.0)
@@ -121,8 +132,15 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, bot: Teleg
         + f"\n<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
     )
 
-    bot.send_message(msg)
-    logger.info(f"Alert sent: {player} {market} {side} {line} @ {book}")
+    # Tier 2: queue for next digest flush (12 PM / 3 PM / 6 PM).
+    side_char  = 'O' if side.upper() == 'OVER' else 'U'
+    mkt_short  = _MARKET_SHORT.get(market, market[:3].title())
+    title = (
+        f"{player} {side_char}{line} {mkt_short} "
+        f"@{book} {_parlay_american(odds)} | {edge:.1%} | ${stake:.0f}"
+    )
+    db.queue_pending_alert('prop', title, msg, priority=edge, game_date=game_date)
+    logger.info(f"Alert queued: {player} {market} {side} {line} @ {book}")
 
 
 _PARLAY_MARKET_LABELS: Dict[str, str] = {
@@ -149,6 +167,7 @@ def send_parlay_alert(
     joint_true_prob: float,
     joint_book_prob: float,
     bot: TelegramBotClient,
+    db: Optional[DatabaseClient] = None,
 ) -> None:
     """
     Format and send a multi-leg high-probability parlay to Telegram.
@@ -207,8 +226,136 @@ def send_parlay_alert(
         f"Max Stake:      ${_camouflage_stake(max_parlay_stake):.0f} ({_PARLAY_MAX_PCT.get(n, 0.0025):.2%} bankroll cap)"
     )
 
-    bot.send_message("\n".join(lines))
+    msg = "\n".join(lines)
+    if db is not None:
+        # Tier 2: queue for digest.
+        title = f"{n}-leg SGP | True: {joint_true_prob:.0%} | Edge: {edge:+.1%} | EV: {ev:+.1%}"
+        db.queue_pending_alert('parlay', title, msg, priority=ev)
+    else:
+        # Fallback: send instantly when no DB is available.
+        bot.send_message(msg)
     logger.info(
         f"{n}-leg high-prob parlay | "
         f"joint_prob={joint_true_prob:.2%} | edge={edge:.2%} | ev={ev:.2%}"
     )
+
+
+# ── Game market alerts (Moneyline / Spread / Total) ───────────────────────────
+
+_GAME_MARKET_LABELS: Dict[str, str] = {
+    'h2h':     'Moneyline',
+    'spreads': 'Spread',
+    'totals':  'Total',
+}
+
+
+def send_game_market_alert(
+    home_team: str,
+    away_team: str,
+    home_score: float,
+    away_score: float,
+    market: str,
+    side: str,
+    edge: float,
+    ev: float,
+    model_prob: float,
+    book_prob: float,
+    book_odds: float,
+    book: str,
+    game_date: str,
+    event_id: str,
+    line: float,
+    db: DatabaseClient,
+    _bot: TelegramBotClient,
+    home_abbr: str = '',
+    away_abbr: str = '',
+) -> None:
+    """
+    Evaluate and send a Telegram alert for a game market edge
+    (Moneyline, Spread, or Total).
+
+    `side` doubles as both the DB deduplication key and the display label
+    (e.g. "Denver Nuggets", "Boston Celtics -6.5", "Over").
+    `line` is 0.0 for moneyline, the spread value for spreads, and the
+    combined total for totals.
+    """
+    matchup      = f"{away_team} @ {home_team}"
+    market_label = _GAME_MARKET_LABELS.get(market, market.title())
+
+    if db.check_recent_alert(matchup, market, line, side, edge):
+        logger.info(f"Skipping duplicate game market alert: {matchup} {market_label} {side}")
+        return
+
+    # Kelly sizing — capped at 3 % of bankroll (game markets are more efficient
+    # than player props; model uncertainty is higher for team-level projections).
+    stake = 0.0
+    if book_odds > 1.0 and ev > 0.0:
+        stake = BANKROLL * (ev / (book_odds - 1.0)) * KELLY_FRACTION
+        stake = min(stake, BANKROLL * 0.03)
+    stake = _camouflage_stake(stake)
+
+    MAX_DAILY_RISK = BANKROLL * 0.25
+    MAX_PER_GAME   = BANKROLL * 0.10
+
+    with db.get_conn() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT SUM(stake) as total_risk FROM alerts_sent WHERE date(timestamp) = date('now')"
+        )
+        row = cursor.fetchone()
+        current_daily_risk = float(row['total_risk'] or 0.0) if row else 0.0
+        if current_daily_risk + stake > MAX_DAILY_RISK:
+            logger.warning(
+                f"Skipping {matchup} — daily risk limit "
+                f"({current_daily_risk:.2f}/{MAX_DAILY_RISK:.2f})"
+            )
+            return
+
+        if event_id:
+            cursor.execute(
+                "SELECT SUM(stake) as game_risk FROM alerts_sent "
+                "WHERE event_id = ? AND date(timestamp) = date('now')",
+                (event_id,),
+            )
+            game_row = cursor.fetchone()
+            current_game_risk = float(game_row['game_risk'] or 0.0) if game_row else 0.0
+            if current_game_risk + stake > MAX_PER_GAME:
+                logger.warning(
+                    f"Skipping {matchup} — per-game risk limit "
+                    f"({current_game_risk:.2f}/{MAX_PER_GAME:.2f})"
+                )
+                return
+
+    db.insert_alert(
+        player_name=matchup, market=market, line=line, side=side,
+        edge=edge, book=book, odds=book_odds, stake=stake,
+        game_date=game_date, event_id=event_id,
+    )
+
+    _h_abbr = home_abbr or home_team.split()[-1][:3].upper()
+    _a_abbr = away_abbr or away_team.split()[-1][:3].upper()
+    line_str = f" {line:+.1f}" if market != 'h2h' else ''
+
+    msg = (
+        f"<b>⚡ NBA GAME MARKET EDGE</b>\n\n"
+        f"Game: {_a_abbr} @ {_h_abbr}  ({game_date})\n"
+        f"Proj: {_a_abbr} {away_score:.1f} – {_h_abbr} {home_score:.1f}\n\n"
+        f"Market: {market_label}{line_str}\n"
+        f"Side:   {side}\n"
+        f"Best Book: {book}  |  Odds: {_parlay_american(book_odds)}\n\n"
+        f"Model Prob:  {model_prob:.3f}\n"
+        f"Book Prob:   {book_prob:.3f}\n"
+        f"Edge:  {edge:+.2%}\n"
+        f"EV:    {ev:+.2%}\n\n"
+        f"<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
+    )
+
+    # Tier 2: queue for digest.
+    side_short = side if len(side) <= 14 else side[:13] + "…"
+    title = (
+        f"{_a_abbr}@{_h_abbr} {market_label}{line_str} {side_short} "
+        f"@{book} {_parlay_american(book_odds)} | {edge:+.1%} | ${stake:.0f}"
+    )
+    db.queue_pending_alert('game_market', title, msg, priority=edge, game_date=game_date)
+    logger.info(f"Game market alert queued: {matchup} {market_label} {side} edge={edge:.2%}")

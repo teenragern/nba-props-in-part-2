@@ -56,6 +56,21 @@ class DatabaseClient:
             "ALTER TABLE clv_tracking ADD COLUMN implied_closing REAL",
             "ALTER TABLE clv_tracking ADD COLUMN implied_alert REAL",
             "ALTER TABLE clv_tracking ADD COLUMN clv REAL",
+            # bet_results — push detection (settlement v2)
+            "ALTER TABLE bet_results ADD COLUMN push BOOLEAN NOT NULL DEFAULT 0",
+            # pending_alerts — two-tier alert batching (flush v1)
+            # (table created by schema; migration ensures forward-compat if
+            #  an older DB predates the CREATE TABLE statement above)
+            """CREATE TABLE IF NOT EXISTS pending_alerts (
+                id         INTEGER  PRIMARY KEY AUTOINCREMENT,
+                alert_type TEXT     NOT NULL,
+                title      TEXT     NOT NULL,
+                body       TEXT     NOT NULL,
+                priority   REAL     NOT NULL DEFAULT 0.0,
+                game_date  TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sent_at    DATETIME
+            )""",
         ]
         for sql in migrations:
             try:
@@ -803,6 +818,70 @@ class DatabaseClient:
             return [float(r["avg_pfd_per_game"]) for r in rows]
         except Exception:
             return []
+
+    # ------------------------------------------------------------------ #
+    #  Backtesting                                                         #
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    #  Two-tier alert batching                                            #
+    # ------------------------------------------------------------------ #
+
+    def queue_pending_alert(
+        self,
+        alert_type: str,
+        title: str,
+        body: str,
+        priority: float = 0.0,
+        game_date: str = None,
+    ) -> int:
+        """
+        Store a Tier-2 alert for inclusion in the next digest flush.
+
+        Returns the new row id.
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO pending_alerts (alert_type, title, body, priority, game_date)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (alert_type, title, body, priority, game_date),
+            )
+            return cursor.lastrowid
+
+    def get_pending_alerts(self, unsent_only: bool = True) -> list:
+        """
+        Return pending_alerts rows as dicts.
+
+        When `unsent_only=True` (default), returns only rows where sent_at IS NULL.
+        Rows are ordered by alert_type then priority descending (highest edge first).
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            where = "WHERE sent_at IS NULL" if unsent_only else ""
+            cursor.execute(
+                f"""
+                SELECT id, alert_type, title, body, priority, game_date, created_at
+                FROM pending_alerts
+                {where}
+                ORDER BY alert_type, priority DESC
+                """
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def mark_pending_alerts_sent(self, ids: list) -> None:
+        """Stamp sent_at = now for the given pending_alert ids."""
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        with self.get_conn() as conn:
+            conn.execute(
+                f"UPDATE pending_alerts SET sent_at = CURRENT_TIMESTAMP "
+                f"WHERE id IN ({placeholders})",
+                ids,
+            )
 
     # ------------------------------------------------------------------ #
     #  Backtesting                                                         #

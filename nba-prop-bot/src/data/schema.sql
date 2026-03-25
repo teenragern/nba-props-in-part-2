@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS bet_results (
     alert_id INTEGER PRIMARY KEY,
     actual_result REAL,
     won BOOLEAN,
+    push BOOLEAN NOT NULL DEFAULT 0,
     settled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(alert_id) REFERENCES alerts_sent(id)
 );
@@ -250,6 +251,21 @@ CREATE TABLE IF NOT EXISTS cross_team_correlations (
     computed_date TEXT NOT NULL,
     PRIMARY KEY (matchup, player_a, player_b, market_a, market_b)
 );
+
+-- Two-tier alert batching: Tier 2 edges queue here until the next digest flush.
+CREATE TABLE IF NOT EXISTS pending_alerts (
+    id          INTEGER  PRIMARY KEY AUTOINCREMENT,
+    alert_type  TEXT     NOT NULL,            -- 'prop' | 'game_market' | 'parlay'
+    title       TEXT     NOT NULL,            -- compact one-liner shown in digest
+    body        TEXT     NOT NULL,            -- full HTML body (for reference / future standalone send)
+    priority    REAL     NOT NULL DEFAULT 0.0, -- sort key: higher = shown first (use edge/ev value)
+    game_date   TEXT,                         -- YYYY-MM-DD, for grouping
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    sent_at     DATETIME                      -- NULL = pending; populated when included in a digest
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_alerts_unsent
+    ON pending_alerts(sent_at, created_at);
 
 -- Indexes to accelerate the steam detection query (scans last 120 min)
 CREATE INDEX IF NOT EXISTS idx_line_history_ts

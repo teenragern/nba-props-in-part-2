@@ -235,7 +235,10 @@ class PropMLModel:
                             league_avg_pace: float = 99.0,
                             opp_rebound_pct_lookup: Optional[Dict[str, float]] = None,
                             opp_pts_paint_lookup: Optional[Dict[str, float]] = None,
-                            ) -> Tuple[List, List]:
+                            player_name: str = "",
+                            clv_weight_lookup: Optional[Dict] = None,
+                            return_weights: bool = False,
+                            ) -> Tuple:
         """
         Generate (X, y) training samples from a player's chronological game logs.
         Requires at least 15 games. Only uses past games as features (no lookahead).
@@ -248,16 +251,23 @@ class PropMLModel:
                                     Build from team_stats_df['DREB_PCT'].
             opp_pts_paint_lookup:   {team_abbr_upper: opp_pts_paint_normalized}.
                                     Build from def_stats_df['OPP_PTS_PAINT'].
+            player_name:            Player's display name — used for CLV lookup.
+            clv_weight_lookup:      {(player_norm, market, date_str): weight} from
+                                    build_clv_weight_lookup().  When provided, each
+                                    training sample is weighted by past CLV outcome.
+            return_weights:         When True, returns (X, y, weights); when False
+                                    (default) returns (X, y) for backward compatibility.
         """
         if logs.empty or len(logs) < 15:
-            return [], []
+            return ([], [], []) if return_weights else ([], [])
         if self.col not in logs.columns or 'MIN' not in logs.columns:
-            return [], []
+            return ([], [], []) if return_weights else ([], [])
 
         # nba_api returns newest-first → reverse for chronological order
         chron = logs[::-1].reset_index(drop=True)
+        player_norm = _norm_player_name(player_name)
 
-        X, y = [], []
+        X, y, weights = [], [], []
         for i in range(10, len(chron)):
             current = chron.iloc[i]
             if float(current.get('MIN', 0) or 0) <= 0:
@@ -306,12 +316,27 @@ class PropMLModel:
             if feats is None:
                 continue
 
+            # CLV-derived sample weight: past bets on this player/market/game
+            # that beat the closing line are upweighted; those that missed are down.
+            sample_weight = 1.0
+            if clv_weight_lookup is not None and player_norm:
+                try:
+                    gdate = str(pd.to_datetime(current['GAME_DATE']).date())
+                    sample_weight = clv_weight_lookup.get(
+                        (player_norm, self.market, gdate), 1.0
+                    )
+                except Exception:
+                    sample_weight = 1.0
+
             X.append([feats[k] for k in FEATURE_NAMES])
             y.append(target_rate)
+            weights.append(sample_weight)
 
+        if return_weights:
+            return X, y, weights
         return X, y
 
-    def train(self, X: List, y: List) -> bool:
+    def train(self, X: List, y: List, sample_weight: Optional[List] = None) -> bool:
         """Train XGBoost. Returns True on success."""
         if len(X) < MIN_TRAIN_SAMPLES:
             return False
@@ -327,7 +352,8 @@ class PropMLModel:
                 random_state=42,
                 verbosity=0,
             )
-            self.model.fit(np.array(X), np.array(y))
+            sw = np.array(sample_weight) if sample_weight else None
+            self.model.fit(np.array(X), np.array(y), sample_weight=sw)
             joblib.dump(self.model, self.model_path)
             return True
         except Exception:
@@ -471,6 +497,154 @@ def train_models_from_logs(player_logs_list: List[pd.DataFrame],
         results[market] = success
         status = "trained" if success else f"skipped (need {MIN_TRAIN_SAMPLES} samples, got {len(all_X)})"
         log.info(f"ML model [{market}]: {status}")
+    return results
+
+
+# ── CLV Feedback Helpers ──────────────────────────────────────────────────────
+
+def _norm_player_name(name: str) -> str:
+    """Lowercase + strip accents + normalise whitespace for CLV key matching."""
+    import unicodedata
+    nfkd = unicodedata.normalize('NFKD', name)
+    return ' '.join(nfkd.encode('ascii', 'ignore').decode('ascii').lower().split())
+
+
+def build_clv_weight_lookup(db) -> Dict:
+    """
+    Query clv_tracking for all settled records and return a sample-weight dict:
+        {(player_norm, market, date_str): weight_multiplier}
+
+    CLV is the probability improvement over the alert price (implied_closing − implied_alert).
+    We translate it to XGBoost sample weights that reinforce predictions the sharp market
+    later confirmed (positive CLV) and discount those it moved against (negative CLV).
+
+    Weight table:
+        CLV >  0.02  → 1.8   (strong beat: closing line agreed with us)
+        CLV >  0.00  → 1.2   (mild beat)
+        CLV > −0.02  → 0.9   (near-miss: market barely moved against us)
+        CLV ≤ −0.02  → 0.6   (market clearly disagreed: discount this prediction)
+    """
+    try:
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT ct.player_id                                       AS player,
+                       ct.market,
+                       ct.clv,
+                       COALESCE(a.game_date, DATE(ct.alert_time))         AS game_date
+                FROM   clv_tracking ct
+                LEFT   JOIN alerts_sent a
+                            ON  a.player_name = ct.player_id
+                            AND a.market      = ct.market
+                            AND date(a.timestamp) = date(ct.alert_time)
+                WHERE  ct.clv IS NOT NULL
+                """
+            ).fetchall()
+    except Exception:
+        return {}
+
+    lookup: Dict = {}
+    for row in rows:
+        player_n = _norm_player_name(str(row['player']))
+        market   = str(row['market'])
+        gdate    = str(row['game_date'] or '')
+        clv_val  = float(row['clv'])
+
+        if clv_val > 0.02:
+            weight = 1.8
+        elif clv_val > 0.0:
+            weight = 1.2
+        elif clv_val > -0.02:
+            weight = 0.9
+        else:
+            weight = 0.6
+
+        lookup[(player_n, market, gdate)] = weight
+
+    return lookup
+
+
+def train_models_with_clv_feedback(
+    player_named_logs: List[Tuple[str, pd.DataFrame]],
+    db,
+    opp_stats_df: Optional[pd.DataFrame] = None,
+    team_stats_df: Optional[pd.DataFrame] = None,
+    def_stats_df: Optional[pd.DataFrame] = None,
+    league_avg_pace: float = 99.0,
+) -> Dict[str, bool]:
+    """
+    CLV-weighted variant of train_models_from_logs.
+
+    ``player_named_logs`` must be a list of ``(player_name, logs_df)`` tuples so
+    each sample can be matched to its CLV record.
+
+    Uses the same feature set as the standard model; the only difference is that
+    XGBoost's ``sample_weight`` is drawn from the CLV history so predictions that
+    historically beat the closing line receive higher training influence.
+
+    Falls back to uniform weights when no CLV data is available (first run).
+    """
+    from src.utils.logging_utils import get_logger
+    log = get_logger(__name__)
+
+    clv_lookup = build_clv_weight_lookup(db)
+    log.info(f"CLV feedback: {len(clv_lookup)} CLV weight records loaded.")
+
+    # Build context lookups (same as train_models_from_logs)
+    pace_lookup: Optional[Dict[str, float]] = None
+    if team_stats_df is not None and not team_stats_df.empty and 'PACE' in team_stats_df.columns:
+        pace_lookup = _build_abbr_lookup(team_stats_df, 'PACE')
+        if pace_lookup:
+            league_avg_pace = float(np.mean(list(pace_lookup.values())))
+
+    opp_rebound_pct_lookup: Optional[Dict[str, float]] = None
+    if team_stats_df is not None and not team_stats_df.empty and 'DREB_PCT' in team_stats_df.columns:
+        raw = _build_abbr_lookup(team_stats_df, 'DREB_PCT')
+        lg_avg = float(np.mean(list(raw.values()))) if raw else 0.0
+        if lg_avg > 0:
+            opp_rebound_pct_lookup = {k: v / lg_avg for k, v in raw.items()}
+
+    opp_pts_paint_lookup: Optional[Dict[str, float]] = None
+    if def_stats_df is not None and not def_stats_df.empty and 'OPP_PTS_PAINT' in def_stats_df.columns:
+        raw = _build_abbr_lookup(def_stats_df, 'OPP_PTS_PAINT')
+        lg_avg = float(np.mean(list(raw.values()))) if raw else 0.0
+        if lg_avg > 0:
+            opp_pts_paint_lookup = {k: v / lg_avg for k, v in raw.items()}
+
+    results = {}
+    for market in _MARKET_COL:
+        model = PropMLModel(market)
+
+        opp_def_lookup: Optional[Dict[str, float]] = None
+        opp_col = _MARKET_OPP_STAT.get(market)
+        if opp_stats_df is not None and not opp_stats_df.empty and opp_col and opp_col in opp_stats_df.columns:
+            raw = _build_abbr_lookup(opp_stats_df, opp_col)
+            lg_avg = float(np.mean(list(raw.values()))) if raw else 1.0
+            opp_def_lookup = {k: v / lg_avg for k, v in raw.items()} if lg_avg > 0 else raw
+
+        all_X, all_y, all_w = [], [], []
+        for player_name, logs in player_named_logs:
+            X, y, w = model.build_training_data(
+                logs, opp_def_lookup, pace_lookup, league_avg_pace,
+                opp_rebound_pct_lookup, opp_pts_paint_lookup,
+                player_name=player_name,
+                clv_weight_lookup=clv_lookup,
+                return_weights=True,
+            )
+            all_X.extend(X)
+            all_y.extend(y)
+            all_w.extend(w)
+
+        success = model.train(all_X, all_y, sample_weight=all_w if all_w else None)
+        results[market] = success
+        beats  = sum(1 for w in all_w if w > 1.0)
+        misses = sum(1 for w in all_w if w < 1.0)
+        status = (
+            "trained" if success
+            else f"skipped (need {MIN_TRAIN_SAMPLES} samples, got {len(all_X)})"
+        )
+        log.info(f"CLV model [{market}]: {status} | CLV beats={beats} misses={misses}")
+
     return results
 
 

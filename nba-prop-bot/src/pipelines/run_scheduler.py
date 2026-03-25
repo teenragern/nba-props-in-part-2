@@ -37,7 +37,8 @@ from src.pipelines.exposure import check_exposure
 from src.pipelines.timing_analysis import analyze_timing
 from src.clients.twitter_monitor import TwitterNitterMonitor
 from src.pipelines.breaking_news import check_breaking_news
-from src.pipelines.train_ml import train_ml_models
+from src.pipelines.train_ml import train_ml_models, train_ml_models_clv_feedback
+from src.pipelines.flush_alerts import flush_pending_alerts
 from src.config import SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL
 
 logger = get_logger(__name__)
@@ -161,6 +162,14 @@ def job_breaking_news():
         notify("Scan [BREAKING]", scan_props)
 
 
+def job_flush_alerts():
+    """Send Tier-2 digest (Props / Game Markets / SGPs)."""
+    if not _has_games():
+        logger.info("Digest flush skipped: no NBA games today.")
+        return
+    flush_pending_alerts(DatabaseClient(), bot)
+
+
 def job_settle():        notify("Settle",          settle_alerts)
 def job_stats():         notify("Stats",            generate_analytics)
 def job_calibration():   notify("Calibration",      check_calibration)
@@ -168,7 +177,8 @@ def job_tune():          notify("Tune",             run_tuning, DatabaseClient()
 def job_market_stats():  notify("Market Stats",     analyze_market_stats)
 def job_exposure():      notify("Exposure",         check_exposure)
 def job_timing_analysis(): notify("Timing Analysis", analyze_timing)
-def job_train_ml():      notify("Train ML",         train_ml_models)
+def job_train_ml():      notify("Train ML",                  train_ml_models)
+def job_train_clv_ml():  notify("Train ML [CLV Feedback]",   train_ml_models_clv_feedback)
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +197,19 @@ def start_scheduler():
     schedule.every().day.at("10:00").do(job_market_stats)
     schedule.every().day.at("10:15").do(job_timing_analysis)
     schedule.every(6).hours.do(job_exposure)
-    schedule.every().sunday.at("03:00").do(job_train_ml)   # weekly ML retrain (off-peak)
+    schedule.every().sunday.at("03:00").do(job_train_ml)    # weekly ML retrain (off-peak)
+    schedule.every(30).days.at("04:00").do(job_train_clv_ml)  # monthly CLV-weighted retrain
 
     # --- Game-day guarded jobs (skip when no games or outside window) ---
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # ~11 credits each
     schedule.every(120).minutes.do(job_clv)                     # ~11 credits each
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
     schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
+
+    # --- Tier-2 digest flushes (Props / Game Markets / SGPs) ---
+    schedule.every().day.at("12:00").do(job_flush_alerts)
+    schedule.every().day.at("15:00").do(job_flush_alerts)
+    schedule.every().day.at("18:00").do(job_flush_alerts)
 
     # Run sync immediately so _today_game_count is set before first scan.
     job_sync()

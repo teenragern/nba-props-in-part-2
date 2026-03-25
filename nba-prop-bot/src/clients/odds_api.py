@@ -1,5 +1,5 @@
 import requests
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from src.config import ODDS_API_KEY, ODDS_REGION, BOOKMAKERS, SHARP_BOOKS
 from src.utils.retry import retry_with_backoff
 from src.utils.logging_utils import get_logger
@@ -103,3 +103,130 @@ class OddsApiClient:
         if len(spreads) % 2 == 0:
             return (spreads[mid - 1] + spreads[mid]) / 2.0
         return spreads[mid]
+
+    # ── Game-market odds extraction ───────────────────────────────────────────
+    # These helpers return a (price_a, price_b, book_title) tuple from the
+    # sharpest available book for use in devig_shin probability estimation.
+
+    _SHARP_PRIORITY = ['pinnacle', 'circa', 'bookmaker', 'betonlineag']
+
+    @staticmethod
+    def extract_h2h_odds(
+        bookmakers: List[Dict], home_team: str, away_team: str
+    ) -> Optional[Tuple[float, float, str]]:
+        """
+        Return (home_price, away_price, book_title) for the h2h (moneyline) market.
+
+        Iterates bookmakers in priority order (sharpest first).  Returns the first
+        book that has valid decimal prices for both sides.  Returns None when no
+        h2h data is present.
+        """
+        home_lower = home_team.lower()
+        home_last  = home_lower.split()[-1]
+        away_lower = away_team.lower()
+        away_last  = away_lower.split()[-1]
+
+        candidates: Dict[str, Tuple[float, float, str]] = {}
+        for book in bookmakers:
+            title_lower = book.get('title', '').lower()
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'h2h':
+                    continue
+                hp = ap = None
+                for outcome in mkt.get('outcomes', []):
+                    name  = outcome.get('name', '').lower()
+                    price = float(outcome.get('price', 0.0))
+                    if price <= 1.0:
+                        continue
+                    if name == home_lower or home_last in name:
+                        hp = price
+                    elif name == away_lower or away_last in name:
+                        ap = price
+                if hp and ap:
+                    candidates[title_lower] = (hp, ap, book.get('title', ''))
+
+        if not candidates:
+            return None
+        for sharp in OddsApiClient._SHARP_PRIORITY:
+            if sharp in candidates:
+                return candidates[sharp]
+        return next(iter(candidates.values()))
+
+    @staticmethod
+    def extract_spread_odds_at_line(
+        bookmakers: List[Dict], home_team: str, home_spread: float
+    ) -> Optional[Tuple[float, float, str]]:
+        """
+        Return (home_price, away_price, book_title) for the spread at `home_spread`.
+
+        `home_spread` follows the OddsApiClient convention: negative means the
+        home team is favored (e.g. -6.5).  Returns None when no matching data
+        is found.
+        """
+        home_lower = home_team.lower()
+        home_last  = home_lower.split()[-1]
+
+        candidates: Dict[str, Tuple[float, float, str]] = {}
+        for book in bookmakers:
+            title_lower = book.get('title', '').lower()
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'spreads':
+                    continue
+                hp = ap = None
+                for outcome in mkt.get('outcomes', []):
+                    point = outcome.get('point')
+                    price = float(outcome.get('price', 0.0))
+                    if point is None or price <= 1.0:
+                        continue
+                    name    = outcome.get('name', '').lower()
+                    is_home = (name == home_lower or home_last in name)
+                    if is_home and abs(float(point) - home_spread) < 0.1:
+                        hp = price
+                    elif not is_home and abs(float(point) + home_spread) < 0.1:
+                        ap = price
+                if hp and ap:
+                    candidates[title_lower] = (hp, ap, book.get('title', ''))
+
+        if not candidates:
+            return None
+        for sharp in OddsApiClient._SHARP_PRIORITY:
+            if sharp in candidates:
+                return candidates[sharp]
+        return next(iter(candidates.values()))
+
+    @staticmethod
+    def extract_total_odds_at_line(
+        bookmakers: List[Dict], total_line: float
+    ) -> Optional[Tuple[float, float, str]]:
+        """
+        Return (over_price, under_price, book_title) for the total at `total_line`.
+        Returns None when no matching totals data is found.
+        """
+        candidates: Dict[str, Tuple[float, float, str]] = {}
+        for book in bookmakers:
+            title_lower = book.get('title', '').lower()
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'totals':
+                    continue
+                op = up = None
+                for outcome in mkt.get('outcomes', []):
+                    point = outcome.get('point')
+                    price = float(outcome.get('price', 0.0))
+                    if point is None or price <= 1.0:
+                        continue
+                    if abs(float(point) - total_line) > 0.1:
+                        continue
+                    name = outcome.get('name', '').lower()
+                    if name == 'over':
+                        op = price
+                    elif name == 'under':
+                        up = price
+                if op and up:
+                    candidates[title_lower] = (op, up, book.get('title', ''))
+
+        if not candidates:
+            return None
+        for sharp in OddsApiClient._SHARP_PRIORITY:
+            if sharp in candidates:
+                return candidates[sharp]
+        return next(iter(candidates.values()))

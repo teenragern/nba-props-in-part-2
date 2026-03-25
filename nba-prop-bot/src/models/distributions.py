@@ -426,3 +426,90 @@ def get_probability_distribution(
     else:
         variance = max(mean * 1.25, 4.0) * variance_scale
         return _cap(normal_over_under(mean, variance, line))
+
+
+# ── Game market (team-level) projections ─────────────────────────────────────
+
+_MARGIN_STD = 11.5   # Final-score margin std dev (historical NBA ≈ 11–12 pts)
+_TOTAL_STD  = 14.0   # Combined-total std dev     (historical NBA ≈ 13–15 pts)
+
+
+def project_game_markets(
+    home_expected_score: float,
+    away_expected_score: float,
+    book_spread: float,
+    book_total: float,
+) -> Dict[str, float]:
+    """
+    Project true probabilities for Moneyline, Spread, and Total markets
+    using a Normal distribution on final-score margin / combined total.
+
+    Parameters
+    ----------
+    home_expected_score : Pace-and-opponent-adjusted projected score, home team.
+    away_expected_score : Same for the away team.
+    book_spread         : Home team spread (OddsApiClient convention — negative
+                          means home is favored, e.g. -6.5).
+    book_total          : Combined over/under total from the book.
+
+    Returns
+    -------
+    dict with keys: home_win, away_win, home_cover, away_cover, over, under.
+    Cover and total probabilities are conditional on no push (push returns stake).
+
+    Convention
+    ----------
+    expected_margin = away_expected - home_expected.
+    Negative  → home projected to win.
+    Home covers when (away_score - home_score) < book_spread.
+    """
+    expected_margin = away_expected_score - home_expected_score
+    expected_total  = home_expected_score + away_expected_score
+
+    # ── Moneyline ─────────────────────────────────────────────────────────────
+    # P(home wins) = P(away - home < 0) = CDF(0; μ=expected_margin, σ=_MARGIN_STD)
+    home_win = float(norm.cdf(0.0, loc=expected_margin, scale=_MARGIN_STD))
+    away_win = 1.0 - home_win
+
+    # ── Spread ────────────────────────────────────────────────────────────────
+    # Whole-number spreads allow a push; condition on no-push for bet probability.
+    is_whole_spread = book_spread != 0.0 and abs(book_spread - round(book_spread)) < 0.01
+    if is_whole_spread:
+        push_prob = float(
+            norm.cdf(book_spread + 0.5, loc=expected_margin, scale=_MARGIN_STD)
+            - norm.cdf(book_spread - 0.5, loc=expected_margin, scale=_MARGIN_STD)
+        )
+        raw_home = float(norm.cdf(book_spread - 0.5, loc=expected_margin, scale=_MARGIN_STD))
+        raw_away = 1.0 - float(norm.cdf(book_spread + 0.5, loc=expected_margin, scale=_MARGIN_STD))
+        denom    = max(1.0 - push_prob, 1e-6)
+        home_cover = raw_home / denom
+        away_cover = raw_away / denom
+    else:
+        # Half-point spread: no push possible
+        home_cover = float(norm.cdf(book_spread, loc=expected_margin, scale=_MARGIN_STD))
+        away_cover = 1.0 - home_cover
+
+    # ── Total ─────────────────────────────────────────────────────────────────
+    is_whole_total = book_total > 0.0 and abs(book_total - round(book_total)) < 0.01
+    if is_whole_total:
+        push_prob = float(
+            norm.cdf(book_total + 0.5, loc=expected_total, scale=_TOTAL_STD)
+            - norm.cdf(book_total - 0.5, loc=expected_total, scale=_TOTAL_STD)
+        )
+        raw_over  = 1.0 - float(norm.cdf(book_total + 0.5, loc=expected_total, scale=_TOTAL_STD))
+        raw_under = float(norm.cdf(book_total - 0.5, loc=expected_total, scale=_TOTAL_STD))
+        denom     = max(1.0 - push_prob, 1e-6)
+        prob_over  = raw_over  / denom
+        prob_under = raw_under / denom
+    else:
+        prob_over  = 1.0 - float(norm.cdf(book_total, loc=expected_total, scale=_TOTAL_STD))
+        prob_under = float(norm.cdf(book_total, loc=expected_total, scale=_TOTAL_STD))
+
+    return {
+        'home_win':   home_win,
+        'away_win':   away_win,
+        'home_cover': float(np.clip(home_cover, 0.0, 1.0)),
+        'away_cover': float(np.clip(away_cover, 0.0, 1.0)),
+        'over':       float(np.clip(prob_over,  0.0, 1.0)),
+        'under':      float(np.clip(prob_under, 0.0, 1.0)),
+    }

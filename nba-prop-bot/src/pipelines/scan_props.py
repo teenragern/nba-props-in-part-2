@@ -45,19 +45,22 @@ from src.models.distributions import (
     get_probability_distribution,
     compute_player_foul_rate,
     classify_bench_tier,
+    project_game_markets,
 )
 from src.models.devig import (
-    decimal_to_implied_prob, devig_two_way,
+    decimal_to_implied_prob, devig_two_way, devig_shin,
     build_consensus_true_prob, get_theoretical_hold,
 )
 from src.models.edge_ranker import rank_edges, set_db as set_ranker_db
 from src.models.ml_model import get_ml_projection
-from src.pipelines.send_alerts import evaluate_and_alert
+from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert
 from src.pipelines.combos import generate_and_alert_combos
 from src.models.sgp_correlations import build_team_correlation_matrix
 from src.clients.on_off_splits import OnOffSplitsClient
 from src.clients.rotation_model import RotationModel
-from src.clients.travel_fatigue import compute_travel_fatigue, TEAM_NAME_TO_ABBR
+from src.clients.travel_fatigue import (
+    compute_travel_fatigue, TEAM_NAME_TO_ABBR, ARENAS, haversine_miles, _HIGH_ALTITUDE_FT,
+)
 from src.clients.referee_client import fetch_today_assignments, match_event_refs
 from src.models.referee_stats import get_crew_foul_factor
 
@@ -68,6 +71,73 @@ _SHARP_TS_BOOKS      = {'pinnacle', 'circa', 'bookmaker'}
 _SOFT_TS_BOOKS       = {'draftkings', 'fanduel', 'betmgm', 'caesars'}
 _STALE_THRESHOLD_SEC = 60
 _SHARP_RECENT_SEC    = 120
+
+# Game markets are highly efficient — require a stricter edge threshold.
+_GAME_MARKET_EDGE_MIN = 0.015  # 1.5 %
+
+
+def _get_team_adv_row(df, team_name: str):
+    """
+    Extract OFF_RATING, DEF_RATING, PACE from the advanced-stats DataFrame
+    for `team_name`.  Returns a dict or None if not found.
+    """
+    import pandas as pd
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return None
+    low = team_name.lower()
+    row = df[df['TEAM_NAME'].str.lower() == low]
+    if row.empty:
+        last = low.split()[-1]
+        row = df[df['TEAM_NAME'].str.lower().str.contains(last, na=False)]
+    if row.empty:
+        return None
+    r = row.iloc[0]
+    return {
+        'off_rating': float(r.get('OFF_RATING', 110.0)),
+        'def_rating': float(r.get('DEF_RATING', 110.0)),
+        'pace':       float(r.get('PACE',       99.0)),
+    }
+
+
+def _team_fatigue_mult(team_abbr: str, home_arena_abbr: str) -> float:
+    """
+    Simplified travel-fatigue multiplier for team-level expected-score projection.
+
+    Home team (team_abbr == home_arena_abbr) never incurs a penalty.
+    Away team is penalised for distance, east-bound timezone shift, and altitude —
+    using ½ the per-player B2B rate because the team isn't necessarily on a B2B.
+
+    Returns a multiplier in [0.93, 1.0].
+    """
+    game_arena = ARENAS.get(home_arena_abbr.upper(), {})
+    altitude   = game_arena.get('elev_ft', 0) >= _HIGH_ALTITUDE_FT
+
+    if not team_abbr or team_abbr.upper() == home_arena_abbr.upper():
+        return 1.0  # Home team: no travel penalty, altitude is their home turf
+
+    team_arena = ARENAS.get(team_abbr.upper())
+    if not team_arena:
+        return 0.97 if altitude else 1.0
+
+    miles    = haversine_miles(
+        team_arena['lat'], team_arena['lon'],
+        game_arena.get('lat', team_arena['lat']),
+        game_arena.get('lon', team_arena['lon']),
+    )
+    tz_shift = game_arena.get('tz_offset', 0) - team_arena['tz_offset']
+
+    if miles < 150:
+        # Local road game (e.g. LAL at LAC) — treat as near-home
+        return 0.97 if altitude else 1.0
+
+    # Scale at ½ the B2B player rate: 1 % per 1 000 mi, 0.8 % per hour east
+    penalty = (miles / 1000.0) * 0.01
+    if tz_shift > 0:
+        penalty += tz_shift * 0.008
+    if altitude:
+        penalty += 0.02
+
+    return round(max(0.93, 1.0 - penalty), 4)
 
 # ─── BDL integration (conditional import) ─────────────────────────────
 
@@ -397,7 +467,7 @@ def scan_props():
             try:
                 sharp_odds = odds_client.get_event_odds(
                     event_id=event_id,
-                    markets=[*PROP_MARKETS, 'spreads', 'totals']
+                    markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals']
                 )
                 sharp_bookmakers = sharp_odds.get('bookmakers', [])
             except Exception as _se:
@@ -427,7 +497,7 @@ def scan_props():
             try:
                 odds_data = odds_client.get_event_odds(
                     event_id=event_id,
-                    markets=[*PROP_MARKETS, 'spreads', 'totals']
+                    markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals']
                 )
             except Exception:
                 continue
@@ -525,6 +595,142 @@ def scan_props():
         pace_info = stats_client.get_team_pace(home_team, away_team)
 
         sharp_alerted: set = set()
+
+        # ── Game Markets Scan ─────────────────────────────────────────
+        # Run before the player loop so team-level edges are reported
+        # independently of prop availability.  Requires sharp book odds
+        # (h2h + spreads + totals) from the Odds API.
+        if sharp_bookmakers:
+            _gm_home_abbr = TEAM_NAME_TO_ABBR.get(home_team, home_team.split()[-1][:3].upper())
+            _gm_away_abbr = TEAM_NAME_TO_ABBR.get(away_team, away_team.split()[-1][:3].upper())
+            _gm_matchup   = f"{away_team} @ {home_team}"
+            try:
+                _adv_df   = stats_client.get_team_stats()
+                _home_row = _get_team_adv_row(_adv_df, home_team)
+                _away_row = _get_team_adv_row(_adv_df, away_team)
+
+                if _home_row and _away_row and not _adv_df.empty:
+                    _lg_def   = float(_adv_df['DEF_RATING'].mean()) or 114.0
+                    _gm_pace  = (_home_row['pace'] + _away_row['pace']) / 2.0
+
+                    # Expected scores: pace-adjusted, opponent-defense-adjusted
+                    _home_exp = (
+                        _home_row['off_rating'] * (_away_row['def_rating'] / _lg_def)
+                        * _gm_pace / 100.0
+                    )
+                    _away_exp = (
+                        _away_row['off_rating'] * (_home_row['def_rating'] / _lg_def)
+                        * _gm_pace / 100.0
+                    )
+
+                    # Sanity-clamp before applying fatigue
+                    _home_exp = max(85.0, min(135.0, _home_exp))
+                    _away_exp = max(85.0, min(135.0, _away_exp))
+
+                    # Team travel-fatigue multipliers
+                    _home_exp *= _team_fatigue_mult(_gm_home_abbr, _gm_home_abbr)
+                    _away_exp *= _team_fatigue_mult(_gm_away_abbr, _gm_home_abbr)
+
+                    _book_spread = _home_spread or 0.0
+                    _book_total  = _game_total  or 0.0
+
+                    _gm_probs = project_game_markets(
+                        _home_exp, _away_exp, _book_spread, _book_total
+                    )
+
+                    # ── Moneyline (h2h) ───────────────────────────────
+                    _h2h = OddsApiClient.extract_h2h_odds(
+                        sharp_bookmakers, home_team, away_team
+                    )
+                    if _h2h:
+                        _h2h_hp, _h2h_ap, _h2h_book = _h2h
+                        _true_h, _true_a = devig_shin(
+                            decimal_to_implied_prob(_h2h_hp),
+                            decimal_to_implied_prob(_h2h_ap),
+                        )
+                        for _gm_model_p, _gm_book_p, _gm_odds, _gm_side in [
+                            (_gm_probs['home_win'], _true_h, _h2h_hp, home_team),
+                            (_gm_probs['away_win'], _true_a, _h2h_ap, away_team),
+                        ]:
+                            _gm_edge = _gm_model_p - _gm_book_p
+                            if _gm_edge >= _GAME_MARKET_EDGE_MIN:
+                                _gm_ev = _gm_model_p * (_gm_odds - 1) - (1 - _gm_model_p)
+                                send_game_market_alert(
+                                    home_team=home_team, away_team=away_team,
+                                    home_score=_home_exp, away_score=_away_exp,
+                                    market='h2h', side=_gm_side,
+                                    edge=_gm_edge, ev=_gm_ev,
+                                    model_prob=_gm_model_p, book_prob=_gm_book_p,
+                                    book_odds=_gm_odds, book=_h2h_book,
+                                    game_date=game_date, event_id=event_id,
+                                    line=0.0, db=db, bot=bot,
+                                    home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                )
+
+                    # ── Spread ────────────────────────────────────────
+                    if _book_spread != 0.0:
+                        _sp = OddsApiClient.extract_spread_odds_at_line(
+                            sharp_bookmakers, home_team, _book_spread
+                        )
+                        if _sp:
+                            _sp_hp, _sp_ap, _sp_book = _sp
+                            _true_h, _true_a = devig_shin(
+                                decimal_to_implied_prob(_sp_hp),
+                                decimal_to_implied_prob(_sp_ap),
+                            )
+                            for _gm_model_p, _gm_book_p, _gm_odds, _gm_side in [
+                                (_gm_probs['home_cover'], _true_h, _sp_hp,
+                                 f"{home_team} {_book_spread:+.1f}"),
+                                (_gm_probs['away_cover'], _true_a, _sp_ap,
+                                 f"{away_team} {-_book_spread:+.1f}"),
+                            ]:
+                                _gm_edge = _gm_model_p - _gm_book_p
+                                if _gm_edge >= _GAME_MARKET_EDGE_MIN:
+                                    _gm_ev = _gm_model_p * (_gm_odds - 1) - (1 - _gm_model_p)
+                                    send_game_market_alert(
+                                        home_team=home_team, away_team=away_team,
+                                        home_score=_home_exp, away_score=_away_exp,
+                                        market='spreads', side=_gm_side,
+                                        edge=_gm_edge, ev=_gm_ev,
+                                        model_prob=_gm_model_p, book_prob=_gm_book_p,
+                                        book_odds=_gm_odds, book=_sp_book,
+                                        game_date=game_date, event_id=event_id,
+                                        line=_book_spread, db=db, bot=bot,
+                                        home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                    )
+
+                    # ── Total ─────────────────────────────────────────
+                    if _book_total > 0.0:
+                        _tot = OddsApiClient.extract_total_odds_at_line(
+                            sharp_bookmakers, _book_total
+                        )
+                        if _tot:
+                            _tot_op, _tot_up, _tot_book = _tot
+                            _true_o, _true_u = devig_shin(
+                                decimal_to_implied_prob(_tot_op),
+                                decimal_to_implied_prob(_tot_up),
+                            )
+                            for _gm_model_p, _gm_book_p, _gm_odds, _gm_side in [
+                                (_gm_probs['over'],  _true_o, _tot_op, 'Over'),
+                                (_gm_probs['under'], _true_u, _tot_up, 'Under'),
+                            ]:
+                                _gm_edge = _gm_model_p - _gm_book_p
+                                if _gm_edge >= _GAME_MARKET_EDGE_MIN:
+                                    _gm_ev = _gm_model_p * (_gm_odds - 1) - (1 - _gm_model_p)
+                                    send_game_market_alert(
+                                        home_team=home_team, away_team=away_team,
+                                        home_score=_home_exp, away_score=_away_exp,
+                                        market='totals', side=_gm_side,
+                                        edge=_gm_edge, ev=_gm_ev,
+                                        model_prob=_gm_model_p, book_prob=_gm_book_p,
+                                        book_odds=_gm_odds, book=_tot_book,
+                                        game_date=game_date, event_id=event_id,
+                                        line=_book_total, db=db, bot=bot,
+                                        home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                    )
+
+            except Exception as _gm_err:
+                logger.warning(f"Game markets scan failed for {_gm_matchup}: {_gm_err}")
 
         # ── Per-player loop ───────────────────────────────────────────
         for player_name in players_in_event:
