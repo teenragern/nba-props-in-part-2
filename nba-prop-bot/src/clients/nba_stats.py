@@ -13,6 +13,19 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
+def get_current_nba_season() -> str:
+    """
+    Return the current NBA season string (e.g. '2025-26').
+    October or later → current year is the start year.
+    January–September → previous year is the start year.
+    """
+    now = datetime.now()
+    start_year = now.year if now.month >= 10 else now.year - 1
+    end_suffix = str(start_year + 1)[-2:]
+    return f"{start_year}-{end_suffix}"
+
+
 # Build static team lookup tables once at import time
 try:
     from nba_api.stats.static import teams as _nba_teams
@@ -76,8 +89,8 @@ _POSITION_BLEND = 0.25
 
 
 class NbaStatsClient:
-    def __init__(self, season: str = "2024-25"):
-        self.season = season
+    def __init__(self, season: str = None):
+        self.season = season or get_current_nba_season()
         self.cache_db = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'stats_cache.db')
         self._init_cache()
         self._opp_stats_cache: Optional[pd.DataFrame] = None   # Opponent PerGame
@@ -554,6 +567,24 @@ class NbaStatsClient:
         blend = (1.0 - _POSITION_BLEND) + _POSITION_BLEND * pf
         return round(max(0.70, min(1.30, base * blend)), 4)
 
+    def get_team_win_pct_map(self) -> Dict[str, float]:
+        """
+        Return {team_name_lower: win_pct} for all teams this season.
+        Reuses the in-memory advanced stats cache — no extra API call after the
+        first fetch.
+        """
+        try:
+            df = self.get_team_stats()
+            if df.empty or 'W_PCT' not in df.columns:
+                return {}
+            return {
+                str(row['TEAM_NAME']).lower(): float(row['W_PCT'])
+                for _, row in df.iterrows()
+            }
+        except Exception as e:
+            logger.warning(f"get_team_win_pct_map failed: {e}")
+            return {}
+
     def get_team_pace(self, home_team: str, away_team: str) -> Dict[str, float]:
         """Return pace for both teams. Used to replace hardcoded 99.0."""
         try:
@@ -639,6 +670,59 @@ class NbaStatsClient:
         info = commonplayerinfo.CommonPlayerInfo(player_id=player_id)
         time.sleep(0.6)
         return info.get_dict()
+
+    def get_player_previous_teams(self, player_id: int) -> set:
+        """
+        Return the set of full team names (lowercased) this player has
+        previously played for.
+
+        Sources (zero extra API calls after first run per player):
+          1. Previous-season game logs via get_player_game_logs_season —
+             cached permanently in backtest_logs_cache.
+          2. Current-season game logs (already cached today) — catches
+             mid-season trades where some logs show the old team abbreviation.
+
+        Matching against opp_team (full name) works because _ABBR_TO_FULL
+        maps every NBA team abbreviation to its lowercased full name.
+        """
+        if not hasattr(self, '_prev_teams_cache'):
+            self._prev_teams_cache: Dict[int, set] = {}
+        if player_id in self._prev_teams_cache:
+            return self._prev_teams_cache[player_id]
+
+        prev_teams: set = set()
+
+        # ── Previous season logs ────────────────────────────────────────────
+        try:
+            parts      = self.season.split('-')
+            prev_start = int(parts[0]) - 1
+            prev_end   = str(int(parts[0]))[-2:]   # "24" from 2024
+            prev_season = f"{prev_start}-{prev_end}"
+            prev_logs   = self.get_player_game_logs_season(player_id, prev_season)
+            if not prev_logs.empty and 'TEAM_ABBREVIATION' in prev_logs.columns:
+                for abbr in prev_logs['TEAM_ABBREVIATION'].unique():
+                    full = _ABBR_TO_FULL.get(str(abbr).lower(), '')
+                    if full:
+                        prev_teams.add(full)
+        except Exception:
+            pass
+
+        # ── Current season: catch mid-season trades ─────────────────────────
+        try:
+            curr_logs = self.get_player_game_logs(player_id)
+            if not curr_logs.empty and 'TEAM_ABBREVIATION' in curr_logs.columns:
+                curr_abbr = str(curr_logs.iloc[0]['TEAM_ABBREVIATION']).lower()
+                for abbr in curr_logs['TEAM_ABBREVIATION'].unique():
+                    abbr_lower = str(abbr).lower()
+                    if abbr_lower != curr_abbr:
+                        full = _ABBR_TO_FULL.get(abbr_lower, '')
+                        if full:
+                            prev_teams.add(full)
+        except Exception:
+            pass
+
+        self._prev_teams_cache[player_id] = prev_teams
+        return prev_teams
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def get_box_score(self, game_id: str) -> pd.DataFrame:

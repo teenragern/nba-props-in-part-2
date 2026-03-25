@@ -194,6 +194,8 @@ def monte_carlo_over_under(
     n_sims: int = 1000,
     market: str = 'player_points',
     bench_tier: int = 1,
+    next_opp_win_pct: float = 0.0,
+    revenge_game: bool = False,
 ) -> Dict[str, float]:
     """
     Vectorized Monte Carlo simulation over n_sims game scenarios.
@@ -234,6 +236,13 @@ def monte_carlo_over_under(
     rng = np.random.default_rng()
     rate = mean_proj / proj_minutes
 
+    # Look-ahead spot: player's team is a heavy favourite tonight AND faces a
+    # tough opponent next game (win_pct > 0.65).  Coaches rest stars earlier
+    # in garbage time to protect them — tighten the blowout minute cap.
+    _effective_blowout_cap = blowout_minute_cap
+    if next_opp_win_pct > 0.65 and bench_tier <= 1:
+        _effective_blowout_cap = min(blowout_minute_cap, 24.0)
+
     # ── 1. Simulate effective minutes ──────────────────────────────────────
     sim_min = np.full(n_sims, proj_minutes, dtype=np.float64)
 
@@ -251,7 +260,7 @@ def monte_carlo_over_under(
         else:
             # Stars / starters / rotation players sit in blowouts
             sim_min = np.where(is_blowout,
-                               np.minimum(sim_min, blowout_minute_cap),
+                               np.minimum(sim_min, _effective_blowout_cap),
                                sim_min)
     elif blowout_prob > 0.0:
         # Mode B: precomputed scalar probability (legacy / backtest path).
@@ -261,7 +270,7 @@ def monte_carlo_over_under(
             sim_min = np.where(is_blowout, garbage_min, sim_min)
         else:
             sim_min = np.where(is_blowout,
-                               np.minimum(sim_min, blowout_minute_cap),
+                               np.minimum(sim_min, _effective_blowout_cap),
                                sim_min)
 
     adj_foul_rate = player_foul_rate * max(0.5, float(opp_foul_rate))
@@ -293,6 +302,15 @@ def monte_carlo_over_under(
     # ── 2. Sample stat outcome (Gamma-Poisson mixture) ─────────────────────
     expected = np.maximum(rate * sim_min, 0.0)
     alpha = DISPERSION_ALPHAS.get(market, 0.10)
+    # Revenge game: player faces a team they previously played for.
+    # Motivation spikes usage and shot attempts → widen the distribution for
+    # scoring/playmaking markets so the model captures tail upside the book misses.
+    _REVENGE_MARKETS = {
+        'player_points', 'player_assists',
+        'player_points_rebounds_assists', 'player_threes',
+    }
+    if revenge_game and market in _REVENGE_MARKETS:
+        alpha *= 1.10
     variance = expected + alpha * (expected ** 2)
 
     overdispersed = (variance > expected * 1.001) & (expected > 0.0)
@@ -336,6 +354,8 @@ def get_probability_distribution(
     player_foul_rate: float = 0.0,
     opp_foul_rate: float = 1.0,
     bench_tier: int = 1,
+    next_opp_win_pct: float = 0.0,
+    revenge_game: bool = False,
 ) -> Dict[str, float]:
     """
     Return {prob_over, prob_under} for a player prop.
@@ -377,6 +397,8 @@ def get_probability_distribution(
             n_sims=1000,
             market=market,
             bench_tier=bench_tier,
+            next_opp_win_pct=next_opp_win_pct,
+            revenge_game=revenge_game,
         ))
 
     # ── Parametric fallback ─────────────────────────────────────────────────

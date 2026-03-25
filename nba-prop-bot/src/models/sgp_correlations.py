@@ -280,6 +280,69 @@ def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -
     }
 
 
+def compute_synthetic_pra_prob(
+    logs: pd.DataFrame,
+    mean_pts: float,
+    mean_reb: float,
+    mean_ast: float,
+    pra_line: float,
+    n_sims: int = 10_000,
+) -> Dict[str, float]:
+    """
+    Compute P(PTS + REB + AST > pra_line) via a trivariate Gaussian copula
+    with Poisson marginals.
+
+    Why this matters: sportsbooks price PRA using their own derivative model
+    that often drifts out of sync with the individual-market prices. This
+    function derives PRA probability directly from the component distributions
+    and their historical covariance, exposing mis-pricings the book can't see.
+
+    Method:
+      1. Build the 3×3 Pearson correlation matrix for (PTS, REB, AST) from
+         the player's game logs (falls back to league averages if < 15 games).
+      2. Sample z ~ N(0, Σ)  where Σ = correlation matrix.
+      3. Transform each z through Φ → uniform, then through Poisson PPF
+         to get simulated integer counts correlated as in real life.
+      4. Return the fraction of sims where PTS + REB + AST > pra_line.
+
+    Returns:
+        {'prob_over': float, 'prob_under': float}
+        Empty dict when projected means are missing or matrix is degenerate.
+    """
+    if mean_pts <= 0 or mean_reb <= 0 or mean_ast <= 0 or pra_line <= 0:
+        return {}
+
+    rho_pr = get_pairwise_correlation('player_points',   'player_rebounds', logs)
+    rho_pa = get_pairwise_correlation('player_points',   'player_assists',  logs)
+    rho_ra = get_pairwise_correlation('player_rebounds', 'player_assists',  logs)
+
+    corr_matrix = np.array([
+        [1.0,    rho_pr, rho_pa],
+        [rho_pr, 1.0,    rho_ra],
+        [rho_pa, rho_ra, 1.0],
+    ])
+
+    rng = np.random.default_rng()
+    try:
+        z_samples = rng.multivariate_normal(
+            mean=[0.0, 0.0, 0.0], cov=corr_matrix, size=n_sims
+        )
+    except (np.linalg.LinAlgError, ValueError):
+        # Correlation matrix not positive semi-definite — fall back gracefully
+        logger.debug("compute_synthetic_pra_prob: degenerate correlation matrix, skipping")
+        return {}
+
+    # Map standard-normal quantiles → uniform → Poisson integer counts
+    # poisson.ppf(u, mu) is the smallest k s.t. Poisson.CDF(k, mu) >= u
+    u = norm.cdf(z_samples)  # shape (n_sims, 3)
+    sim_pts = poisson.ppf(u[:, 0], mu=mean_pts)
+    sim_reb = poisson.ppf(u[:, 1], mu=mean_reb)
+    sim_ast = poisson.ppf(u[:, 2], mu=mean_ast)
+
+    prob_over = float(np.mean(sim_pts + sim_reb + sim_ast > pra_line))
+    return {'prob_over': prob_over, 'prob_under': 1.0 - prob_over}
+
+
 # ── Cross-player (SGP teammate) correlations ──────────────────────────────────
 
 # Market pairs we compute for the PG→Big relationship.
@@ -394,5 +457,100 @@ def build_team_correlation_matrix(
         + ", ".join(
             f"{m_a.split('_')[1]}/{m_b.split('_')[1]}={c:.3f}(n={n})"
             for (m_a, m_b), (c, n) in corr_pairs.items()
+        )
+    )
+
+
+# ── Cross-team (opposing-player) correlations ─────────────────────────────────
+#
+# Players on opposing teams compete for the same finite resources in a game.
+# The strongest signal is rebounding: roughly 110 total boards per contest.
+# When one big dominates the glass, the opponent's big collects fewer — a
+# meaningful negative Pearson correlation.
+#
+# Sportsbook SGP builders universally assume independence across teams (ρ = 0).
+# A negative stat correlation becomes a POSITIVE bet-outcome correlation when
+# one leg is OVER and the opposing leg is UNDER, yielding a structural edge
+# the book has not priced.  The same finite-resource logic applies to any
+# metric with a conserved game total (possession counts, shots, etc.).
+
+# League-wide defaults for opposing-player finite-resource correlations.
+# Key = sorted (market_a, market_b) tuple; value = Pearson stat correlation.
+CROSS_TEAM_DEFAULTS: Dict[Tuple[str, str], float] = {
+    ('player_rebounds', 'player_rebounds'): -0.20,  # ~110 total REB conserved
+    ('player_points',   'player_points'):   -0.08,  # game-script / pace symmetry
+    ('player_assists',  'player_assists'):  -0.05,  # playmaking flow
+    ('player_blocks',   'player_blocks'):   -0.05,  # interior paint dominance
+}
+
+# Market pairs stored in the DB for each cross-team matchup.
+_CROSS_TEAM_PAIRS: List[Tuple[str, str]] = [
+    ('player_rebounds', 'player_rebounds'),
+    ('player_points',   'player_points'),
+]
+
+
+def get_cross_team_default_corr(market_a: str, market_b: str) -> float:
+    """
+    Return the league-wide default cross-team correlation for an opposing-player
+    market pair.  Returns 0.0 for pairs with no known finite-resource signal.
+    """
+    key = tuple(sorted([market_a, market_b]))
+    return CROSS_TEAM_DEFAULTS.get(key, 0.0)
+
+
+def build_cross_team_correlation_matrix(
+    home_team: str,
+    away_team: str,
+    stats_client: Any,
+    db: Any,
+) -> None:
+    """
+    Identify the opposing bigs for the home/away matchup and persist
+    cross-team correlation defaults for finite-resource market pairs.
+
+    Uses league-wide defaults rather than head-to-head empirical data
+    because two teams meet only 2–4 times per season — too sparse to
+    compute reliable Pearson correlations from aligned game logs.
+
+    The DB record has a 7-day TTL (same as cross_player_correlations)
+    so the same matchup is only processed once per week.
+    """
+    home_roster = stats_client.get_team_pg_and_big(home_team)
+    away_roster = stats_client.get_team_pg_and_big(away_team)
+    home_big = home_roster.get('big')
+    away_big = away_roster.get('big')
+
+    if not home_big or not away_big:
+        logger.debug(
+            f"build_cross_team_correlation_matrix: no big identified for "
+            f"'{home_team}' or '{away_team}'"
+        )
+        return
+
+    matchup = "|".join(sorted([home_team.lower(), away_team.lower()]))
+
+    # Skip recomputation if a fresh DB record already exists for primary pair
+    if db.get_cross_team_correlation(
+        matchup, home_big['name'], away_big['name'],
+        'player_rebounds', 'player_rebounds',
+    ) is not None:
+        return
+
+    for mkt_a, mkt_b in _CROSS_TEAM_PAIRS:
+        corr = CROSS_TEAM_DEFAULTS.get(tuple(sorted([mkt_a, mkt_b])), 0.0)
+        # Store both orderings so lookups succeed regardless of leg order
+        db.upsert_cross_team_correlation(
+            matchup, home_big['name'], away_big['name'], mkt_a, mkt_b, corr, 0)
+        db.upsert_cross_team_correlation(
+            matchup, away_big['name'], home_big['name'], mkt_b, mkt_a, corr, 0)
+
+    logger.debug(
+        f"Cross-team corr stored: {home_team} {home_big['name']} ↔ "
+        f"{away_team} {away_big['name']} | "
+        + ", ".join(
+            f"{m_a.split('_')[1]}/{m_b.split('_')[1]}="
+            f"{CROSS_TEAM_DEFAULTS.get(tuple(sorted([m_a, m_b])), 0.0):.2f}"
+            for m_a, m_b in _CROSS_TEAM_PAIRS
         )
     )

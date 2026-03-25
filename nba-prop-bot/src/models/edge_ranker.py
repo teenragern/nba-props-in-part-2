@@ -150,12 +150,17 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         variance = (mean * 1.25) * var_scale if mean > 0 else 1.0
         c['risk_adjusted_ev'] = ev / variance if variance > 0 else ev
 
-        # Under Tax: NBA stat distributions are right-skewed (bounded at 0,
-        # unbounded above). The median is naturally below the mean, so Unders
-        # are mechanically over-represented in top rankings even without real
-        # edge. A 15% haircut lets high-quality Overs compete fairly.
-        if side.upper() == 'UNDER':
-            c['risk_adjusted_ev'] *= 0.85
+        # ──────────────────────────────────────────────────────────────────
+        # Under Tax REMOVED.
+        #
+        # Previously applied a 15% penalty to Under risk_adjusted_ev to
+        # offset right-skew in NBA stat distributions. Empirical data
+        # shows the model OVER-projects means in the 55-65% band, meaning
+        # Unders are mechanically more likely to hit than the model thinks.
+        # The tax was filtering out profitable Under picks and contributing
+        # to the parlay loss spiral. Calibration_model.py now handles this
+        # correctly at the probability level.
+        # ──────────────────────────────────────────────────────────────────
 
         ranked.append(c)
 

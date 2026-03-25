@@ -234,6 +234,65 @@ class DatabaseClient:
             "dispersion": float(dispersion)
         }
 
+    def get_sharp_line_shift(self, player_name: str, market: str) -> dict:
+        """
+        Detect if any sharp book has made a whole-number line move (>= 1.0)
+        within the last 3 hours for this player/market.
+
+        Reads the Over side only — both sides are stored with the same line
+        value so one side is sufficient to see the structural shift.
+
+        Returns a dict with:
+          shift_detected  – bool
+          sharp_book      – the book that moved first
+          old_line        – earliest line seen in the window
+          new_line        – latest line seen in the window
+          direction       – 'UP' (sharp money on Over) or 'DOWN' (sharp money on Under)
+          magnitude       – |new_line - old_line|
+        """
+        _empty: dict = {'shift_detected': False}
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT bookmaker, line, timestamp
+                    FROM line_history
+                    WHERE player_name = ? AND market = ? AND side = 'OVER'
+                      AND LOWER(bookmaker) IN ('pinnacle', 'circa', 'bookmaker')
+                      AND timestamp >= datetime('now', '-3 hours')
+                    ORDER BY bookmaker, timestamp ASC
+                    """,
+                    (player_name, market),
+                )
+                rows = cursor.fetchall()
+        except Exception:
+            return _empty
+
+        if not rows:
+            return _empty
+
+        from collections import defaultdict
+        by_book: dict = defaultdict(list)
+        for row in rows:
+            by_book[row['bookmaker']].append(float(row['line']))
+
+        for book, lines in by_book.items():
+            if len(lines) < 2:
+                continue
+            earliest, latest = lines[0], lines[-1]
+            magnitude = latest - earliest
+            if abs(magnitude) >= 1.0:
+                return {
+                    'shift_detected':    True,
+                    'sharp_book':        book,
+                    'old_line':          earliest,
+                    'new_line':          latest,
+                    'direction':         'UP' if magnitude > 0 else 'DOWN',
+                    'magnitude':         abs(magnitude),
+                }
+        return _empty
+
     def get_book_market_bias(self, book: str, market: str) -> float:
         """
         Priority 7: Return per-book/market bias correction factor based on
@@ -262,6 +321,32 @@ class DatabaseClient:
         except Exception:
             pass
         return 1.0
+
+    def get_clv_beat_rate(self, days_back: int = 30, min_samples: int = 10) -> Optional[float]:
+        """
+        Return the fraction of settled bets that beat the closing line (clv > 0)
+        over the last `days_back` days.  Returns None when fewer than
+        `min_samples` settled bets exist (insufficient data to act on).
+        """
+        try:
+            with self.get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)                             AS total,
+                           SUM(CASE WHEN clv > 0 THEN 1 ELSE 0 END) AS beats
+                    FROM clv_tracking
+                    WHERE clv IS NOT NULL
+                      AND alert_time >= datetime('now', ?)
+                    """,
+                    (f'-{days_back} days',)
+                )
+                row = cursor.fetchone()
+                if row and row['total'] and row['total'] >= min_samples:
+                    return float(row['beats']) / float(row['total'])
+        except Exception:
+            pass
+        return None
 
     def get_avg_clv(self, days_back: int = 30) -> float:
         """Priority 8: Return average CLV for recent alerts (used by tune.py)."""
@@ -504,6 +589,38 @@ class DatabaseClient:
                    AND market_a = ? AND market_b = ?
                    AND computed_date >= date('now', '-7 days')""",
                 (team, player_a, player_b, market_a, market_b),
+            ).fetchone()
+        return float(row['correlation']) if row else None
+
+    # ------------------------------------------------------------------ #
+    #  Cross-team (opposing-player) SGP correlations                      #
+    # ------------------------------------------------------------------ #
+
+    def upsert_cross_team_correlation(
+        self, matchup: str, player_a: str, player_b: str,
+        market_a: str, market_b: str, correlation: float, n_games: int,
+    ) -> None:
+        with self.get_conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO cross_team_correlations
+                   (matchup, player_a, player_b, market_a, market_b,
+                    correlation, n_games, computed_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, date('now'))""",
+                (matchup, player_a, player_b, market_a, market_b, correlation, n_games),
+            )
+
+    def get_cross_team_correlation(
+        self, matchup: str, player_a: str, player_b: str,
+        market_a: str, market_b: str,
+    ) -> Optional[float]:
+        """Return cached cross-team correlation if stored within the last 7 days."""
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """SELECT correlation FROM cross_team_correlations
+                   WHERE matchup = ? AND player_a = ? AND player_b = ?
+                   AND market_a = ? AND market_b = ?
+                   AND computed_date >= date('now', '-7 days')""",
+                (matchup, player_a, player_b, market_a, market_b),
             ).fetchone()
         return float(row['correlation']) if row else None
 

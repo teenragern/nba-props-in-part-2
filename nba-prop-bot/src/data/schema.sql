@@ -236,6 +236,21 @@ CREATE TABLE IF NOT EXISTS steam_alerts (
     timestamp           DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Opposing-player finite-resource correlations (cross-team SGP adjustment).
+-- Books assume independence across teams; negative rebounding / scoring
+-- correlations create structural pricing edges in OVER/UNDER pairs.
+CREATE TABLE IF NOT EXISTS cross_team_correlations (
+    matchup       TEXT NOT NULL,  -- "|"-joined sorted team names (canonical)
+    player_a      TEXT NOT NULL,
+    player_b      TEXT NOT NULL,
+    market_a      TEXT NOT NULL,
+    market_b      TEXT NOT NULL,
+    correlation   REAL NOT NULL,
+    n_games       INTEGER DEFAULT 0,
+    computed_date TEXT NOT NULL,
+    PRIMARY KEY (matchup, player_a, player_b, market_a, market_b)
+);
+
 -- Indexes to accelerate the steam detection query (scans last 120 min)
 CREATE INDEX IF NOT EXISTS idx_line_history_ts
     ON line_history(timestamp);

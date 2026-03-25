@@ -22,8 +22,8 @@ KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 # Scheduler credit-conservation settings
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "90"))
 QUOTA_FLOOR = int(os.getenv("QUOTA_FLOOR", "30"))
-NEWS_POLL_INTERVAL     = int(os.getenv("NEWS_POLL_INTERVAL",     "60"))   # seconds (legacy RSS, kept for reference)
-TWITTER_POLL_INTERVAL  = int(os.getenv("TWITTER_POLL_INTERVAL",  "15"))   # seconds between Nitter polls
+NEWS_POLL_INTERVAL     = int(os.getenv("NEWS_POLL_INTERVAL",     "60"))
+TWITTER_POLL_INTERVAL  = int(os.getenv("TWITTER_POLL_INTERVAL",  "15"))
 
 # Sharp-line devigging — top-down signal
 SHARP_BOOKS_RAW = os.getenv("SHARP_BOOKS", "pinnacle")
@@ -32,12 +32,21 @@ REC_BOOKS_RAW   = os.getenv("REC_BOOKS", "draftkings,fanduel")
 REC_BOOKS       = [b.strip() for b in REC_BOOKS_RAW.split(",") if b.strip()]
 SHARP_EDGE_MIN  = float(os.getenv("SHARP_EDGE_MIN", "0.03"))
 
-# Books used for synthetic consensus line — devigged independently then weighted
+# Consensus sharp books for synthetic true probability
 CONSENSUS_BOOKS_RAW = os.getenv("CONSENSUS_BOOKS", "pinnacle,circa,bookmaker")
 CONSENSUS_BOOKS     = [b.strip().lower() for b in CONSENSUS_BOOKS_RAW.split(",") if b.strip()]
-# Max theoretical hold before a sharp book is excluded from consensus.
-# A spike above their normal ~4% signals a defensive placeholder, not a real line.
-CONSENSUS_HOLD_MAX  = float(os.getenv("CONSENSUS_HOLD_MAX", "0.06"))  # 6%
+CONSENSUS_HOLD_MAX  = float(os.getenv("CONSENSUS_HOLD_MAX", "0.06"))
+
+# ── BallDontLie GOAT Tier ─────────────────────────────────────────────
+BDL_API_KEY = os.getenv("BDL_API_KEY", "")
+# Use BDL as primary data source for props, injuries, lineups
+# Falls back to Odds API + scraping when BDL_API_KEY is empty
+BDL_ENABLED = bool(BDL_API_KEY)
+# BDL vendors to pull prop lines from (rec books — sharp pricing still from Odds API)
+BDL_PROP_VENDORS_RAW = os.getenv("BDL_PROP_VENDORS", "draftkings,fanduel,caesars,betmgm")
+BDL_PROP_VENDORS = [v.strip() for v in BDL_PROP_VENDORS_RAW.split(",") if v.strip()]
+# When BDL is active, reduce Odds API scan frequency (only needed for Pinnacle)
+BDL_SHARP_SCAN_INTERVAL = int(os.getenv("BDL_SHARP_SCAN_INTERVAL", "30"))  # minutes
 
 PROP_MARKETS = [
     "player_points",

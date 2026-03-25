@@ -11,3 +11,4 @@ scikit-learn>=1.3.0
 joblib>=1.3.0
 python-dateutil>=2.8.2
 feedparser>=6.0.0
+balldontlie>=1.0.0

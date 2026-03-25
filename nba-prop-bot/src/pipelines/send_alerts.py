@@ -8,6 +8,17 @@ from src.config import BANKROLL, KELLY_FRACTION
 logger = get_logger(__name__)
 
 
+def _camouflage_stake(stake: float) -> float:
+    """Round to natural recreational-bettor increments to avoid sharp-profiling flags."""
+    if stake <= 0:
+        return 0.0
+    if stake < 50:
+        return max(5.0, round(stake / 5) * 5)
+    if stake < 200:
+        return round(stake / 25) * 25
+    return round(stake / 50) * 50
+
+
 def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, bot: TelegramBotClient):
     player    = edge_data.get('player_id', 'Unknown')
     market    = edge_data.get('market',    'Unknown')
@@ -29,10 +40,16 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, bot: Teleg
     away = edge_data.get('away_team', 'Away')
 
     # Fractional Kelly stake sizing
+    # Kelly formula: f* = (b*p - q) / b  =  ev / (odds - 1)
+    # where ev = model_prob*(odds-1) - (1-model_prob) = model_prob*odds - 1.
+    # Using raw `edge` (prob difference) in the numerator was wrong: it
+    # under-stakes high-odds bets and over-stakes low-odds bets.
+    ev    = edge_data.get('ev', 0.0)
     stake = 0.0
-    if odds > 1:
-        stake = BANKROLL * (edge / (odds - 1.0)) * KELLY_FRACTION
+    if odds > 1 and ev > 0:
+        stake = BANKROLL * (ev / (odds - 1.0)) * KELLY_FRACTION
         stake = min(stake, BANKROLL * 0.05)  # hard cap: 5% per bet
+    stake = _camouflage_stake(stake)
 
     MAX_DAILY_RISK = BANKROLL * 0.25
     MAX_PER_GAME   = BANKROLL * 0.10
@@ -94,8 +111,14 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, bot: Teleg
         f"Proj Minutes: {edge_data.get('projected_minutes',  0.0):.1f}\n"
         f"Injury:       {edge_data.get('injury_status', 'Healthy')}\n"
         f"Usage Boost:  {edge_data.get('usage_boost',    0.0):.1%}\n"
-        f"Book Bias:    {edge_data.get('feedback_factor_applied', 1.0):.2f}\n\n"
-        f"<b>Suggested Stake (Kelly):</b> ${stake:.2f}"
+        f"Book Bias:    {edge_data.get('feedback_factor_applied', 1.0):.2f}\n"
+        + (
+            f"⚡ Line Shift: {edge_data['line_shift_old_line']} → "
+            f"{edge_data['line_shift_new_line']} "
+            f"@ {edge_data['line_shift_sharp_book']}\n"
+            if edge_data.get('line_shift_flag') else ""
+        )
+        + f"\n<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
     )
 
     bot.send_message(msg)
@@ -167,13 +190,21 @@ def send_parlay_alert(
             f"{game} — {prob:.0%}"
         )
 
+    # Thresholds for comparing against the book's actual SGP price:
+    # BET if book offers ≥ 85% of theoretical baseline (≤15% SGP penalty)
+    # SKIP if book offers < 60% of theoretical baseline (>40% SGP penalty)
+    bet_threshold  = _parlay_american(combined_decimal * 0.85)
+    skip_threshold = _parlay_american(combined_decimal * 0.60)
+
     lines.append(
-        f"\nCombined Odds:  {_parlay_american(combined_decimal)}\n"
+        f"\nTheoretical Baseline: {_parlay_american(combined_decimal)}\n"
+        f"⚠️ Books apply hidden SGP penalties — verify the book's actual SGP price.\n"
+        f"✅ BET if book offers ≥ {bet_threshold} | ❌ SKIP if book offers < {skip_threshold}\n"
         f"True Hit Prob:  {joint_true_prob:.2%}\n"
         f"Book Implied:   {joint_book_prob:.2%}\n"
         f"Edge:           +{edge:.2%}\n"
         f"EV:             {ev:+.2%}\n"
-        f"Max Stake:      ${max_parlay_stake:.2f} ({_PARLAY_MAX_PCT.get(n, 0.0025):.2%} bankroll cap)"
+        f"Max Stake:      ${_camouflage_stake(max_parlay_stake):.0f} ({_PARLAY_MAX_PCT.get(n, 0.0025):.2%} bankroll cap)"
     )
 
     bot.send_message("\n".join(lines))
