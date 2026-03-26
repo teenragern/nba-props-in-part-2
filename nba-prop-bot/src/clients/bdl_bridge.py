@@ -314,6 +314,94 @@ class BDLBridge:
 
         return result
 
+    # ── Comprehensive season profile (advanced V2 + playtype + general/advanced) ──
+
+    def get_player_season_profile(
+        self, bdl_player_id: int, season: int
+    ) -> Dict[str, float]:
+        """
+        Fetch the full season-level player profile used by XGBoost and the
+        fatigue model. Combines three BDL data layers:
+
+          1. V2 per-game advanced stats (last 10 games) → usage%, touches,
+             court distance, pct_pts_3pt.
+          2. Season averages general/advanced → ts_pct.
+          3. Season averages playtype/* → PnR ball-handler, isolation,
+             spot-up, and transition frequencies.
+
+        Returns a flat dict with keys:
+            avg_distance     — court miles/game (fatigue model)
+            real_usage_pct   — true usage % (replaces box-score proxy)
+            avg_touches      — per-game ball touches
+            pct_pts_3pt      — % of points from 3s (scoring profile)
+            ts_pct           — true shooting % (general/advanced)
+            pnr_bh_freq      — PnR ball-handler play frequency
+            iso_freq         — isolation play frequency
+            spotup_freq      — spot-up play frequency
+            transition_freq  — transition play frequency
+        """
+        defaults: Dict[str, float] = {
+            "avg_distance":    0.0,
+            "real_usage_pct":  0.0,
+            "avg_touches":     0.0,
+            "pct_pts_3pt":     0.0,
+            "ts_pct":          0.0,
+            "pnr_bh_freq":     0.0,
+            "iso_freq":        0.0,
+            "spotup_freq":     0.0,
+            "transition_freq": 0.0,
+        }
+        result = dict(defaults)
+
+        # ── Layer 1: V2 per-game advanced stats ──────────────────────────
+        adv = self.get_player_advanced_features(bdl_player_id, season, n_games=10)
+        result["avg_distance"]   = adv.get("avg_distance",   0.0)
+        result["real_usage_pct"] = adv.get("avg_usage_pct",  0.0)
+        result["avg_touches"]    = adv.get("avg_touches",     0.0)
+        result["pct_pts_3pt"]    = adv.get("avg_pct_pts_3pt", 0.0)
+
+        # ── Layer 2: Season averages general/advanced → ts_pct ───────────
+        try:
+            gen_adv = self.bdl.get_season_averages(
+                season=season,
+                player_ids=[bdl_player_id],
+                category="general",
+                stat_type="advanced",
+            )
+            if gen_adv:
+                result["ts_pct"] = float(gen_adv[0].get("ts_pct", 0.0) or 0.0)
+        except Exception as e:
+            logger.debug(f"BDL general/advanced failed for {bdl_player_id}: {e}")
+
+        # ── Layer 3: Playtype season averages ────────────────────────────
+        _playtype_targets = {
+            "prballhandler": "pnr_bh_freq",
+            "isolation":     "iso_freq",
+            "spotup":        "spotup_freq",
+            "transition":    "transition_freq",
+        }
+        for stat_type, feature_key in _playtype_targets.items():
+            try:
+                rows = self.bdl.get_season_averages(
+                    season=season,
+                    player_ids=[bdl_player_id],
+                    category="playtype",
+                    stat_type=stat_type,
+                )
+                if rows:
+                    freq = rows[0].get("percent_of_plays") or rows[0].get("frequency") or 0.0
+                    result[feature_key] = float(freq or 0.0)
+            except Exception as e:
+                logger.debug(f"BDL playtype/{stat_type} failed for {bdl_player_id}: {e}")
+
+        logger.debug(
+            f"BDL season profile for {bdl_player_id}: "
+            f"usage={result['real_usage_pct']:.1%} ts={result['ts_pct']:.3f} "
+            f"pnr={result['pnr_bh_freq']:.2f} iso={result['iso_freq']:.2f} "
+            f"spotup={result['spotup_freq']:.2f} trans={result['transition_freq']:.2f}"
+        )
+        return result
+
     # ── Advanced Stats for XGBoost features ──────────────────────────────
 
     def get_player_advanced_features(

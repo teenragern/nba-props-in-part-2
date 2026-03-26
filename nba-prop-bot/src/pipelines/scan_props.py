@@ -808,18 +808,18 @@ def scan_props():
 
             _position_group = NbaStatsClient.infer_position_group(logs)
 
-            # BDL advanced features: court-distance supplement to fatigue model.
-            # avg_distance > 3.0 miles/game signals high accumulated playing effort
-            # beyond what travel_fatigue captures (travel vs. on-court exertion).
+            # BDL season profile: usage%, touches, playtype frequencies, ts_pct.
+            # avg_distance > 3.0 mi/game signals on-court exertion beyond travel fatigue.
             _adj_fatigue_mult = _fatigue['fatigue_multiplier']
+            _bdl_profile: Dict[str, float] = {}
             if BDL_ENABLED_RUNTIME and player_name in bdl_player_map:
-                _adv_ck = f"bdl_adv_{bdl_player_map[player_name]}"
-                if _adv_ck not in _PROJECTIONS_CACHE:
-                    _PROJECTIONS_CACHE[_adv_ck] = _bdl_bridge.get_player_advanced_features(
+                _prof_ck = f"bdl_profile_{bdl_player_map[player_name]}"
+                if _prof_ck not in _PROJECTIONS_CACHE:
+                    _PROJECTIONS_CACHE[_prof_ck] = _bdl_bridge.get_player_season_profile(
                         bdl_player_map[player_name], season=_season_int
                     )
-                _bdl_adv = _PROJECTIONS_CACHE[_adv_ck]
-                if _bdl_adv.get("avg_distance", 0.0) > 3.0:
+                _bdl_profile = _PROJECTIONS_CACHE[_prof_ck]
+                if _bdl_profile.get("avg_distance", 0.0) > 3.0:
                     _adj_fatigue_mult *= 0.98
 
             for mkt in PROP_MARKETS:
@@ -882,6 +882,13 @@ def scan_props():
                         travel_miles=_fatigue['miles_traveled'],
                         tz_shift_hours=_fatigue['tz_shift_hours'],
                         altitude_flag=_fatigue['altitude_flag'],
+                        real_usage_pct=_bdl_profile.get('real_usage_pct', 0.0),
+                        avg_touches=_bdl_profile.get('avg_touches', 0.0),
+                        pnr_bh_freq=_bdl_profile.get('pnr_bh_freq', 0.0),
+                        iso_freq=_bdl_profile.get('iso_freq', 0.0),
+                        spotup_freq=_bdl_profile.get('spotup_freq', 0.0),
+                        transition_freq=_bdl_profile.get('transition_freq', 0.0),
+                        ts_pct=_bdl_profile.get('ts_pct', 0.0),
                     )
                     if ml_mean is not None and ml_mean > 0:
                         proj['mean'] = 0.5 * proj['mean'] + 0.5 * ml_mean

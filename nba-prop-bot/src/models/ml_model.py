@@ -5,7 +5,7 @@ Trains one XGBRegressor per market (points/rebounds/assists/threes) on
 historical player game logs. Predictions are blended 50/50 with the
 Bayesian model in scan_props.py.
 
-Feature vector per game prediction (21 features):
+Feature vector per game prediction (27 features):
   Base rates:
     rate_5g          per-minute rate over last 5 games
     rate_10g         per-minute rate over last 10 games
@@ -21,7 +21,9 @@ Feature vector per game prediction (21 features):
     games_played     total season games (proxy for small-sample risk)
     streak_factor    rate last 3 games / rate games 4-10 (hot/cold momentum, clamped 0.5–2.0)
     home_rate_delta  historical home per-min rate minus away per-min rate
-    usage_proxy_5g   (FGA + 0.44*FTA + TOV) / MIN over last 5 games (shot/possession volume)
+  Usage & efficiency (BDL real values at inference; box-score proxy at training):
+    real_usage_pct   BDL true usage % (replaces (FGA+0.44*FTA+TOV)/MIN proxy)
+    ts_pct_5g        true shooting % = PTS/(2*(FGA+0.44*FTA)); BDL general/advanced at inference
   Travel fatigue:
     travel_miles     straight-line miles traveled since last game
     tz_shift_hours   hours shifted east (+) or west (-) vs. last arena
@@ -32,6 +34,12 @@ Feature vector per game prediction (21 features):
     opp_pace         opponent team's raw pace normalized to league avg (1.0 = avg)
     opp_rebound_pct  opponent team's DREB_PCT normalized to league avg
     opp_pts_paint    opponent points allowed in paint per game, normalized
+  BDL season profile — tracking + playtype (real at inference; 0 during training):
+    avg_touches      per-game ball touches (BDL V2 advanced)
+    pnr_bh_freq      PnR ball-handler play frequency (BDL playtype/prballhandler)
+    iso_freq         isolation play frequency (BDL playtype/isolation)
+    spotup_freq      spot-up play frequency (BDL playtype/spotup)
+    transition_freq  transition play frequency (BDL playtype/transition)
 
 Target: per-minute rate for the specific stat.
 Final projection = predicted_rate * projected_minutes.
@@ -66,12 +74,16 @@ FEATURE_NAMES = [
     'avg_min_5g', 'std_min_5g',
     # Situational
     'home_flag', 'rest_days', 'b2b_flag', 'games_played',
-    'streak_factor', 'home_rate_delta', 'usage_proxy_5g',
+    'streak_factor', 'home_rate_delta',
+    # Usage & efficiency (BDL real at inference; proxy/computed at training)
+    'real_usage_pct', 'ts_pct_5g',
     # Travel fatigue
     'travel_miles', 'tz_shift_hours', 'altitude_flag',
     # Matchup context
     'opp_def_rating', 'pace_factor',
     'opp_pace', 'opp_rebound_pct', 'opp_pts_paint',
+    # BDL season profile: tracking + playtype (real at inference, 0.0 at training)
+    'avg_touches', 'pnr_bh_freq', 'iso_freq', 'spotup_freq', 'transition_freq',
 ]
 
 # Opponent stat column per market (mirrors nba_stats._MARKET_OPP_COL)
@@ -162,6 +174,17 @@ class PropMLModel:
         tov = recent.get('TOV', pd.Series([0] * len(recent))).sum()
         return float((fga + 0.44 * fta + tov) / total_min)
 
+    def _ts_pct(self, logs: pd.DataFrame, n: int = 5) -> float:
+        """True shooting % = PTS / (2 * (FGA + 0.44 * FTA)) over last n games."""
+        recent = logs.head(n)
+        if recent.empty:
+            return 0.0
+        pts = recent.get('PTS', pd.Series([0] * len(recent))).sum()
+        fga = recent.get('FGA', pd.Series([0] * len(recent))).sum()
+        fta = recent.get('FTA', pd.Series([0] * len(recent))).sum()
+        denom = 2.0 * (fga + 0.44 * fta)
+        return float(pts / denom) if denom > 0 else 0.0
+
     def _streak_factor(self, logs: pd.DataFrame) -> float:
         """Rate last 3 games / rate games 4-10. Captures hot/cold streaks. Clamped [0.5, 2.0]."""
         recent_3 = self._safe_rate(logs.head(3))
@@ -188,7 +211,15 @@ class PropMLModel:
                        opp_pts_paint: float = 1.0,
                        travel_miles: float = 0.0,
                        tz_shift_hours: int = 0,
-                       altitude_flag: bool = False) -> Optional[Dict]:
+                       altitude_flag: bool = False,
+                       # BDL season profile (real at inference; computed/0 at training)
+                       real_usage_pct: float = 0.0,
+                       avg_touches: float = 0.0,
+                       pnr_bh_freq: float = 0.0,
+                       iso_freq: float = 0.0,
+                       spotup_freq: float = 0.0,
+                       transition_freq: float = 0.0,
+                       ts_pct: float = 0.0) -> Optional[Dict]:
         """Build feature dict from game logs. Returns None if insufficient data."""
         if logs.empty or len(logs) < 3:
             return None
@@ -216,7 +247,9 @@ class PropMLModel:
             'games_played':     len(logs),
             'streak_factor':    self._streak_factor(logs),
             'home_rate_delta':  self._home_rate_delta(logs),
-            'usage_proxy_5g':   self._usage_proxy(logs, n=5),
+            # Usage & efficiency: real BDL value at inference; proxy at training
+            'real_usage_pct':   real_usage_pct if real_usage_pct > 0 else self._usage_proxy(logs, n=5),
+            'ts_pct_5g':        ts_pct if ts_pct > 0 else self._ts_pct(logs, n=5),
             # Travel fatigue
             'travel_miles':     float(travel_miles),
             'tz_shift_hours':   int(tz_shift_hours),
@@ -227,6 +260,12 @@ class PropMLModel:
             'opp_pace':         float(opp_pace),
             'opp_rebound_pct':  float(opp_rebound_pct),
             'opp_pts_paint':    float(opp_pts_paint),
+            # BDL season profile: 0.0 during training; real values at inference
+            'avg_touches':      float(avg_touches),
+            'pnr_bh_freq':      float(pnr_bh_freq),
+            'iso_freq':         float(iso_freq),
+            'spotup_freq':      float(spotup_freq),
+            'transition_freq':  float(transition_freq),
         }
 
     def build_training_data(self, logs: pd.DataFrame,
@@ -382,42 +421,59 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
                       opp_pts_paint: float = 1.0,
                       travel_miles: float = 0.0,
                       tz_shift_hours: int = 0,
-                      altitude_flag: bool = False) -> Optional[float]:
+                      altitude_flag: bool = False,
+                      # BDL season profile features
+                      real_usage_pct: float = 0.0,
+                      avg_touches: float = 0.0,
+                      pnr_bh_freq: float = 0.0,
+                      iso_freq: float = 0.0,
+                      spotup_freq: float = 0.0,
+                      transition_freq: float = 0.0,
+                      ts_pct: float = 0.0) -> Optional[float]:
     """
     Public API: return ML mean projection for a player/market.
     Returns None if model is untrained or data insufficient.
     Caller blends this 50/50 with the Bayesian projection.
 
-    Args:
-        opp_def_rating:   opponent defensive strength for this market (1.0 = league avg).
-        pace_factor:      (team_pace + opp_pace) / (2 * league_avg).
-        opp_pace:         opponent team pace normalized to league avg.
-        opp_rebound_pct:  opponent DREB_PCT normalized to league avg.
-        opp_pts_paint:    opponent points allowed in paint normalized to league avg.
+    BDL season profile args (all default 0.0 — computed from logs when absent):
+        real_usage_pct:   BDL true usage % (replaces box-score proxy).
+        avg_touches:      per-game ball touches from BDL V2 advanced.
+        pnr_bh_freq:      PnR ball-handler frequency from BDL playtype.
+        iso_freq:         isolation play frequency from BDL playtype.
+        spotup_freq:      spot-up play frequency from BDL playtype.
+        transition_freq:  transition play frequency from BDL playtype.
+        ts_pct:           true shooting % from BDL general/advanced.
     """
     if proj_minutes <= 0:
         return None
 
+    _bdl_kwargs = dict(
+        real_usage_pct=real_usage_pct, avg_touches=avg_touches,
+        pnr_bh_freq=pnr_bh_freq, iso_freq=iso_freq,
+        spotup_freq=spotup_freq, transition_freq=transition_freq,
+        ts_pct=ts_pct,
+    )
     _travel_kwargs = dict(travel_miles=travel_miles, tz_shift_hours=tz_shift_hours,
                           altitude_flag=altitude_flag)
 
     if market == 'player_points_rebounds_assists':
         pts = get_ml_projection('player_points',  logs, proj_minutes, home_flag, rest_days,
                                 opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
-                                **_travel_kwargs)
+                                **_travel_kwargs, **_bdl_kwargs)
         reb = get_ml_projection('player_rebounds', logs, proj_minutes, home_flag, rest_days,
                                 opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
-                                **_travel_kwargs)
+                                **_travel_kwargs, **_bdl_kwargs)
         ast = get_ml_projection('player_assists',  logs, proj_minutes, home_flag, rest_days,
                                 opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
-                                **_travel_kwargs)
+                                **_travel_kwargs, **_bdl_kwargs)
         if any(v is None for v in [pts, reb, ast]):
             return None
         return pts + reb + ast
 
     model = PropMLModel(market)
     feats = model.build_features(logs, home_flag, rest_days, opp_def_rating, pace_factor,
-                                 opp_pace, opp_rebound_pct, opp_pts_paint, **_travel_kwargs)
+                                 opp_pace, opp_rebound_pct, opp_pts_paint,
+                                 **_travel_kwargs, **_bdl_kwargs)
     if feats is None:
         return None
 
