@@ -20,7 +20,7 @@ def get_market_col(market: str) -> str:
 
 
 def get_bayesian_rate(sample_rate: float, prior_rate: float,
-                      n_games: int, prior_weight: float = 15.0) -> float:
+                      n_games: int, prior_weight: float = 8.0) -> float:
     return ((n_games * sample_rate) + (prior_weight * prior_rate)) / (n_games + prior_weight)
 
 
@@ -114,7 +114,7 @@ def build_player_projection(player_id: str, market: str, line: float,
                              starter_flag: bool = False,
                              b2b_flag: bool = False,
                              spread_magnitude: float = 0.0,
-                             prior_weight: float = 15.0,
+                             prior_weight: float = 8.0,
                              home_flag: bool = False,
                              rest_days: int = 2,
                              out_player_avg_mins: float = 0.0,

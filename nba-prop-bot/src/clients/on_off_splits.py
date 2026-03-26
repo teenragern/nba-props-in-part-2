@@ -25,7 +25,7 @@ logger = get_logger(__name__)
 
 GAMES_BACK  = 20     # look back this many shared games
 MIN_MINUTES = 10.0   # minimum "without" minutes for data to be trusted
-FALLBACK    = 1.15   # multiplier when data is sparse
+FALLBACK    = 1.05   # multiplier when data is sparse
 CACHE_TTL_H = 20     # hours before cached result is considered stale
 CLAMP_LO    = 0.70   # minimum plausible multiplier
 CLAMP_HI    = 2.00   # maximum plausible multiplier
@@ -88,7 +88,7 @@ class OnOffSplitsClient:
 
         Returns:
             Float multiplier clamped to [CLAMP_LO, CLAMP_HI].
-            Returns FALLBACK (1.15) if data is insufficient.
+            Returns FALLBACK (1.05) if data is insufficient.
         """
         season = _current_season()
 

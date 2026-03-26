@@ -12,12 +12,14 @@ Key changes from V1:
   • Heavier reality tax: 0.90 for 2-leg, 0.82 for 3-leg.
   • Slate-wide high-prob parlays (4-leg, 8-leg) removed entirely —
     they were the primary source of parlay losses.
-  • Diversification: max 1 parlay per game, legs must come from
-    different players AND different markets (no double-dipping on
-    correlated outcomes like PTS + PRA).
+  • Cross-game only: legs must come from different games (Rainbet does
+    not allow same-game stacking). One best parlay per scan.
+  • Legs must come from different players AND different markets
+    (no double-dipping on correlated outcomes like PTS + PRA).
 
 Rules:
-  • One parlay per game — the highest-edge combo.
+  • One best cross-game parlay per scan.
+  • All legs must be from different games (enforced by _compatible).
   • All legs must be from different players.
   • All legs must be from different market families (PTS and PRA conflict).
   • Same-team 2-leg pairs use cross-player historical correlation from DB.
@@ -39,11 +41,11 @@ logger = get_logger(__name__)
 
 MAX_LEGS        = 3      # hard cap: no 4+ leggers until calibration improves
 MAX_INPUT_EDGES = 12     # top-N edges per game considered as candidates
-COMBO_EDGE_MIN  = 0.04   # minimum joint edge to alert (was 0.02)
+COMBO_EDGE_MIN  = 0.08   # minimum joint edge to alert (was 0.04)
 
 # Per-leg quality gates — each leg must pass BOTH independently
 PER_LEG_EDGE_MIN    = 0.05   # each leg must show ≥5% edge after calibration
-PER_LEG_PROB_MIN    = 0.55   # each leg must have ≥55% calibrated hit probability
+PER_LEG_PROB_MIN    = 0.60   # each leg must have ≥60% calibrated hit probability (was 0.55)
 PER_LEG_IMPLIED_MAX = 0.55   # skip legs where book already prices >55% (no edge room)
 
 # Reality tax: accounts for correlated blowouts, last-minute news,
@@ -116,9 +118,11 @@ def _compatible(legs: List[Dict]) -> bool:
     Return True only when:
       1. All legs are from different players.
       2. All legs are from different market families (no PTS + PRA stacking).
+      3. All legs are from different games (Rainbet does not allow same-game stacking).
     """
     players = set()
     families: Set[str] = set()
+    events: Set[str] = set()
 
     for leg in legs:
         pid = leg['player_id']
@@ -130,6 +134,11 @@ def _compatible(legs: List[Dict]) -> bool:
         if family in families:
             return False
         families.add(family)
+
+        eid = leg.get('event_id', '')
+        if eid in events:
+            return False
+        events.add(eid)
 
     return True
 
@@ -239,66 +248,47 @@ def generate_and_alert_combos(
         f"pass per-leg quality gates."
     )
 
-    # ── Step 2: Group by game ─────────────────────────────────────────────
-    games: Dict[str, List[Dict]] = {}
-    for edge in parlay_eligible:
-        eid = edge.get('event_id', 'unknown')
-        games.setdefault(eid, []).append(edge)
+    # ── Step 2: Build cross-game combos from the full pool ───────────────
+    # Legs from the same game are blocked by _compatible (Rainbet restriction).
+    pool = sorted(
+        parlay_eligible,
+        key=lambda e: e.get('risk_adjusted_ev', 0),
+        reverse=True,
+    )[:MAX_INPUT_EDGES]
 
-    sent = 0
-    for event_id, edges in games.items():
-        if len(edges) < 2:
-            continue
+    best: Dict = {}
 
-        # Take top edges by risk_adjusted_ev, balanced between overs and unders
-        _overs  = [e for e in edges if e.get('side', '').upper() == 'OVER'][:6]
-        _unders = [e for e in edges if e.get('side', '').upper() == 'UNDER'][:6]
-        pool = sorted(
-            _overs + _unders,
-            key=lambda e: e.get('risk_adjusted_ev', 0),
-            reverse=True,
-        )[:MAX_INPUT_EDGES]
+    for size in range(2, MAX_LEGS + 1):
+        for combo in combinations(pool, size):
+            legs = list(combo)
+            if not _compatible(legs):
+                continue
 
-        best: Dict = {}
+            result = _combo_edge(legs, db=db)
+            raw_joint = result.get('joint_true_prob', 0)
 
-        for size in range(2, MAX_LEGS + 1):
-            for combo in combinations(pool, size):
-                legs = list(combo)
-                if not _compatible(legs):
-                    continue
+            dampening = _REALITY_TAX.get(size, 0.80)
+            taxed_joint = raw_joint * dampening
 
-                result = _combo_edge(legs, db=db)
-                raw_joint = result.get('joint_true_prob', 0)
+            combo_edge = taxed_joint - result.get('joint_book_prob', 0)
+            if combo_edge < COMBO_EDGE_MIN:
+                continue
 
-                # Apply reality tax
-                dampening = _REALITY_TAX.get(size, 0.80)
-                taxed_joint = raw_joint * dampening
+            if not best or combo_edge > best['edge']:
+                best = {
+                    'legs':       legs,
+                    'edge':       combo_edge,
+                    'joint_prob': taxed_joint,
+                }
 
-                combo_edge = taxed_joint - result.get('joint_book_prob', 0)
-                if combo_edge < COMBO_EDGE_MIN:
-                    continue
-
-                if not best or combo_edge > best['edge']:
-                    best = {
-                        'legs':       legs,
-                        'edge':       combo_edge,
-                        'joint_prob': taxed_joint,
-                    }
-
-        if not best:
-            continue
-
+    if best:
         away = best['legs'][0].get('away_team', '')
         home = best['legs'][0].get('home_team', '')
         msg = _format_combo(best['legs'], best['edge'], best['joint_prob'], away, home)
         bot.send_message(msg)
         logger.info(
-            f"Game parlay sent: {away} @ {home} | "
-            f"{len(best['legs'])}-leg | edge={best['edge']:.2%} | "
-            f"joint_prob={best['joint_prob']:.2%}"
+            f"Cross-game parlay sent: {len(best['legs'])}-leg | "
+            f"edge={best['edge']:.2%} | joint_prob={best['joint_prob']:.2%}"
         )
-        sent += 1
-
-    logger.info(f"Game parlays sent: {sent}/{len(games)} games on slate.")
-    # NOTE: Slate-wide 4-leg and 8-leg high-prob parlays have been removed.
-    # At current calibration levels, they are mathematically -EV.
+    else:
+        logger.info("No cross-game parlay met the edge threshold today.")

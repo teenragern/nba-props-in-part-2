@@ -40,7 +40,7 @@ def flush_pending_alerts(db: DatabaseClient, bot: TelegramBotClient) -> int:
     parlays   = [r for r in rows if r['alert_type'] == 'parlay']
 
     total = len(rows)
-    now   = datetime.now().strftime("%-I:%M %p")   # e.g. "3:00 PM"
+    now   = datetime.now().strftime("%I:%M %p").lstrip("0")   # e.g. "3:00 PM"
 
     lines: List[str] = [
         f"🏀 <b>NBA Prop Slate — {now} Update</b>",
