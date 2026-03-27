@@ -63,6 +63,10 @@ from src.clients.travel_fatigue import (
 )
 from src.clients.referee_client import fetch_today_assignments, match_event_refs
 from src.models.referee_stats import get_crew_foul_factor
+from src.clients.bdl_scan_integration import init_bdl_boost, get_bdl_boost
+from src.clients.bdl_game_logs import BDLGameLogs
+from src.clients.bdl_pbp_adapter import BDLPbpAdapter
+from src.clients.bdl_standings_context import BDLStandingsContext
 
 logger = get_logger(__name__)
 _PROJECTIONS_CACHE: Dict[str, Any] = {}
@@ -155,6 +159,17 @@ else:
     BDL_ENABLED_RUNTIME = False
 
 BDL_ENABLED_RUNTIME = BDL_ENABLED and _bdl_bridge is not None
+
+# BDL full potential modules
+_bdl_booster = init_bdl_boost() if BDL_ENABLED else None
+_bdl_game_logs = None
+_bdl_pbp = None
+_bdl_standings = None
+if BDL_ENABLED_RUNTIME:
+    _bdl_game_logs = BDLGameLogs(_bdl_bridge.bdl)
+    _bdl_pbp = BDLPbpAdapter(_bdl_bridge.bdl)
+    _bdl_standings = BDLStandingsContext(_bdl_bridge.bdl)
+    logger.info("BDL full potential: game logs, PBP, standings, booster initialized")
 
 
 # ─── Helper functions (unchanged from V1) ─────────────────────────────
@@ -594,6 +609,13 @@ def scan_props():
         # ── Pace data ─────────────────────────────────────────────────
         pace_info = stats_client.get_team_pace(home_team, away_team)
 
+        # BDL standings context (rest risk + blowout risk)
+        _standings_ctx = {}
+        if _bdl_standings:
+            _standings_ctx = _bdl_standings.get_game_context(
+                home_team, away_team, season=_season_int
+            )
+
         sharp_alerted: set = set()
 
         # ── Game Markets Scan ─────────────────────────────────────────
@@ -752,20 +774,37 @@ def scan_props():
             if "out" in (injury_status or 'healthy').lower():
                 continue
 
-            # Fetch game logs (nba_api — still needed for projection model)
+            # Fetch game logs (BDL primary → nba_api fallback)
             cache_key = f"{player_name}_{today}"
             if cache_key not in _PROJECTIONS_CACHE:
-                try:
-                    from nba_api.stats.static import players as nba_players
-                    found = nba_players.find_players_by_full_name(player_name)
-                    if not found:
+                _bdl_pid = bdl_player_map.get(player_name) if BDL_ENABLED_RUNTIME else None
+
+                # Try BDL first (no sleep needed, 600 req/min)
+                if _bdl_game_logs and _bdl_pid:
+                    try:
+                        logs = _bdl_game_logs.get_player_game_logs(
+                            bdl_player_id=_bdl_pid, season=_season_int
+                        )
+                        if not logs.empty and len(logs) >= 5:
+                            _PROJECTIONS_CACHE[cache_key] = {"logs": logs, "pid": _bdl_pid}
+                        else:
+                            _bdl_pid = None  # Fall through to nba_api
+                    except Exception:
+                        _bdl_pid = None
+
+                # Fallback to nba_api
+                if cache_key not in _PROJECTIONS_CACHE:
+                    try:
+                        from nba_api.stats.static import players as nba_players
+                        found = nba_players.find_players_by_full_name(player_name)
+                        if not found:
+                            continue
+                        player_id = found[0]['id']
+                        logs = stats_client.get_player_game_logs(player_id)
+                        time.sleep(0.6)
+                        _PROJECTIONS_CACHE[cache_key] = {"logs": logs, "pid": player_id}
+                    except Exception:
                         continue
-                    player_id = found[0]['id']
-                    logs = stats_client.get_player_game_logs(player_id)
-                    time.sleep(0.6)
-                    _PROJECTIONS_CACHE[cache_key] = {"logs": logs, "pid": player_id}
-                except Exception:
-                    continue
 
             p_data        = _PROJECTIONS_CACHE[cache_key]
             logs          = p_data["logs"]
@@ -776,6 +815,14 @@ def scan_props():
             home_flag  = stats_client.is_home_team(player_team_abbr or '', home_team)
             rest_days  = NbaStatsClient.calculate_rest_days(logs)
             b2b_flag   = rest_days == 0
+
+            # Standings-based minutes adjustment
+            _standings_min_adj = 1.0
+            if _standings_ctx:
+                _standings_min_adj = (
+                    _standings_ctx.get('minutes_adj_home', 1.0) if home_flag
+                    else _standings_ctx.get('minutes_adj_away', 1.0)
+                )
 
             # Travel fatigue
             _home_abbr = TEAM_NAME_TO_ABBR.get(home_team, '')
@@ -893,6 +940,27 @@ def scan_props():
                     if ml_mean is not None and ml_mean > 0:
                         proj['mean'] = 0.5 * proj['mean'] + 0.5 * ml_mean
                         proj['ml_blend'] = True
+
+                    # BDL playtype × opponent boost
+                    if _bdl_booster and player_name in bdl_player_map:
+                        _bdl_mult = get_bdl_boost(
+                            _bdl_booster,
+                            bdl_player_id=bdl_player_map[player_name],
+                            opponent_team=opp_team,
+                            market=mkt,
+                            season=_season_int,
+                        )
+                        if _bdl_mult != 1.0:
+                            proj['mean'] *= _bdl_mult
+                            proj['bdl_boost'] = _bdl_mult
+                            logger.debug(
+                                f"BDL boost: {player_name} {mkt} × {_bdl_mult:.3f} "
+                                f"vs {opp_team}"
+                            )
+
+                    # Standings minutes adjustment
+                    if _standings_min_adj != 1.0:
+                        proj['projected_minutes'] *= _standings_min_adj
 
                     # Tight whistle
                     if _crew_factor["tight_whistle"] and mkt in {
