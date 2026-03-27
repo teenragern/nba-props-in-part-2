@@ -29,6 +29,7 @@ def main():
     # Phase 4 Commands
     cal_parser = subparsers.add_parser("calibration", help="Check probability calibration and Brier score")
     tune_parser = subparsers.add_parser("tune", help="Run hyperparameter tuning grid search")
+    train_parser = subparsers.add_parser("train", help="Train multi-season ML models")
     
     # Phase 5 Commands
     market_stats_parser = subparsers.add_parser("market_stats", help="Show market micro-structure analytics and biases")
@@ -64,6 +65,9 @@ def main():
         from src.pipelines.tune import run_tuning
         from src.data.db import DatabaseClient
         run_tuning(DatabaseClient())
+    elif args.command == "train":
+        from src.pipelines.train_ml import train_ml_models
+        train_ml_models()
     elif args.command == "market_stats":
         from src.pipelines.market_stats import analyze_market_stats
         analyze_market_stats()
