@@ -330,35 +330,50 @@ class BDLBridge:
              spot-up, and transition frequencies.
 
         Returns a flat dict with keys:
-            avg_distance     — court miles/game (fatigue model)
-            real_usage_pct   — true usage % (replaces box-score proxy)
-            avg_touches      — per-game ball touches
-            pct_pts_3pt      — % of points from 3s (scoring profile)
-            ts_pct           — true shooting % (general/advanced)
-            pnr_bh_freq      — PnR ball-handler play frequency
-            iso_freq         — isolation play frequency
-            spotup_freq      — spot-up play frequency
-            transition_freq  — transition play frequency
+            avg_distance          — court miles/game (fatigue model)
+            real_usage_pct        — true usage % (replaces box-score proxy)
+            avg_touches           — per-game ball touches
+            pct_pts_3pt           — % of points from 3s (scoring profile)
+            ts_pct                — true shooting % (general/advanced)
+            pnr_bh_freq           — PnR ball-handler play frequency
+            iso_freq              — isolation play frequency
+            spotup_freq           — spot-up play frequency
+            transition_freq       — transition play frequency
+            avg_speed             — avg court speed (mph) from tracking
+            avg_contested_fg_pct  — contested FG% (shot difficulty proxy)
+            avg_deflections       — deflections per game (defensive activity)
+            avg_points_paint      — points in the paint per game
+            avg_pct_pts_paint     — % of points scored from the paint
         """
         defaults: Dict[str, float] = {
-            "avg_distance":    0.0,
-            "real_usage_pct":  0.0,
-            "avg_touches":     0.0,
-            "pct_pts_3pt":     0.0,
-            "ts_pct":          0.0,
-            "pnr_bh_freq":     0.0,
-            "iso_freq":        0.0,
-            "spotup_freq":     0.0,
-            "transition_freq": 0.0,
+            "avg_distance":         0.0,
+            "real_usage_pct":       0.0,
+            "avg_touches":          0.0,
+            "pct_pts_3pt":          0.0,
+            "ts_pct":               0.0,
+            "pnr_bh_freq":          0.0,
+            "iso_freq":             0.0,
+            "spotup_freq":          0.0,
+            "transition_freq":      0.0,
+            "avg_speed":            0.0,
+            "avg_contested_fg_pct": 0.0,
+            "avg_deflections":      0.0,
+            "avg_points_paint":     0.0,
+            "avg_pct_pts_paint":    0.0,
         }
         result = dict(defaults)
 
         # ── Layer 1: V2 per-game advanced stats ──────────────────────────
         adv = self.get_player_advanced_features(bdl_player_id, season, n_games=10)
-        result["avg_distance"]   = adv.get("avg_distance",   0.0)
-        result["real_usage_pct"] = adv.get("avg_usage_pct",  0.0)
-        result["avg_touches"]    = adv.get("avg_touches",     0.0)
-        result["pct_pts_3pt"]    = adv.get("avg_pct_pts_3pt", 0.0)
+        result["avg_distance"]         = adv.get("avg_distance",        0.0)
+        result["real_usage_pct"]       = adv.get("avg_usage_pct",       0.0)
+        result["avg_touches"]          = adv.get("avg_touches",         0.0)
+        result["pct_pts_3pt"]          = adv.get("avg_pct_pts_3pt",     0.0)
+        result["avg_speed"]            = adv.get("avg_speed",           0.0)
+        result["avg_contested_fg_pct"] = adv.get("avg_contested_fg_pct", 0.0)
+        result["avg_deflections"]      = adv.get("avg_deflections",     0.0)
+        result["avg_points_paint"]     = adv.get("avg_points_paint",    0.0)
+        result["avg_pct_pts_paint"]    = adv.get("avg_pct_pts_paint",   0.0)
 
         # ── Layer 2: Season averages general/advanced → ts_pct ───────────
         try:
@@ -398,7 +413,9 @@ class BDLBridge:
             f"BDL season profile for {bdl_player_id}: "
             f"usage={result['real_usage_pct']:.1%} ts={result['ts_pct']:.3f} "
             f"pnr={result['pnr_bh_freq']:.2f} iso={result['iso_freq']:.2f} "
-            f"spotup={result['spotup_freq']:.2f} trans={result['transition_freq']:.2f}"
+            f"spotup={result['spotup_freq']:.2f} trans={result['transition_freq']:.2f} "
+            f"speed={result['avg_speed']:.2f} paint_pts={result['avg_points_paint']:.1f} "
+            f"deflections={result['avg_deflections']:.2f}"
         )
         return result
 

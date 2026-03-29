@@ -116,25 +116,29 @@ def update_clv_lines() -> None:
     for event_id, trackers in by_event.items():
         commence = commence_map.get(event_id)
 
-        if commence is not None:
-            age = now - commence  # positive = game started; negative = in future
+        if commence is None:
+            # Event not in upcoming list — game is likely already over.
+            logger.debug(f"CLV: event {event_id} not in upcoming events — skipping.")
+            continue
 
-            if age < -_WINDOW_FUTURE:
-                # Too far in future — market still moving; wait for closing line
-                logger.debug(
-                    f"CLV: event {event_id} tips in "
-                    f"{-age.total_seconds()/60:.0f}min — skipping."
-                )
-                continue
+        age = now - commence  # positive = game started; negative = in future
 
-            if age > _WINDOW_PAST:
-                # Game well underway or finished — sharp books have likely
-                # suspended props; odds are stale or unavailable.
-                logger.info(
-                    f"CLV: event {event_id} started "
-                    f"{age.total_seconds()/60:.0f}min ago — may be too late."
-                )
-                # Still attempt in case the API still has data.
+        if age < -_WINDOW_FUTURE:
+            # Too far in future — market still moving; wait for closing line
+            logger.debug(
+                f"CLV: event {event_id} tips in "
+                f"{-age.total_seconds()/60:.0f}min — skipping."
+            )
+            continue
+
+        if age > _WINDOW_PAST:
+            # Game well underway or finished — sharp books have likely
+            # suspended props; odds are stale or unavailable.
+            logger.info(
+                f"CLV: event {event_id} started "
+                f"{age.total_seconds()/60:.0f}min ago — may be too late."
+            )
+            # Still attempt in case the API still has data.
 
         # One API call per event (not per player)
         markets_needed = list({t['market'] for t in trackers})

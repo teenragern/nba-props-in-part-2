@@ -414,6 +414,23 @@ def scan_props():
         _sync_injuries_legacy(db, injury_client, today)
 
     # ── 2. Get today's games ─────────────────────────────────────────
+    odds_events = []
+    odds_map = {}
+    try:
+        events = odds_client.get_events()
+        odds_events = [
+            e for e in events
+            if dateutil.parser.isoparse(e['commence_time'])
+               .astimezone(local_zone).strftime('%Y-%m-%d') == today
+        ]
+        for e in events:
+            odds_map[e['home_team'].lower()] = e['id']
+            odds_map[e['away_team'].lower()] = e['id']
+    except Exception as e:
+        logger.error(f"Failed to fetch Odds API events: {e}")
+        if not BDL_ENABLED_RUNTIME:
+            return
+
     if BDL_ENABLED_RUNTIME:
         bdl_games = _bdl_bridge.get_today_games(today)
         today_events = []
@@ -428,16 +445,7 @@ def scan_props():
     else:
         bdl_games = []
         bdl_odds_ctx = {}
-        try:
-            events = odds_client.get_events()
-            today_events = [
-                e for e in events
-                if dateutil.parser.isoparse(e['commence_time'])
-                   .astimezone(local_zone).strftime('%Y-%m-%d') == today
-            ]
-        except Exception as e:
-            logger.error(f"Failed to fetch events: {e}")
-            return
+        today_events = odds_events
 
     # BDL season year (used for advanced-stats lookups)
     _season_int = int(stats_client.season.split('-')[0]) if BDL_ENABLED_RUNTIME else 0
@@ -453,7 +461,8 @@ def scan_props():
             bdl_game_id = event.get("bdl_game_id")
             home_team   = event.get("home_team", "")
             away_team   = event.get("away_team", "")
-            event_id    = str(bdl_game_id)
+            odds_eid    = odds_map.get(home_team.lower()) or odds_map.get(away_team.lower())
+            event_id    = str(odds_eid) if odds_eid else str(bdl_game_id)
             commence_str = event.get("commence_time", "")
         else:
             bdl_game_id = None
@@ -776,8 +785,8 @@ def scan_props():
 
             # Fetch game logs (BDL primary → nba_api fallback)
             cache_key = f"{player_name}_{today}"
+            _bdl_pid = bdl_player_map.get(player_name) if BDL_ENABLED_RUNTIME else None
             if cache_key not in _PROJECTIONS_CACHE:
-                _bdl_pid = bdl_player_map.get(player_name) if BDL_ENABLED_RUNTIME else None
 
                 # Try BDL first (no sleep needed, 600 req/min)
                 if _bdl_game_logs and _bdl_pid:
@@ -869,6 +878,20 @@ def scan_props():
                 if _bdl_profile.get("avg_distance", 0.0) > 3.0:
                     _adj_fatigue_mult *= 0.98
 
+            # BDL PBP shot quality profile (foul-draw rate, paint shot %, assist rate)
+            _pbp_profile: Dict[str, float] = {}
+            if _bdl_pbp and _bdl_game_logs and _bdl_pid:
+                try:
+                    _recent_gids = _bdl_game_logs.get_recent_game_ids(
+                        _bdl_pid, season=_season_int, n=3
+                    )
+                    if _recent_gids:
+                        _pbp_profile = _bdl_pbp.get_player_shot_profile(
+                            _bdl_pid, _recent_gids
+                        )
+                except Exception:
+                    pass
+
             for mkt in PROP_MARKETS:
                 if player_name not in prices_by_market.get(mkt, {}):
                     continue
@@ -936,6 +959,11 @@ def scan_props():
                         spotup_freq=_bdl_profile.get('spotup_freq', 0.0),
                         transition_freq=_bdl_profile.get('transition_freq', 0.0),
                         ts_pct=_bdl_profile.get('ts_pct', 0.0),
+                        avg_speed=_bdl_profile.get('avg_speed', 0.0),
+                        avg_contested_fg_pct=_bdl_profile.get('avg_contested_fg_pct', 0.0),
+                        avg_deflections=_bdl_profile.get('avg_deflections', 0.0),
+                        avg_points_paint=_bdl_profile.get('avg_points_paint', 0.0),
+                        avg_pct_pts_paint=_bdl_profile.get('avg_pct_pts_paint', 0.0),
                     )
                     if ml_mean is not None and ml_mean > 0:
                         proj['mean'] = 0.5 * proj['mean'] + 0.5 * ml_mean
@@ -949,6 +977,7 @@ def scan_props():
                             opponent_team=opp_team,
                             market=mkt,
                             season=_season_int,
+                            player_profile=_bdl_profile,
                         )
                         if _bdl_mult != 1.0:
                             proj['mean'] *= _bdl_mult
@@ -957,6 +986,17 @@ def scan_props():
                                 f"BDL boost: {player_name} {mkt} × {_bdl_mult:.3f} "
                                 f"vs {opp_team}"
                             )
+
+                    # BDL PBP foul-draw boost: high foul-draw rate → more FTAs → more pts
+                    if _pbp_profile and mkt in {
+                        'player_points', 'player_points_rebounds_assists'
+                    }:
+                        _fdr = _pbp_profile.get('foul_draw_rate', 0.0)
+                        if _fdr >= 0.30:
+                            # Every 0.10 above 0.30 threshold → ~1% points boost (capped at 4%)
+                            _pbp_mult = 1.0 + min((_fdr - 0.30) / 0.10 * 0.01, 0.04)
+                            proj['mean'] *= _pbp_mult
+                            proj['pbp_fdr_boost'] = round(_pbp_mult, 4)
 
                     # Standings minutes adjustment
                     if _standings_min_adj != 1.0:
