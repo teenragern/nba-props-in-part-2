@@ -73,6 +73,45 @@ class DatabaseClient:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 sent_at    DATETIME
             )""",
+            # BDL defense profiles cache
+            """CREATE TABLE IF NOT EXISTS bdl_defense_profiles (
+                team_key    TEXT    NOT NULL,
+                season      INTEGER NOT NULL,
+                opp_pts     REAL NOT NULL DEFAULT 1.0,
+                opp_reb     REAL NOT NULL DEFAULT 1.0,
+                opp_ast     REAL NOT NULL DEFAULT 1.0,
+                opp_fg3m    REAL NOT NULL DEFAULT 1.0,
+                opp_fta     REAL NOT NULL DEFAULT 1.0,
+                opp_pts_paint REAL NOT NULL DEFAULT 1.0,
+                def_rating  REAL NOT NULL DEFAULT 1.0,
+                pace        REAL NOT NULL DEFAULT 1.0,
+                blk         REAL NOT NULL DEFAULT 1.0,
+                stl         REAL NOT NULL DEFAULT 1.0,
+                fetched_at  TEXT NOT NULL,
+                PRIMARY KEY (team_key, season)
+            )""",
+            # BDL game log cache
+            """CREATE TABLE IF NOT EXISTS bdl_game_log_cache (
+                player_id   INTEGER NOT NULL,
+                season      INTEGER NOT NULL,
+                game_date   TEXT    NOT NULL,
+                game_id     INTEGER,
+                min         REAL NOT NULL DEFAULT 0.0,
+                pts         REAL NOT NULL DEFAULT 0.0,
+                reb         REAL NOT NULL DEFAULT 0.0,
+                ast         REAL NOT NULL DEFAULT 0.0,
+                fg3m        REAL NOT NULL DEFAULT 0.0,
+                blk         REAL NOT NULL DEFAULT 0.0,
+                stl         REAL NOT NULL DEFAULT 0.0,
+                fga         REAL NOT NULL DEFAULT 0.0,
+                fta         REAL NOT NULL DEFAULT 0.0,
+                tov         REAL NOT NULL DEFAULT 0.0,
+                team_abbr   TEXT,
+                matchup     TEXT,
+                wl          TEXT,
+                cached_at   TEXT NOT NULL,
+                PRIMARY KEY (player_id, season, game_date)
+            )""",
         ]
         for sql in migrations:
             try:
@@ -1013,3 +1052,99 @@ class DatabaseClient:
             'buckets':     [dict(r) for r in bucket_rows],
             'calibration': [dict(r) for r in cal_rows],
         }
+
+    # ── BDL defense profile cache ─────────────────────────────────────
+
+    def upsert_bdl_defense_profile(self, team_key: str, season: int,
+                                    profile: dict):
+        """Cache a normalised BDL defense profile for a team/season."""
+        with self.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO bdl_defense_profiles
+                    (team_key, season, opp_pts, opp_reb, opp_ast, opp_fg3m,
+                     opp_fta, opp_pts_paint, def_rating, pace, blk, stl,
+                     fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (team_key.lower(), season,
+                 profile.get('opp_pts', 1.0), profile.get('opp_reb', 1.0),
+                 profile.get('opp_ast', 1.0), profile.get('opp_fg3m', 1.0),
+                 profile.get('opp_fta', 1.0), profile.get('opp_pts_paint', 1.0),
+                 profile.get('def_rating', 1.0), profile.get('pace', 1.0),
+                 profile.get('blk', 1.0), profile.get('stl', 1.0),
+                 profile.get('fetched_at', ''))
+            )
+
+    def get_bdl_defense_profile(self, team_key: str, season: int) -> Optional[dict]:
+        """Retrieve a cached BDL defense profile, or None if not found."""
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM bdl_defense_profiles WHERE team_key = ? AND season = ?",
+                (team_key.lower(), season)
+            ).fetchone()
+            if not row:
+                # Partial match fallback
+                rows = conn.execute(
+                    "SELECT * FROM bdl_defense_profiles WHERE season = ?",
+                    (season,)
+                ).fetchall()
+                low = team_key.lower()
+                for r in rows:
+                    k = r['team_key']
+                    if k in low or low in k:
+                        row = r
+                        break
+            return dict(row) if row else None
+
+    # ── BDL game log cache ────────────────────────────────────────────
+
+    def cache_bdl_game_logs(self, player_id: int, season: int,
+                             logs: list):
+        """
+        Bulk-insert game log rows into bdl_game_log_cache.
+        Each item in logs is a dict with keys matching the table columns.
+        """
+        from datetime import datetime
+        now = datetime.utcnow().isoformat()
+        with self.get_conn() as conn:
+            for log in logs:
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO bdl_game_log_cache
+                            (player_id, season, game_date, game_id, min, pts, reb,
+                             ast, fg3m, blk, stl, fga, fta, tov,
+                             team_abbr, matchup, wl, cached_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (player_id, season, log.get('game_date', ''),
+                         log.get('game_id'), log.get('min', 0),
+                         log.get('pts', 0), log.get('reb', 0),
+                         log.get('ast', 0), log.get('fg3m', 0),
+                         log.get('blk', 0), log.get('stl', 0),
+                         log.get('fga', 0), log.get('fta', 0),
+                         log.get('tov', 0), log.get('team_abbr', ''),
+                         log.get('matchup', ''), log.get('wl', ''), now)
+                    )
+                except Exception:
+                    pass
+
+    def get_cached_bdl_game_logs(self, player_id: int, season: int) -> list:
+        """
+        Retrieve cached game logs for a player/season.
+        Returns list of dicts sorted newest-first, or [] if stale/missing.
+        Uses a 12-hour TTL.
+        """
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(hours=12)).isoformat()
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM bdl_game_log_cache
+                WHERE player_id = ? AND season = ? AND cached_at > ?
+                ORDER BY game_date DESC
+                """,
+                (player_id, season, cutoff)
+            ).fetchall()
+        return [dict(r) for r in rows] if rows else []

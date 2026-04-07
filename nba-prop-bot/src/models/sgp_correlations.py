@@ -458,6 +458,30 @@ def build_team_correlation_matrix(
             f"{m_a.split('_')[1]}/{m_b.split('_')[1]}={c:.3f}(n={n})"
             for (m_a, m_b), (c, n) in corr_pairs.items()
         )
+
+def build_full_team_correlation_matrix(
+    team_name: str,
+    player_logs_dict: Dict[str, pd.DataFrame],
+    db: Any,
+) -> None:
+    """
+    Compute and persist the full N x N cross-player correlation matrix
+    for all combinations of active players with game logs on a team.
+    """
+    players = list(player_logs_dict.keys())
+    for i in range(len(players)):
+        for j in range(i + 1, len(players)):
+            p_a, p_b = players[i], players[j]
+            logs_a, logs_b = player_logs_dict[p_a], player_logs_dict[p_b]
+            
+            corr_pairs = compute_cross_player_correlations(logs_a, logs_b)
+            for (mkt_a, mkt_b), (corr, n) in corr_pairs.items():
+                # Insert forward pair
+                db.upsert_cross_player_correlation(
+                    team_name, p_a, p_b, mkt_a, mkt_b, corr, n)
+                # Insert reverse pair
+                db.upsert_cross_player_correlation(
+                    team_name, p_b, p_a, mkt_b, mkt_a, corr, n)
     )
 
 

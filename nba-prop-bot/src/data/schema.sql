@@ -268,6 +268,49 @@ CREATE TABLE IF NOT EXISTS pending_alerts (
 CREATE INDEX IF NOT EXISTS idx_pending_alerts_unsent
     ON pending_alerts(sent_at, created_at);
 
+-- BDL defense profiles: full opponent defensive context from BDL team season averages.
+-- Cached with 12h TTL to avoid redundant API calls across scan cycles.
+CREATE TABLE IF NOT EXISTS bdl_defense_profiles (
+    team_key    TEXT    NOT NULL,   -- lowercase team abbr or full name
+    season      INTEGER NOT NULL,
+    opp_pts     REAL    NOT NULL DEFAULT 1.0,
+    opp_reb     REAL    NOT NULL DEFAULT 1.0,
+    opp_ast     REAL    NOT NULL DEFAULT 1.0,
+    opp_fg3m    REAL    NOT NULL DEFAULT 1.0,
+    opp_fta     REAL    NOT NULL DEFAULT 1.0,
+    opp_pts_paint REAL  NOT NULL DEFAULT 1.0,
+    def_rating  REAL    NOT NULL DEFAULT 1.0,
+    pace        REAL    NOT NULL DEFAULT 1.0,
+    blk         REAL    NOT NULL DEFAULT 1.0,
+    stl         REAL    NOT NULL DEFAULT 1.0,
+    fetched_at  TEXT    NOT NULL,
+    PRIMARY KEY (team_key, season)
+);
+
+-- BDL game log cache: per-player box scores cached in SQLite.
+-- Eliminates repeat BDL API calls for the same player/season within a day.
+CREATE TABLE IF NOT EXISTS bdl_game_log_cache (
+    player_id   INTEGER NOT NULL,
+    season      INTEGER NOT NULL,
+    game_date   TEXT    NOT NULL,
+    game_id     INTEGER,
+    min         REAL    NOT NULL DEFAULT 0.0,
+    pts         REAL    NOT NULL DEFAULT 0.0,
+    reb         REAL    NOT NULL DEFAULT 0.0,
+    ast         REAL    NOT NULL DEFAULT 0.0,
+    fg3m        REAL    NOT NULL DEFAULT 0.0,
+    blk         REAL    NOT NULL DEFAULT 0.0,
+    stl         REAL    NOT NULL DEFAULT 0.0,
+    fga         REAL    NOT NULL DEFAULT 0.0,
+    fta         REAL    NOT NULL DEFAULT 0.0,
+    tov         REAL    NOT NULL DEFAULT 0.0,
+    team_abbr   TEXT,
+    matchup     TEXT,
+    wl          TEXT,
+    cached_at   TEXT    NOT NULL,
+    PRIMARY KEY (player_id, season, game_date)
+);
+
 -- Indexes to accelerate the steam detection query (scans last 120 min)
 CREATE INDEX IF NOT EXISTS idx_line_history_ts
     ON line_history(timestamp);

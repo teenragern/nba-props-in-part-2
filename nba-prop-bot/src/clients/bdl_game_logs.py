@@ -39,23 +39,49 @@ class BDLGameLogs:
     Fetches per-game player box score stats from BDL and returns
     a DataFrame compatible with the nba_api game logs shape that
     scan_props.py and ml_model.py already expect.
+
+    Two-tier caching:
+      1. In-memory dict (instant, per-scan lifetime)
+      2. SQLite bdl_game_log_cache table (12h TTL, survives restarts)
     """
 
-    def __init__(self, bdl_client):
+    def __init__(self, bdl_client, db=None):
         self.bdl = bdl_client
+        self.db = db  # DatabaseClient for SQLite caching (optional)
         self._log_cache: Dict[tuple, pd.DataFrame] = {}
         self._game_id_cache: Dict[tuple, List[int]] = {}  # (pid, season) → BDL game IDs
 
     def get_player_game_logs(self, bdl_player_id: int, season: int) -> pd.DataFrame:
         """
         Return game logs for a player/season as a nba_api-compatible DataFrame.
-        Fetches from BDL (no sleep needed) and caches the result.
+
+        Lookup order:
+          1. In-memory cache (instant)
+          2. SQLite cache (12h TTL)
+          3. BDL API (no sleep needed)
         Returns empty DataFrame on failure or if player has no recorded stats.
         """
         cache_key = (bdl_player_id, season)
         if cache_key in self._log_cache:
             return self._log_cache[cache_key]
 
+        # Try SQLite cache
+        if self.db:
+            cached = self.db.get_cached_bdl_game_logs(bdl_player_id, season)
+            if cached:
+                df = self._sqlite_rows_to_df(cached)
+                if not df.empty:
+                    self._log_cache[cache_key] = df
+                    self._game_id_cache[cache_key] = [
+                        int(r['game_id']) for r in cached if r.get('game_id')
+                    ]
+                    logger.debug(
+                        f"BDL game logs (SQLite hit): {len(df)} games "
+                        f"for player {bdl_player_id} (season {season})"
+                    )
+                    return df
+
+        # Fetch from BDL API
         try:
             stats = self.bdl.get_game_stats(
                 player_ids=[bdl_player_id], seasons=[season]
@@ -73,6 +99,7 @@ class BDLGameLogs:
 
         rows: list = []
         game_ids: List[int] = []
+        db_rows: list = []  # for SQLite persistence
 
         for s in stats:
             minutes = _parse_minutes(s.get('min'))
@@ -108,26 +135,45 @@ class BDLGameLogs:
             raw_date = game.get('date') or game.get('datetime') or ''
             game_date = str(raw_date)[:10] if raw_date else ''
 
+            gid = game.get('id')
+            pts  = float(s.get('pts') or 0)
+            reb  = float(s.get('reb') or 0)
+            ast  = float(s.get('ast') or 0)
+            fg3m = float(s.get('fg3m') or 0)
+            blk  = float(s.get('blk') or 0)
+            stl  = float(s.get('stl') or 0)
+            fga  = float(s.get('fga') or 0)
+            fta  = float(s.get('fta') or 0)
+            tov  = float(s.get('turnover') or 0)
+
             rows.append({
                 'MIN':               minutes,
-                'PTS':               float(s.get('pts') or 0),
-                'REB':               float(s.get('reb') or 0),
-                'AST':               float(s.get('ast') or 0),
-                'FG3M':              float(s.get('fg3m') or 0),
-                'BLK':               float(s.get('blk') or 0),
-                'STL':               float(s.get('stl') or 0),
-                'FGA':               float(s.get('fga') or 0),
-                'FTA':               float(s.get('fta') or 0),
-                'TOV':               float(s.get('turnover') or 0),
+                'PTS':               pts,
+                'REB':               reb,
+                'AST':               ast,
+                'FG3M':              fg3m,
+                'BLK':               blk,
+                'STL':               stl,
+                'FGA':               fga,
+                'FTA':               fta,
+                'TOV':               tov,
                 'TEAM_ABBREVIATION': team_abbr,
                 'MATCHUP':           matchup,
                 'GAME_DATE':         game_date,
                 'WL':                wl,
             })
 
-            gid = game.get('id')
             if gid:
                 game_ids.append(int(gid))
+
+            # Prepare row for SQLite cache
+            db_rows.append({
+                'game_date': game_date, 'game_id': int(gid) if gid else None,
+                'min': minutes, 'pts': pts, 'reb': reb, 'ast': ast,
+                'fg3m': fg3m, 'blk': blk, 'stl': stl,
+                'fga': fga, 'fta': fta, 'tov': tov,
+                'team_abbr': team_abbr, 'matchup': matchup, 'wl': wl,
+            })
 
         if not rows:
             empty = pd.DataFrame()
@@ -140,9 +186,49 @@ class BDLGameLogs:
 
         self._log_cache[cache_key] = df
         self._game_id_cache[cache_key] = game_ids
+
+        # Persist to SQLite for next scan cycle
+        if self.db and db_rows:
+            try:
+                self.db.cache_bdl_game_logs(bdl_player_id, season, db_rows)
+            except Exception as e:
+                logger.debug(f"SQLite game log cache write failed: {e}")
+
         logger.debug(
             f"BDL game logs: {len(df)} games for player {bdl_player_id} (season {season})"
         )
+        return df
+
+    @staticmethod
+    def _sqlite_rows_to_df(cached_rows: list) -> pd.DataFrame:
+        """Convert SQLite cache rows to a nba_api-compatible DataFrame."""
+        if not cached_rows:
+            return pd.DataFrame()
+        rows = []
+        for r in cached_rows:
+            if float(r.get('min', 0)) <= 0:
+                continue
+            rows.append({
+                'MIN':               float(r['min']),
+                'PTS':               float(r['pts']),
+                'REB':               float(r['reb']),
+                'AST':               float(r['ast']),
+                'FG3M':              float(r['fg3m']),
+                'BLK':               float(r['blk']),
+                'STL':               float(r['stl']),
+                'FGA':               float(r['fga']),
+                'FTA':               float(r['fta']),
+                'TOV':               float(r['tov']),
+                'TEAM_ABBREVIATION': r.get('team_abbr', ''),
+                'MATCHUP':           r.get('matchup', ''),
+                'GAME_DATE':         r.get('game_date', ''),
+                'WL':                r.get('wl', ''),
+            })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'], errors='coerce')
+        df = df.sort_values('GAME_DATE', ascending=False).reset_index(drop=True)
         return df
 
     def get_recent_game_ids(

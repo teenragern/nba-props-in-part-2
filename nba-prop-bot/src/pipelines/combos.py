@@ -15,25 +15,27 @@ Key changes from V1:
   • SGPs allowed: same-game OVER/OVER and OVER/UNDER combos are valid.
     Rainbet only bans same-game double-unders (all legs UNDER same match).
   • Legs must come from different players AND different markets
-    (no double-dipping on correlated outcomes like PTS + PRA).
-  • Same-team 2-leg pairs use cross-player historical correlation from DB
-    via Gaussian Copula (adjust_joint_probability).
+    (no double-dipping on the same outcome like LeBron PTS + LeBron PRA).
+  • Same-Player, Same-Team, and Cross-Team combinations all dynamically
+    apply the Gaussian Copula correlation models.
 
 Rules:
   • One best parlay per scan (SGP or cross-game).
-  • All legs must be from different players.
-  • All legs must be from different market families (PTS and PRA conflict).
+  • Same-player legs must be from different market families.
   • Same-game double-unders blocked (Rainbet rule).
-  • Same-team 2-leg pairs use cross-player historical correlation from DB.
-  • Opposing-team / 3-player combos assume independence.
 """
 
+import dateutil.parser
 from itertools import combinations
 from math import prod
 from typing import List, Dict, Any, Set
 from datetime import datetime
 
-from src.models.sgp_correlations import adjust_joint_probability
+from src.models.sgp_correlations import (
+    adjust_joint_probability,
+    get_pairwise_correlation,
+    get_cross_team_default_corr
+)
 from src.models.calibration_model import calibrate_prob
 from src.clients.telegram_bot import TelegramBotClient
 from src.pipelines.send_alerts import _parlay_kelly_stake
@@ -146,27 +148,25 @@ _TIP_OFF_WINDOW_SECS = 5400  # 90 minutes
 
 def _compatible(legs: List[Dict]) -> bool:
     """
-    Return True only when:
-      1. All legs are from different players.
-      2. All legs are from different market families (no PTS + PRA stacking).
+    Return True only when passing structural parlay tests:
+      1. Prevent double-dipping same-market families for the SAME player.
+      2. Allow same-player different-markets, or different-players same-markets.
       3. No same-game double-unders (Rainbet rule: all legs UNDER in same match
          is disallowed; OVER/OVER and OVER/UNDER SGPs are fine).
       4. Cross-game legs must tip off within 90 minutes of each other —
          prevents late-scratch risk on games that start hours apart.
     """
-    players = set()
-    families: Set[str] = set()
+    player_families: Set[Tuple[str, str]] = set()
 
     for leg in legs:
         pid = leg['player_id']
-        if pid in players:
-            return False
-        players.add(pid)
-
         family = _MARKET_FAMILY.get(leg.get('market', ''), leg.get('market', ''))
-        if family in families:
+        
+        # Disallow the same player stacking correlated markets (e.g. LeBron PTS and PRA)
+        key = (pid, family)
+        if key in player_families:
             return False
-        families.add(family)
+        player_families.add(key)
 
     # Group legs by event for the next two checks.
     event_legs: Dict[str, List] = {}
@@ -188,6 +188,11 @@ def _compatible(legs: List[Dict]) -> bool:
             ct = leg.get('commence_time')
             if isinstance(ct, datetime):
                 times.append(ct)
+            elif isinstance(ct, str) and ct:
+                try:
+                    times.append(dateutil.parser.isoparse(ct))
+                except Exception:
+                    pass
         if len(times) >= 2:
             spread = (max(times) - min(times)).total_seconds()
             if spread > _TIP_OFF_WINDOW_SECS:
@@ -200,61 +205,62 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
     """
     Compute joint edge for a combo using CALIBRATED probabilities.
 
-    Routing logic:
-      • Cross-game legs (different event_id): pure independence — no copula.
-        Their outcomes are statistically unrelated; applying any correlation
-        model would contaminate the joint probability.
-      • Same-game, same-team, 2-leg: Gaussian Copula via DB cross-player lookup.
-      • Everything else (3-leg, cross-team SGP): assume independence.
+    Dynamically applies Gaussian Copula adjustments for Same-Player, 
+    Same-Team, and Cross-Team SGP sequences. Assumes independence for 
+    cross-game links.
     """
-    # Calibrate each leg's probability before computing joint
     cal_probs = [calibrate_prob(leg.get('model_prob', 0.5)) for leg in legs]
     implied_probs = [leg['implied_prob'] for leg in legs]
 
-    player_ids = {leg['player_id'] for leg in legs}
+    joint_true = cal_probs[0]
+    corr_applied = 0.0
 
-    # Same-game, same-team, 2-leg SGP → Gaussian Copula cross-player lookup.
-    # event_id guard is the critical gate: cross-game pairs must never reach
-    # the copula regardless of team name formatting.
-    if (
-        db is not None
-        and len(legs) == 2
-        and len(player_ids) == 2
-        and legs[0].get('event_id') == legs[1].get('event_id')
-        and legs[0].get('event_id')  # both non-empty
-    ):
-        team_a = legs[0].get('team_name', '')
-        team_b = legs[1].get('team_name', '')
-        if team_a and team_a == team_b:
-            pa, pb = legs[0]['player_id'], legs[1]['player_id']
-            ma, mb = legs[0]['market'],    legs[1]['market']
-            corr = db.get_cross_player_correlation(team_a, pa, pb, ma, mb)
-            if corr is None:
-                corr = db.get_cross_player_correlation(team_a, pb, pa, mb, ma)
-            if corr is not None:
-                jt = adjust_joint_probability(
-                    cal_probs[0], cal_probs[1], corr,
-                    mean_a=legs[0].get('mean'), mean_b=legs[1].get('mean'),
-                    line_a=legs[0].get('line'), line_b=legs[1].get('line'),
-                    side_a=legs[0].get('side', 'OVER'),
-                    side_b=legs[1].get('side', 'OVER'),
-                )
-                jb = prod(implied_probs)
-                return {
-                    'joint_true_prob':     jt,
-                    'joint_book_prob':     jb,
-                    'sgp_edge':            jt - jb,
-                    'correlation_applied': corr,
-                }
+    for i in range(1, len(legs)):
+        leg_a, leg_b = legs[i - 1], legs[i]
+        corr = 0.0
 
-    # Default: assume independence with calibrated probs
-    jt = prod(cal_probs)
+        # Only inject Copula correlation modeling if both legs share a game context
+        if leg_a.get('event_id') and leg_a.get('event_id') == leg_b.get('event_id'):
+            pa, pb = leg_a['player_id'], leg_b['player_id']
+            ma, mb = leg_a['market'], leg_b['market']
+            team_a, team_b = leg_a.get('team_name', ''), leg_b.get('team_name', '')
+
+            if pa == pb:
+                # Same-player SGP (e.g. Points + Assists)
+                corr = get_pairwise_correlation(ma, mb)
+            elif team_a and team_a == team_b and db is not None:
+                # Same-team, cross-player SGP (e.g. Point Guard Assists + Center Points)
+                db_corr = db.get_cross_player_correlation(team_a, pa, pb, ma, mb)
+                if db_corr is None:
+                    db_corr = db.get_cross_player_correlation(team_a, pb, pa, mb, ma)
+                if db_corr is not None:
+                    corr = db_corr
+            elif team_a and team_b and team_a != team_b:
+                # Cross-team SGP (e.g. finite rebounding logic)
+                corr = get_cross_team_default_corr(ma, mb)
+
+        # Copula applied to first pair; subsequent legs sequence via Bivariate Normal
+        mean_a = leg_a.get('mean') if i == 1 else None
+        line_a = leg_a.get('line') if i == 1 else None
+
+        joint_true = adjust_joint_probability(
+            joint_true, cal_probs[i], corr,
+            mean_a=mean_a, mean_b=leg_b.get('mean'),
+            line_a=line_a, line_b=leg_b.get('line'),
+            side_a=leg_a.get('side', 'OVER'),
+            side_b=leg_b.get('side', 'OVER'),
+        )
+        corr_applied += corr
+
+    if len(legs) > 1:
+        corr_applied /= (len(legs) - 1)
+
     jb = prod(implied_probs)
     return {
-        'joint_true_prob':     jt,
+        'joint_true_prob':     joint_true,
         'joint_book_prob':     jb,
-        'sgp_edge':            jt - jb,
-        'correlation_applied': 0.0,
+        'sgp_edge':            joint_true - jb,
+        'correlation_applied': corr_applied,
     }
 
 

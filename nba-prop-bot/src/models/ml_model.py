@@ -1,16 +1,19 @@
 """
-Priority 6: XGBoost ensemble model for per-minute stat rate prediction.
+Priority 6: Ensemble model for per-minute stat rate prediction.
 
-Trains one XGBRegressor per market (points/rebounds/assists/threes) on
+Trains a stacking ensemble (XGBoost + RandomForest + Ridge) per market on
 historical player game logs. Predictions are blended 50/50 with the
-Bayesian model in scan_props.py.
+Bayesian Poisson/Normal model in scan_props.py.
 
-Feature vector per game prediction (35 features):
+Feature vector per game prediction (38 features):
   Base rates:
     rate_5g               per-minute rate over last 5 games
     rate_10g              per-minute rate over last 10 games
+    rate_20g              per-minute rate over last 20 games
     rate_season           season-long per-minute rate
     ewm_rate_5g           exponentially-weighted rate (alpha=0.3) over last 5 games
+    ewm_rate_10g          exponentially-weighted rate (alpha=0.25) over last 10 games
+    ewm_rate_20g          exponentially-weighted rate (alpha=0.15) over last 20 games
   Minutes:
     avg_min_5g            average minutes last 5 games
     std_min_5g            std-dev of minutes last 5 games (consistency)
@@ -19,7 +22,7 @@ Feature vector per game prediction (35 features):
     rest_days             days since last game (capped at 7)
     b2b_flag              1 = back-to-back
     games_played          total season games (proxy for small-sample risk)
-    streak_factor         rate last 3 games / rate games 4-10 (hot/cold momentum, clamped 0.5–2.0)
+    streak_factor         rate last 3 games / rate games 4-10 (hot/cold momentum, clamped 0.5-2.0)
     home_rate_delta       historical home per-min rate minus away per-min rate
   Usage & efficiency (BDL real values at inference; box-score proxy at training):
     real_usage_pct        BDL true usage % (replaces (FGA+0.44*FTA+TOV)/MIN proxy)
@@ -27,26 +30,26 @@ Feature vector per game prediction (35 features):
   Travel fatigue:
     travel_miles          straight-line miles traveled since last game
     tz_shift_hours        hours shifted east (+) or west (-) vs. last arena
-    altitude_flag         1 if tonight's venue ≥ 4 000 ft (Denver/Utah)
+    altitude_flag         1 if tonight's venue >= 4 000 ft (Denver/Utah)
   Matchup context:
     opp_def_rating        opponent defensive strength for this market (1.0 = league avg)
-    pace_factor           (team_pace + opp_pace) / (2 * league_avg) — game tempo
+    pace_factor           (team_pace + opp_pace) / (2 * league_avg) -- game tempo
     opp_pace              opponent team's raw pace normalized to league avg (1.0 = avg)
     opp_rebound_pct       opponent team's DREB_PCT normalized to league avg
     opp_pts_paint         opponent points allowed in paint per game, normalized
-  BDL season profile — tracking + playtype (real at inference; 0 during training):
+  BDL season profile -- tracking + playtype (real at inference; 0 during training):
     avg_touches           per-game ball touches (BDL V2 advanced)
     pnr_bh_freq           PnR ball-handler play frequency (BDL playtype/prballhandler)
-    pnr_roll_freq         PnR roll-man play frequency (BDL playtype/prrollman) — bigs near basket
+    pnr_roll_freq         PnR roll-man play frequency (BDL playtype/prrollman) -- bigs near basket
     iso_freq              isolation play frequency (BDL playtype/isolation)
     spotup_freq           spot-up play frequency (BDL playtype/spotup)
     transition_freq       transition play frequency (BDL playtype/transition)
-    postup_freq           post-up play frequency (BDL playtype/postup) — big men paint scoring
-    drives_per_game       drives per game (BDL tracking/drives) — penetration/FTA/AST proxy
+    postup_freq           post-up play frequency (BDL playtype/postup) -- big men paint scoring
+    drives_per_game       drives per game (BDL tracking/drives) -- penetration/FTA/AST proxy
   BDL V2 advanced tracking (real at inference; 0 during training):
     avg_speed             average court speed mph (BDL V2 advanced)
-    avg_contested_fg_pct  contested FG% — shot-difficulty proxy (BDL V2 advanced)
-    avg_deflections       deflections per game — defensive activity (BDL V2 advanced)
+    avg_contested_fg_pct  contested FG% -- shot-difficulty proxy (BDL V2 advanced)
+    avg_deflections       deflections per game -- defensive activity (BDL V2 advanced)
     avg_points_paint      points in the paint per game (BDL V2 advanced)
     avg_pct_pts_paint     % of points scored from the paint (BDL V2 advanced)
 
@@ -77,8 +80,9 @@ _MARKET_COL = {
 }
 
 FEATURE_NAMES = [
-    # Base rates
-    'rate_5g', 'rate_10g', 'rate_season', 'ewm_rate_5g',
+    # Base rates (expanded with 20-game windows)
+    'rate_5g', 'rate_10g', 'rate_20g', 'rate_season',
+    'ewm_rate_5g', 'ewm_rate_10g', 'ewm_rate_20g',
     # Minutes
     'avg_min_5g', 'std_min_5g',
     # Situational
@@ -126,7 +130,6 @@ def _compute_pace_factor(matchup: str, opp_abbr: str,
     """Compute (team_pace + opp_pace) / (2 * league_avg). Falls back to 1.0."""
     if not pace_lookup or league_avg_pace <= 0:
         return 1.0
-    # Own team abbreviation is the first token of MATCHUP
     own_abbr = matchup.split()[0].upper() if matchup else ''
     own_pace = pace_lookup.get(own_abbr, league_avg_pace)
     opp_pace = pace_lookup.get(opp_abbr, league_avg_pace)
@@ -134,7 +137,7 @@ def _compute_pace_factor(matchup: str, opp_abbr: str,
 
 
 class PropMLModel:
-    """XGBoost model for a single prop market."""
+    """XGBoost model for a single prop market (base learner in ensemble)."""
 
     def __init__(self, market: str):
         self.market = market
@@ -173,11 +176,10 @@ class PropMLModel:
                 rates.append(s / m)
         if not rates:
             return 0.0
-        # Newest first in logs → reverse to oldest-first for EWM then take last value
         return float(pd.Series(rates[::-1]).ewm(alpha=alpha, adjust=False).mean().iloc[-1])
 
     def _usage_proxy(self, logs: pd.DataFrame, n: int = 5) -> float:
-        """(FGA + 0.44·FTA + TOV) / MIN averaged over last n games — possession volume proxy."""
+        """(FGA + 0.44*FTA + TOV) / MIN averaged over last n games."""
         recent = logs.head(n)
         if recent.empty or 'MIN' not in recent.columns:
             return 0.0
@@ -201,7 +203,7 @@ class PropMLModel:
         return float(pts / denom) if denom > 0 else 0.0
 
     def _streak_factor(self, logs: pd.DataFrame) -> float:
-        """Rate last 3 games / rate games 4-10. Captures hot/cold streaks. Clamped [0.5, 2.0]."""
+        """Rate last 3 games / rate games 4-10. Clamped [0.5, 2.0]."""
         recent_3 = self._safe_rate(logs.head(3))
         prev_7   = self._safe_rate(logs.iloc[3:10])
         if prev_7 <= 0:
@@ -209,7 +211,7 @@ class PropMLModel:
         return float(max(0.5, min(2.0, recent_3 / prev_7)))
 
     def _home_rate_delta(self, logs: pd.DataFrame) -> float:
-        """Historical per-minute rate in home games minus away games (up to last 30 of each)."""
+        """Historical per-minute rate in home games minus away games."""
         if 'MATCHUP' not in logs.columns:
             return 0.0
         home_logs = logs[logs['MATCHUP'].str.contains('vs\\.', na=False)].head(30)
@@ -253,15 +255,19 @@ class PropMLModel:
 
         r5  = logs.head(5)
         r10 = logs.head(10)
+        r20 = logs.head(20)
         avg_min = r5['MIN'].mean()
         std_min = r5['MIN'].std() if len(r5) > 1 else 0.0
 
         return {
-            # Base rates
+            # Base rates (expanded)
             'rate_5g':          self._safe_rate(r5),
             'rate_10g':         self._safe_rate(r10),
+            'rate_20g':         self._safe_rate(r20),
             'rate_season':      self._safe_rate(logs),
-            'ewm_rate_5g':      self._ewm_rate(logs, n=5),
+            'ewm_rate_5g':      self._ewm_rate(logs, n=5, alpha=0.3),
+            'ewm_rate_10g':     self._ewm_rate(logs, n=10, alpha=0.25),
+            'ewm_rate_20g':     self._ewm_rate(logs, n=20, alpha=0.15),
             # Minutes
             'avg_min_5g':       float(avg_min) if not pd.isna(avg_min) else 0.0,
             'std_min_5g':       float(std_min) if not pd.isna(std_min) else 0.0,
@@ -272,7 +278,7 @@ class PropMLModel:
             'games_played':     len(logs),
             'streak_factor':    self._streak_factor(logs),
             'home_rate_delta':  self._home_rate_delta(logs),
-            # Usage & efficiency: real BDL value at inference; proxy at training
+            # Usage & efficiency
             'real_usage_pct':   real_usage_pct if real_usage_pct > 0 else self._usage_proxy(logs, n=5),
             'ts_pct_5g':        ts_pct if ts_pct > 0 else self._ts_pct(logs, n=5),
             # Travel fatigue
@@ -285,7 +291,7 @@ class PropMLModel:
             'opp_pace':         float(opp_pace),
             'opp_rebound_pct':  float(opp_rebound_pct),
             'opp_pts_paint':    float(opp_pts_paint),
-            # BDL season profile: 0.0 during training; real values at inference
+            # BDL season profile
             'avg_touches':           float(avg_touches),
             'pnr_bh_freq':           float(pnr_bh_freq),
             'pnr_roll_freq':         float(pnr_roll_freq),
@@ -294,13 +300,13 @@ class PropMLModel:
             'transition_freq':       float(transition_freq),
             'postup_freq':           float(postup_freq),
             'drives_per_game':       float(drives_per_game),
-            # BDL V2 advanced tracking: 0.0 during training; real values at inference
+            # BDL V2 advanced tracking
             'avg_speed':             float(avg_speed),
             'avg_contested_fg_pct':  float(avg_contested_fg_pct),
             'avg_deflections':       float(avg_deflections),
             'avg_points_paint':      float(avg_points_paint),
             'avg_pct_pts_paint':     float(avg_pct_pts_paint),
-            # Foul rate: higher → more minutes variance (foul trouble risk)
+            # Foul rate
             'player_foul_rate':      float(player_foul_rate),
         }
 
@@ -317,28 +323,13 @@ class PropMLModel:
         """
         Generate (X, y) training samples from a player's chronological game logs.
         Requires at least 15 games. Only uses past games as features (no lookahead).
-
-        Args:
-            opp_def_lookup:         {team_abbr_upper: def_rating} for this market
-                                    (normalized, 1.0 = league avg).
-            pace_lookup:            {team_abbr_upper: pace_float} (raw values).
-            opp_rebound_pct_lookup: {team_abbr_upper: dreb_pct_normalized}.
-                                    Build from team_stats_df['DREB_PCT'].
-            opp_pts_paint_lookup:   {team_abbr_upper: opp_pts_paint_normalized}.
-                                    Build from def_stats_df['OPP_PTS_PAINT'].
-            player_name:            Player's display name — used for CLV lookup.
-            clv_weight_lookup:      {(player_norm, market, date_str): weight} from
-                                    build_clv_weight_lookup().  When provided, each
-                                    training sample is weighted by past CLV outcome.
-            return_weights:         When True, returns (X, y, weights); when False
-                                    (default) returns (X, y) for backward compatibility.
         """
         if logs.empty or len(logs) < 15:
             return ([], [], []) if return_weights else ([], [])
         if self.col not in logs.columns or 'MIN' not in logs.columns:
             return ([], [], []) if return_weights else ([], [])
 
-        # nba_api returns newest-first → reverse for chronological order
+        # nba_api returns newest-first -> reverse for chronological order
         chron = logs[::-1].reset_index(drop=True)
         player_norm = _norm_player_name(player_name)
 
@@ -366,7 +357,6 @@ class PropMLModel:
             pace    = _compute_pace_factor(matchup, opp_abbr,
                                            pace_lookup, league_avg_pace)
 
-            # Opponent pace normalized to league average
             if pace_lookup and league_avg_pace > 0:
                 raw_opp_pace = pace_lookup.get(opp_abbr, league_avg_pace)
                 opp_pace_norm = raw_opp_pace / league_avg_pace
@@ -378,12 +368,10 @@ class PropMLModel:
             opp_paint   = (opp_pts_paint_lookup.get(opp_abbr, 1.0)
                            if opp_pts_paint_lookup else 1.0)
 
-            # Travel features: current game arena vs. previous game arena
             own_abbr = str(current.get('TEAM_ABBREVIATION', '')).upper()
             prev_matchup = str(chron.iloc[i - 1].get('MATCHUP', ''))
             t_miles, t_tz, t_alt = travel_features_for_game(matchup, prev_matchup, own_abbr)
 
-            # Compute player foul rate from history for training
             _hist_foul_rate = 0.0
             if 'PF' in history.columns and 'MIN' in history.columns:
                 _h5 = history.head(5)
@@ -401,8 +389,6 @@ class PropMLModel:
             if feats is None:
                 continue
 
-            # CLV-derived sample weight: past bets on this player/market/game
-            # that beat the closing line are upweighted; those that missed are down.
             sample_weight = 1.0
             if clv_weight_lookup is not None and player_norm:
                 try:
@@ -456,6 +442,138 @@ class PropMLModel:
             return None
 
 
+# =========================================================================
+# Ensemble model: XGBoost + RandomForest + Ridge stacking
+# =========================================================================
+
+class EnsembleModel:
+    """
+    Stacking ensemble for a single prop market.
+
+    Base learners:
+      1. XGBRegressor  (tree-based, handles interactions)
+      2. RandomForest   (tree-based, reduces XGB overfitting)
+      3. LinearRegression (linear, captures main effects XGB might overfit)
+
+    Meta-learner: Ridge regression on base learner OOF predictions.
+    """
+
+    def __init__(self, market: str):
+        self.market = market
+        self.col = _MARKET_COL.get(market, 'PTS')
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        self.ensemble_path = os.path.join(MODEL_DIR, f'{market}_ensemble.pkl')
+        self.ensemble = None
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.ensemble_path):
+            try:
+                import joblib
+                self.ensemble = joblib.load(self.ensemble_path)
+            except Exception:
+                self.ensemble = None
+
+    def train(self, X: List, y: List, sample_weight: Optional[List] = None) -> bool:
+        """Train 3 base learners + Ridge meta-learner via 3-fold stacking."""
+        if len(X) < MIN_TRAIN_SAMPLES:
+            return False
+        try:
+            import joblib
+            import xgboost as xgb
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.linear_model import LinearRegression, Ridge
+            from sklearn.model_selection import KFold
+
+            X_arr = np.array(X)
+            y_arr = np.array(y)
+            sw = np.array(sample_weight) if sample_weight else None
+
+            # Base learners
+            xgb_model = xgb.XGBRegressor(
+                n_estimators=200, max_depth=4, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0,
+            )
+            rf_model = RandomForestRegressor(
+                n_estimators=150, max_depth=8, min_samples_leaf=5,
+                max_features=0.7, random_state=42, n_jobs=-1,
+            )
+            lr_model = LinearRegression()
+
+            base_learners = [
+                ('xgb', xgb_model),
+                ('rf', rf_model),
+                ('lr', lr_model),
+            ]
+
+            # Generate OOF predictions for meta-learner training
+            kf = KFold(n_splits=3, shuffle=True, random_state=42)
+            oof_preds = np.zeros((len(X_arr), len(base_learners)))
+
+            for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X_arr)):
+                X_train, X_val = X_arr[train_idx], X_arr[val_idx]
+                y_train = y_arr[train_idx]
+                sw_train = sw[train_idx] if sw is not None else None
+
+                for bl_idx, (name, model) in enumerate(base_learners):
+                    model_clone = _clone_model(model)
+                    if name == 'xgb' and sw_train is not None:
+                        model_clone.fit(X_train, y_train, sample_weight=sw_train)
+                    elif name == 'rf' and sw_train is not None:
+                        model_clone.fit(X_train, y_train, sample_weight=sw_train)
+                    else:
+                        model_clone.fit(X_train, y_train)
+                    oof_preds[val_idx, bl_idx] = model_clone.predict(X_val)
+
+            # Train meta-learner on OOF predictions
+            meta = Ridge(alpha=0.5)
+            meta.fit(oof_preds, y_arr)
+
+            # Retrain base learners on full data
+            trained_bases = []
+            for name, model in base_learners:
+                if name in ('xgb', 'rf') and sw is not None:
+                    model.fit(X_arr, y_arr, sample_weight=sw)
+                else:
+                    model.fit(X_arr, y_arr)
+                trained_bases.append((name, model))
+
+            self.ensemble = {
+                'bases': trained_bases,
+                'meta': meta,
+                'feature_names': FEATURE_NAMES,
+            }
+            joblib.dump(self.ensemble, self.ensemble_path)
+            return True
+        except Exception:
+            self.ensemble = None
+            return False
+
+    def predict_rate(self, features: Dict) -> Optional[float]:
+        """Predict per-minute rate using ensemble."""
+        if self.ensemble is None:
+            return None
+        try:
+            feat_vec = np.array([[features[k] for k in FEATURE_NAMES]])
+            base_preds = []
+            for name, model in self.ensemble['bases']:
+                base_preds.append(model.predict(feat_vec)[0])
+            meta_input = np.array([base_preds])
+            return float(self.ensemble['meta'].predict(meta_input)[0])
+        except Exception:
+            return None
+
+
+def _clone_model(model):
+    """Clone a sklearn/xgb model by re-instantiating with same params."""
+    from sklearn.base import clone
+    return clone(model)
+
+
+# =========================================================================
+# Public API
+# =========================================================================
+
 def get_ml_projection(market: str, logs: pd.DataFrame,
                       proj_minutes: float,
                       home_flag: bool = False,
@@ -489,16 +607,8 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
     """
     Public API: return ML mean projection for a player/market.
     Returns None if model is untrained or data insufficient.
-    Caller blends this 50/50 with the Bayesian projection.
 
-    BDL season profile args (all default 0.0 — computed from logs when absent):
-        real_usage_pct:   BDL true usage % (replaces box-score proxy).
-        avg_touches:      per-game ball touches from BDL V2 advanced.
-        pnr_bh_freq:      PnR ball-handler frequency from BDL playtype.
-        iso_freq:         isolation play frequency from BDL playtype.
-        spotup_freq:      spot-up play frequency from BDL playtype.
-        transition_freq:  transition play frequency from BDL playtype.
-        ts_pct:           true shooting % from BDL general/advanced.
+    Tries ensemble first; falls back to standalone XGBoost.
     """
     if proj_minutes <= 0:
         return None
@@ -531,19 +641,31 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
             return None
         return pts + reb + ast
 
-    model = PropMLModel(market)
-    feats = model.build_features(logs, home_flag, rest_days, opp_def_rating, pace_factor,
-                                 opp_pace, opp_rebound_pct, opp_pts_paint,
-                                 **_travel_kwargs, **_bdl_kwargs)
+    # Build features once, try ensemble then XGB fallback
+    prop_model = PropMLModel(market)
+    feats = prop_model.build_features(logs, home_flag, rest_days, opp_def_rating, pace_factor,
+                                      opp_pace, opp_rebound_pct, opp_pts_paint,
+                                      **_travel_kwargs, **_bdl_kwargs)
     if feats is None:
         return None
 
-    rate = model.predict_rate(feats)
+    # Try ensemble first
+    ens = EnsembleModel(market)
+    rate = ens.predict_rate(feats)
+
+    # Fallback to standalone XGB
+    if rate is None:
+        rate = prop_model.predict_rate(feats)
+
     if rate is None:
         return None
 
     return max(0.0, rate * proj_minutes)
 
+
+# =========================================================================
+# Training functions
+# =========================================================================
 
 def train_models_from_logs(player_logs_list: List[pd.DataFrame],
                            opp_stats_df: Optional[pd.DataFrame] = None,
@@ -551,30 +673,19 @@ def train_models_from_logs(player_logs_list: List[pd.DataFrame],
                            def_stats_df: Optional[pd.DataFrame] = None,
                            league_avg_pace: float = 99.0) -> Dict[str, bool]:
     """
-    Train XGBoost models for all markets using a list of player game log DataFrames.
-    Call this from a pipeline (e.g., python main.py train_ml).
+    Train ensemble models for all markets using a list of player game log DataFrames.
+    Also trains standalone XGBoost as fallback.
     Returns {market: success_bool}.
-
-    Args:
-        opp_stats_df:  DataFrame from NbaStatsClient.get_opponent_stats().
-                       Must contain TEAM_ABBREVIATION + OPP_PTS/REB/AST/FG3M.
-        team_stats_df: DataFrame from NbaStatsClient.get_team_stats() [Advanced].
-                       Must contain TEAM_ABBREVIATION + PACE + DREB_PCT.
-        def_stats_df:  DataFrame from NbaStatsClient.get_team_defense_stats() [Defense].
-                       Must contain TEAM_ABBREVIATION + OPP_PTS_PAINT.
-        league_avg_pace: League average pace (default 99.0).
     """
     from src.utils.logging_utils import get_logger
     log = get_logger(__name__)
 
-    # Build pace lookup: {abbr: raw_pace}
     pace_lookup: Optional[Dict[str, float]] = None
     if team_stats_df is not None and not team_stats_df.empty and 'PACE' in team_stats_df.columns:
         pace_lookup = _build_abbr_lookup(team_stats_df, 'PACE')
         if pace_lookup:
             league_avg_pace = float(np.mean(list(pace_lookup.values())))
 
-    # Build opp_rebound_pct lookup: {abbr: dreb_pct_normalized}
     opp_rebound_pct_lookup: Optional[Dict[str, float]] = None
     if team_stats_df is not None and not team_stats_df.empty and 'DREB_PCT' in team_stats_df.columns:
         raw = _build_abbr_lookup(team_stats_df, 'DREB_PCT')
@@ -582,7 +693,6 @@ def train_models_from_logs(player_logs_list: List[pd.DataFrame],
         if league_avg_dreb > 0:
             opp_rebound_pct_lookup = {k: v / league_avg_dreb for k, v in raw.items()}
 
-    # Build opp_pts_paint lookup: {abbr: opp_pts_paint_normalized}
     opp_pts_paint_lookup: Optional[Dict[str, float]] = None
     if def_stats_df is not None and not def_stats_df.empty and 'OPP_PTS_PAINT' in def_stats_df.columns:
         raw = _build_abbr_lookup(def_stats_df, 'OPP_PTS_PAINT')
@@ -592,9 +702,9 @@ def train_models_from_logs(player_logs_list: List[pd.DataFrame],
 
     results = {}
     for market in _MARKET_COL:
-        model = PropMLModel(market)
+        prop_model = PropMLModel(market)
+        ens_model  = EnsembleModel(market)
 
-        # Build opponent defensive lookup for this market: {abbr: def_rating}
         opp_def_lookup: Optional[Dict[str, float]] = None
         opp_col = _MARKET_OPP_STAT.get(market)
         if opp_stats_df is not None and not opp_stats_df.empty and opp_col and opp_col in opp_stats_df.columns:
@@ -604,16 +714,23 @@ def train_models_from_logs(player_logs_list: List[pd.DataFrame],
 
         all_X, all_y = [], []
         for logs in player_logs_list:
-            X, y = model.build_training_data(
+            X, y = prop_model.build_training_data(
                 logs, opp_def_lookup, pace_lookup, league_avg_pace,
                 opp_rebound_pct_lookup, opp_pts_paint_lookup,
             )
             all_X.extend(X)
             all_y.extend(y)
-        success = model.train(all_X, all_y)
+
+        # Train ensemble (primary)
+        ens_ok = ens_model.train(all_X, all_y)
+        # Train standalone XGB (fallback)
+        xgb_ok = prop_model.train(all_X, all_y)
+
+        success = ens_ok or xgb_ok
         results[market] = success
-        status = "trained" if success else f"skipped (need {MIN_TRAIN_SAMPLES} samples, got {len(all_X)})"
-        log.info(f"ML model [{market}]: {status}")
+        log.info(f"ML model [{market}]: ensemble={'ok' if ens_ok else 'skip'} "
+                 f"xgb={'ok' if xgb_ok else 'skip'} "
+                 f"({len(all_X)} samples)")
     return results
 
 
@@ -628,18 +745,7 @@ def _norm_player_name(name: str) -> str:
 
 def build_clv_weight_lookup(db) -> Dict:
     """
-    Query clv_tracking for all settled records and return a sample-weight dict:
-        {(player_norm, market, date_str): weight_multiplier}
-
-    CLV is the probability improvement over the alert price (implied_closing − implied_alert).
-    We translate it to XGBoost sample weights that reinforce predictions the sharp market
-    later confirmed (positive CLV) and discount those it moved against (negative CLV).
-
-    Weight table:
-        CLV >  0.02  → 1.8   (strong beat: closing line agreed with us)
-        CLV >  0.00  → 1.2   (mild beat)
-        CLV > −0.02  → 0.9   (near-miss: market barely moved against us)
-        CLV ≤ −0.02  → 0.6   (market clearly disagreed: discount this prediction)
+    Query clv_tracking for all settled records and return a sample-weight dict.
     """
     try:
         with db.get_conn() as conn:
@@ -691,15 +797,7 @@ def train_models_with_clv_feedback(
 ) -> Dict[str, bool]:
     """
     CLV-weighted variant of train_models_from_logs.
-
-    ``player_named_logs`` must be a list of ``(player_name, logs_df)`` tuples so
-    each sample can be matched to its CLV record.
-
-    Uses the same feature set as the standard model; the only difference is that
-    XGBoost's ``sample_weight`` is drawn from the CLV history so predictions that
-    historically beat the closing line receive higher training influence.
-
-    Falls back to uniform weights when no CLV data is available (first run).
+    Trains both ensemble and standalone XGB with CLV sample weights.
     """
     from src.utils.logging_utils import get_logger
     log = get_logger(__name__)
@@ -707,7 +805,6 @@ def train_models_with_clv_feedback(
     clv_lookup = build_clv_weight_lookup(db)
     log.info(f"CLV feedback: {len(clv_lookup)} CLV weight records loaded.")
 
-    # Build context lookups (same as train_models_from_logs)
     pace_lookup: Optional[Dict[str, float]] = None
     if team_stats_df is not None and not team_stats_df.empty and 'PACE' in team_stats_df.columns:
         pace_lookup = _build_abbr_lookup(team_stats_df, 'PACE')
@@ -730,7 +827,8 @@ def train_models_with_clv_feedback(
 
     results = {}
     for market in _MARKET_COL:
-        model = PropMLModel(market)
+        prop_model = PropMLModel(market)
+        ens_model  = EnsembleModel(market)
 
         opp_def_lookup: Optional[Dict[str, float]] = None
         opp_col = _MARKET_OPP_STAT.get(market)
@@ -741,7 +839,7 @@ def train_models_with_clv_feedback(
 
         all_X, all_y, all_w = [], [], []
         for player_name, logs in player_named_logs:
-            X, y, w = model.build_training_data(
+            X, y, w = prop_model.build_training_data(
                 logs, opp_def_lookup, pace_lookup, league_avg_pace,
                 opp_rebound_pct_lookup, opp_pts_paint_lookup,
                 player_name=player_name,
@@ -752,21 +850,22 @@ def train_models_with_clv_feedback(
             all_y.extend(y)
             all_w.extend(w)
 
-        success = model.train(all_X, all_y, sample_weight=all_w if all_w else None)
+        sw = all_w if all_w else None
+        ens_ok = ens_model.train(all_X, all_y, sample_weight=sw)
+        xgb_ok = prop_model.train(all_X, all_y, sample_weight=sw)
+
+        success = ens_ok or xgb_ok
         results[market] = success
         beats  = sum(1 for w in all_w if w > 1.0)
         misses = sum(1 for w in all_w if w < 1.0)
-        status = (
-            "trained" if success
-            else f"skipped (need {MIN_TRAIN_SAMPLES} samples, got {len(all_X)})"
-        )
-        log.info(f"CLV model [{market}]: {status} | CLV beats={beats} misses={misses}")
+        log.info(f"CLV model [{market}]: ensemble={'ok' if ens_ok else 'skip'} "
+                 f"xgb={'ok' if xgb_ok else 'skip'} | CLV beats={beats} misses={misses}")
 
     return results
 
 
 def _build_abbr_lookup(df: pd.DataFrame, value_col: str) -> Dict[str, float]:
-    """Build {team_abbr_upper: value} from a DataFrame that has TEAM_ABBREVIATION or TEAM_NAME."""
+    """Build {team_abbr_upper: value} from a DataFrame."""
     result: Dict[str, float] = {}
     if 'TEAM_ABBREVIATION' in df.columns:
         for _, row in df.iterrows():

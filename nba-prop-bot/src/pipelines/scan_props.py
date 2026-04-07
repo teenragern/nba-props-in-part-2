@@ -70,6 +70,7 @@ from src.clients.bdl_scan_integration import init_bdl_boost, get_bdl_boost
 from src.clients.bdl_game_logs import BDLGameLogs
 from src.clients.bdl_pbp_adapter import BDLPbpAdapter
 from src.clients.bdl_standings_context import BDLStandingsContext
+from src.clients.bdl_defense_context import BDLDefenseContext
 
 logger = get_logger(__name__)
 _PROJECTIONS_CACHE: Dict[str, Any] = {}
@@ -300,11 +301,13 @@ _bdl_booster = init_bdl_boost() if BDL_ENABLED else None
 _bdl_game_logs = None
 _bdl_pbp = None
 _bdl_standings = None
+_bdl_defense = None
 if BDL_ENABLED_RUNTIME:
     _bdl_game_logs = BDLGameLogs(_bdl_bridge.bdl)
     _bdl_pbp = BDLPbpAdapter(_bdl_bridge.bdl)
     _bdl_standings = BDLStandingsContext(_bdl_bridge.bdl)
-    logger.info("BDL full potential: game logs, PBP, standings, booster initialized")
+    _bdl_defense = BDLDefenseContext(_bdl_bridge.bdl)
+    logger.info("BDL full potential: game logs, PBP, standings, defense context, booster initialized")
 
 
 # ─── Helper functions (unchanged from V1) ─────────────────────────────
@@ -665,6 +668,10 @@ def scan_props():
     db.init_bookmaker_profiles()
     _book_weights = db.get_sharp_book_weights()
 
+    # Inject DB into BDL modules for SQLite caching
+    if _bdl_game_logs:
+        _bdl_game_logs.db = db
+
     today      = datetime.now().strftime('%Y-%m-%d')
     local_zone = tz.tzlocal()
 
@@ -938,13 +945,6 @@ def scan_props():
                 f"| {home_team} vs {away_team}"
             )
 
-        # ── Cross-player correlations ─────────────────────────────────
-        for _team in (home_team, away_team):
-            try:
-                build_team_correlation_matrix(_team, stats_client, db)
-            except Exception:
-                pass
-
         # ── OUT players ───────────────────────────────────────────────
         out_players: List[str] = []
         with db.get_conn() as conn:
@@ -1004,6 +1004,24 @@ def scan_props():
             _standings_ctx = _bdl_standings.get_game_context(
                 home_team, away_team, season=_season_int
             )
+
+        # BDL full defense profiles (opponent DRTG, pace, position-specific factors)
+        _home_def_profile = {}
+        _away_def_profile = {}
+        if _bdl_defense and _season_int:
+            try:
+                _home_def_profile = _bdl_defense.get_opponent_profile(
+                    away_team, _season_int, db=db
+                )
+                _away_def_profile = _bdl_defense.get_opponent_profile(
+                    home_team, _season_int, db=db
+                )
+                logger.debug(
+                    f"BDL defense: home opp def_rating={_home_def_profile.get('def_rating', 1.0):.3f} "
+                    f"away opp def_rating={_away_def_profile.get('def_rating', 1.0):.3f}"
+                )
+            except Exception as _def_err:
+                logger.debug(f"BDL defense profile fetch failed: {_def_err}")
 
         sharp_alerted: set = set()
 
@@ -1323,6 +1341,7 @@ def scan_props():
                 logger.warning(f"Team totals scan failed for {_gm_matchup}: {_tt_err}")
 
         # ── Per-player loop ───────────────────────────────────────────
+        team_player_logs: Dict[str, Dict[str, pd.DataFrame]] = {}
         for player_name in players_in_event:
             # Injury status
             injury_status = "Healthy"
@@ -1383,6 +1402,8 @@ def scan_props():
             home_flag  = stats_client.is_home_team(player_team_abbr or '', home_team)
             rest_days  = NbaStatsClient.calculate_rest_days(logs)
             b2b_flag   = rest_days == 0
+            _pt_team = home_team if home_flag else away_team
+            team_player_logs.setdefault(_pt_team, {})[player_name] = logs
 
             # Standings-based minutes adjustment
             _standings_min_adj = 1.0
@@ -1477,6 +1498,16 @@ def scan_props():
                 opp_multiplier = stats_client.get_positional_def_multiplier(
                     opp_team, base_mkt, _position_group
                 )
+
+                # BDL defense context: position-specific DRTG-weighted factor.
+                # Blend 50/50 with nba_api multiplier when available — BDL
+                # provides richer opponent/advanced/defense dimensions.
+                _def_profile = _home_def_profile if home_flag else _away_def_profile
+                if _def_profile:
+                    _bdl_def_factor = _bdl_defense.get_position_def_factor(
+                        _def_profile, _position_group, base_mkt
+                    )
+                    opp_multiplier = 0.50 * opp_multiplier + 0.50 * _bdl_def_factor
 
                 for line in prices_by_market[mkt][player_name]:
                     # On/off usage shift
@@ -1786,6 +1817,14 @@ def scan_props():
                                 f" | {rec_book.title()} {_american(rec_price)}"
                             )
                             bot.send_message(msg)
+
+        # ── Build Full Team Correlation Matrix for SGPs ───────────────
+        for _t_name, _t_logs in team_player_logs.items():
+            try:
+                from src.models.sgp_correlations import build_full_team_correlation_matrix
+                build_full_team_correlation_matrix(_t_name, _t_logs, db)
+            except Exception as e:
+                logger.warning(f"Failed to build full team correlation matrix for {_t_name}: {e}")
 
     # ── Rank and alert ────────────────────────────────────────────────
     ranked_edges = rank_edges(candidates)

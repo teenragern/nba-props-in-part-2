@@ -7,6 +7,18 @@ _AWAY_PENALTY   = 0.98
 _EXTENDED_REST_BOOST = 1.03  # 3+ days rest
 _B2B_PENALTY_MULT    = 0.95  # back-to-back (rest_days == 0)
 
+# Rest-day schedule: maps rest_days -> multiplier
+_REST_SCHEDULE = {
+    0: 0.95,   # B2B
+    1: 1.00,   # normal rest
+    2: 1.01,   # extra day
+    3: 1.03,   # extended rest
+    4: 1.025,  # diminishing returns
+    5: 1.02,
+    6: 1.015,
+    7: 1.01,   # rust risk after a week off
+}
+
 
 def get_market_col(market: str) -> str:
     return {
@@ -30,52 +42,141 @@ def get_home_away_factor(home_flag: bool) -> float:
 
 
 def get_rest_days_factor(rest_days: int, b2b_flag: bool) -> float:
-    """Priority 4: Performance adjustment based on rest between games."""
+    """Priority 4: Granular rest-day schedule instead of binary B2B/extended."""
     if b2b_flag or rest_days == 0:
         return _B2B_PENALTY_MULT
-    if rest_days >= 3:
-        return _EXTENDED_REST_BOOST
-    return 1.0
+    return _REST_SCHEDULE.get(min(rest_days, 7), 1.0)
 
+
+# ---------------------------------------------------------------------------
+# Rolling average helpers (exponential decay)
+# ---------------------------------------------------------------------------
+
+def _ewm_rate(logs: pd.DataFrame, col: str, n: int, alpha: float = 0.3) -> float:
+    """Exponentially-weighted per-minute rate over the last n games (newest-first logs)."""
+    recent = logs.head(n)
+    if recent.empty or col not in recent.columns or 'MIN' not in recent.columns:
+        return 0.0
+    rates = []
+    for _, row in recent.iterrows():
+        m = float(row.get('MIN', 0) or 0)
+        s = float(row.get(col, 0) or 0)
+        if m > 0:
+            rates.append(s / m)
+    if not rates:
+        return 0.0
+    return float(pd.Series(rates[::-1]).ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+
+
+def _rolling_rate(logs: pd.DataFrame, col: str, n: int) -> float:
+    """Simple per-minute rate over the last n games."""
+    subset = logs.head(n)
+    if subset.empty or col not in subset.columns or 'MIN' not in subset.columns:
+        return 0.0
+    total_min = subset['MIN'].sum()
+    if total_min <= 0:
+        return 0.0
+    return float(subset[col].sum() / total_min)
+
+
+def compute_rolling_rates(logs: pd.DataFrame, col: str) -> Dict[str, float]:
+    """
+    Compute rolling 5/10/20-game simple and EWM per-minute rates.
+    Returns a dict with keys: rate_5g, rate_10g, rate_20g,
+    ewm_5g, ewm_10g, ewm_20g.
+    """
+    return {
+        'rate_5g':  _rolling_rate(logs, col, 5),
+        'rate_10g': _rolling_rate(logs, col, 10),
+        'rate_20g': _rolling_rate(logs, col, 20),
+        'ewm_5g':   _ewm_rate(logs, col, 5, alpha=0.3),
+        'ewm_10g':  _ewm_rate(logs, col, 10, alpha=0.25),
+        'ewm_20g':  _ewm_rate(logs, col, 20, alpha=0.15),
+    }
+
+
+def blend_rolling_rates(rates: Dict[str, float], n_games: int) -> float:
+    """
+    Blend rolling rates with adaptive weighting based on sample size.
+    Early-season (few games) leans on EWM; mid-season balances all windows.
+    """
+    if n_games < 8:
+        # Small sample: lean on EWM of what we have
+        return rates.get('ewm_5g', 0.0)
+    if n_games < 15:
+        # Growing sample: 60% EWM-5, 25% rate_10, 15% rate_season (not here)
+        return 0.60 * rates.get('ewm_5g', 0.0) + 0.40 * rates.get('rate_10g', 0.0)
+    # Full sample: blend across windows with recency bias
+    return (
+        0.35 * rates.get('ewm_5g', 0.0) +
+        0.25 * rates.get('ewm_10g', 0.0) +
+        0.15 * rates.get('rate_10g', 0.0) +
+        0.15 * rates.get('ewm_20g', 0.0) +
+        0.10 * rates.get('rate_20g', 0.0)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Minutes projection (refined)
+# ---------------------------------------------------------------------------
 
 def estimate_projected_minutes(recent_logs: pd.DataFrame, season_logs: pd.DataFrame,
                                 injury_status: str, starter_flag: bool = False,
                                 b2b_flag: bool = False, spread_magnitude: float = 0.0,
-                                out_player_avg_mins: float = 0.0) -> float:
+                                out_player_avg_mins: float = 0.0,
+                                rest_days: int = 2) -> float:
     if recent_logs.empty and season_logs.empty:
         return 0.0
 
     recent_5_mins  = recent_logs['MIN'].head(5).mean()  if not recent_logs.empty else 0.0
     recent_10_mins = recent_logs['MIN'].head(10).mean() if not recent_logs.empty else recent_5_mins
+    recent_20_mins = recent_logs['MIN'].head(20).mean() if not recent_logs.empty else recent_10_mins
     season_mins    = season_logs['MIN'].mean()           if not season_logs.empty else recent_5_mins
 
     if pd.isna(recent_5_mins):  recent_5_mins  = season_mins
     if pd.isna(recent_10_mins): recent_10_mins = season_mins
+    if pd.isna(recent_20_mins): recent_20_mins = season_mins
     if pd.isna(season_mins):    season_mins    = recent_5_mins
+
+    # Minutes volatility: high std signals unstable rotation
+    min_std_5 = recent_logs['MIN'].head(5).std() if not recent_logs.empty and len(recent_logs) > 1 else 0.0
+    if pd.isna(min_std_5):
+        min_std_5 = 0.0
 
     # Trend detection: sharp upward trend signals a role change in progress
     mins_trend = recent_5_mins - recent_10_mins
     if mins_trend > 4.0:
         # Weight heavily toward recent games (rotation expanding)
-        base_mins = (0.70 * recent_5_mins) + (0.20 * recent_10_mins) + (0.10 * season_mins)
+        base_mins = (0.70 * recent_5_mins) + (0.15 * recent_10_mins) + (0.10 * recent_20_mins) + (0.05 * season_mins)
+    elif mins_trend < -4.0:
+        # Downward trend: role shrinking, still trust recent but hedge more
+        base_mins = (0.55 * recent_5_mins) + (0.20 * recent_10_mins) + (0.15 * recent_20_mins) + (0.10 * season_mins)
+    elif min_std_5 > 6.0:
+        # High volatility: lean on 10/20 game windows for stability
+        base_mins = (0.30 * recent_5_mins) + (0.30 * recent_10_mins) + (0.25 * recent_20_mins) + (0.15 * season_mins)
     else:
-        base_mins = (0.50 * recent_5_mins) + (0.30 * recent_10_mins) + (0.20 * season_mins)
+        base_mins = (0.45 * recent_5_mins) + (0.25 * recent_10_mins) + (0.20 * recent_20_mins) + (0.10 * season_mins)
 
     # Rotation-aware minutes boost
     if starter_flag:
         if out_player_avg_mins > base_mins + 5.0:
-            # Player is being thrust into a bigger role than their average suggests.
-            # Primary backup absorbs ~55% of the missing starter's opportunity.
             base_mins = 0.45 * base_mins + 0.55 * out_player_avg_mins
         else:
-            # Regular starter or minor role change: flat boost
             base_mins += 3.0
     elif out_player_avg_mins > 0:
-        # Non-starter picks up overflow minutes
         base_mins += out_player_avg_mins * 0.15
 
-    if b2b_flag:             base_mins -= 1.5
-    if spread_magnitude > 15.0: base_mins -= 2.0
+    # B2B minute reduction (scaled by rest)
+    if b2b_flag:
+        base_mins -= 1.5
+    elif rest_days >= 4:
+        # Extended rest can slightly increase minutes (coach plays starters longer)
+        base_mins += 0.5
+
+    if spread_magnitude > 15.0:
+        base_mins -= 2.0
+    elif spread_magnitude > 10.0:
+        base_mins -= 1.0
 
     mult = 1.0
     status = injury_status.lower() if injury_status else "healthy"
@@ -101,7 +202,7 @@ def calculate_pra_rate(logs: pd.DataFrame) -> float:
 
 
 def get_market_variance_calibration(_market: str) -> float:
-    # Phase 4: DB lookup for realized vs predicted variance scaling (stub → 1.0 until data accumulates)
+    # Phase 4: DB lookup for realized vs predicted variance scaling (stub -> 1.0 until data accumulates)
     return 1.0
 
 
@@ -131,7 +232,8 @@ def build_player_projection(player_id: str, market: str, line: float,
     else:
         proj_mins = estimate_projected_minutes(
             recent_logs, season_logs, injury_status,
-            starter_flag, b2b_flag, spread_magnitude, out_player_avg_mins
+            starter_flag, b2b_flag, spread_magnitude, out_player_avg_mins,
+            rest_days=rest_days,
         )
 
     if proj_mins <= 0:
@@ -140,42 +242,38 @@ def build_player_projection(player_id: str, market: str, line: float,
             "mean": 0.0, "projected_minutes": 0.0, "injury_status": injury_status,
         }
 
-    n_sample_games = min(5, len(recent_logs)) if not recent_logs.empty else 0
+    n_sample_games = min(len(recent_logs), 30) if not recent_logs.empty else 0
 
+    # ── Rolling averages with exponential decay ────────────────────────────
     if market == "player_points_rebounds_assists":
-        recent_rate = calculate_pra_rate(recent_logs.head(5))
+        # Blend PRA from component rolling rates
+        pts_rates = compute_rolling_rates(recent_logs, 'PTS') if not recent_logs.empty else {}
+        reb_rates = compute_rolling_rates(recent_logs, 'REB') if not recent_logs.empty else {}
+        ast_rates = compute_rolling_rates(recent_logs, 'AST') if not recent_logs.empty else {}
+        recent_rate = sum(blend_rolling_rates(r, n_sample_games) for r in [pts_rates, reb_rates, ast_rates])
         season_rate = calculate_pra_rate(season_logs)
     else:
         col = get_market_col(market)
         if not col:
             return {}
-        recent_rate = calculate_rate(recent_logs.head(5), col)
+        rolling = compute_rolling_rates(recent_logs, col) if not recent_logs.empty else {}
+        recent_rate = blend_rolling_rates(rolling, n_sample_games) if rolling else 0.0
         season_rate = calculate_rate(season_logs, col)
 
     if season_rate == 0: season_rate = recent_rate
     if recent_rate == 0: recent_rate = season_rate
 
     # ── Role-shift override ────────────────────────────────────────────
-    # When a primary initiator is OUT and we have reliable on/off split
-    # data (rate_without), hard-override the Bayesian baseline with the
-    # isolated rate. This prevents the season-long positional average
-    # from anchoring the projection to the wrong role.
     role_shifted = False
     if role_shift_rate > 0:
-        # Use the on/off rate_without directly — this IS the player's
-        # per-minute production when the initiator is off the floor.
         blended_rate = role_shift_rate
         role_shifted = True
-        # If BOTH initiators are out, apply a 1.50x multiplier on top —
-        # the remaining guard absorbs even more creation responsibility.
         if initiators_out >= 2:
             blended_rate *= 1.50
-        # Skip the generic usage_shift; it's already baked into rate_without
         adj_rate = blended_rate
     else:
-        # Bayesian shrinkage (pulls sample toward season prior)
+        # Bayesian shrinkage (pulls rolling-blended rate toward season prior)
         blended_rate = get_bayesian_rate(recent_rate, season_rate, n_sample_games, prior_weight=prior_weight)
-        # Lineup usage shift (key player out → +% to active players)
         adj_rate = blended_rate * (1 + usage_shift)
 
     # Pace adjustment
@@ -190,11 +288,11 @@ def build_player_projection(player_id: str, market: str, line: float,
     # Priority 4: Home/away factor
     adj_rate *= get_home_away_factor(home_flag)
 
-    # Priority 4: Rest days factor (applied to minutes proxy)
+    # Priority 4: Rest days factor
     rest_factor = get_rest_days_factor(rest_days, b2b_flag)
     adj_rate *= rest_factor
 
-    # Travel fatigue reduces projected minutes (and thus the mean proportionally)
+    # Travel fatigue reduces projected minutes
     if fatigue_multiplier < 1.0:
         proj_mins = proj_mins * fatigue_multiplier
 
@@ -215,4 +313,10 @@ def build_player_projection(player_id: str, market: str, line: float,
         "fatigue_multiplier": fatigue_multiplier,
         "role_shifted":       role_shifted,
         "initiators_out":     initiators_out,
+        # Factor breakdown: projected_rate = base_rate x pace x opp_def x rest x home
+        "base_rate":          blended_rate,
+        "pace_factor":        pace_factor,
+        "opp_def_factor":     opponent_multiplier,
+        "rest_factor":        rest_factor,
+        "home_factor":        get_home_away_factor(home_flag),
     }
