@@ -96,11 +96,12 @@ def notify(job_name, func, *args):
 def job_sync():
     """Fetch today's event list (1 credit) and update _today_game_count."""
     global _today_game_count
+    fetched_events = []
     try:
         today_str = datetime.now(ET).strftime('%Y-%m-%d')
-        events    = _odds_client.get_events()
+        fetched_events = _odds_client.get_events()
         _today_game_count = sum(
-            1 for e in events
+            1 for e in fetched_events
             if dateutil.parser.isoparse(e['commence_time'])
                .astimezone(ET).strftime('%Y-%m-%d') == today_str
         )
@@ -116,8 +117,8 @@ def job_sync():
     except Exception as e:
         logger.error(f"Sync quota check failed: {e}")
 
-    # Also persist events to the games table.
-    notify("Sync", sync_events)
+    # Pass the already-fetched events so sync_events doesn't need a second get_events() call.
+    notify("Sync", sync_events, fetched_events or None)
 
 
 def job_scan():

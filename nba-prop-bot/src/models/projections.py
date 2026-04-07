@@ -119,7 +119,9 @@ def build_player_projection(player_id: str, market: str, line: float,
                              rest_days: int = 2,
                              out_player_avg_mins: float = 0.0,
                              projected_minutes_override: float = 0.0,
-                             fatigue_multiplier: float = 1.0) -> Dict[str, Any]:
+                             fatigue_multiplier: float = 1.0,
+                             role_shift_rate: float = 0.0,
+                             initiators_out: int = 0) -> Dict[str, Any]:
     """
     projected_minutes_override: when > 0, skips estimate_projected_minutes entirely
     and uses this value directly (e.g. from the RotationModel's slot-based projection).
@@ -153,11 +155,28 @@ def build_player_projection(player_id: str, market: str, line: float,
     if season_rate == 0: season_rate = recent_rate
     if recent_rate == 0: recent_rate = season_rate
 
-    # Bayesian shrinkage (pulls sample toward season prior)
-    blended_rate = get_bayesian_rate(recent_rate, season_rate, n_sample_games, prior_weight=prior_weight)
-
-    # Lineup usage shift (key player out → +% to active players)
-    adj_rate = blended_rate * (1 + usage_shift)
+    # ── Role-shift override ────────────────────────────────────────────
+    # When a primary initiator is OUT and we have reliable on/off split
+    # data (rate_without), hard-override the Bayesian baseline with the
+    # isolated rate. This prevents the season-long positional average
+    # from anchoring the projection to the wrong role.
+    role_shifted = False
+    if role_shift_rate > 0:
+        # Use the on/off rate_without directly — this IS the player's
+        # per-minute production when the initiator is off the floor.
+        blended_rate = role_shift_rate
+        role_shifted = True
+        # If BOTH initiators are out, apply a 1.50x multiplier on top —
+        # the remaining guard absorbs even more creation responsibility.
+        if initiators_out >= 2:
+            blended_rate *= 1.50
+        # Skip the generic usage_shift; it's already baked into rate_without
+        adj_rate = blended_rate
+    else:
+        # Bayesian shrinkage (pulls sample toward season prior)
+        blended_rate = get_bayesian_rate(recent_rate, season_rate, n_sample_games, prior_weight=prior_weight)
+        # Lineup usage shift (key player out → +% to active players)
+        adj_rate = blended_rate * (1 + usage_shift)
 
     # Pace adjustment
     pace_factor = 1.0
@@ -194,4 +213,6 @@ def build_player_projection(player_id: str, market: str, line: float,
         "home_flag":          home_flag,
         "rest_days":          rest_days,
         "fatigue_multiplier": fatigue_multiplier,
+        "role_shifted":       role_shifted,
+        "initiators_out":     initiators_out,
     }

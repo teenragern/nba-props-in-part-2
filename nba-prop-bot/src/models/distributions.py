@@ -234,6 +234,36 @@ def monte_carlo_over_under(
         return {"prob_over": 0.0, "prob_under": 1.0}
 
     rng = np.random.default_rng()
+
+    # ── 0. Pre-game blowout cap ───────────────────────────────────────────
+    # When the book spread signals a likely blowout (|spread| >= 11),
+    # slash projected minutes for starters/stars BEFORE the MC loop.
+    # The Q3 simulation (Mode A) already captures in-game blowout
+    # variance, but it under-weights guaranteed garbage-time benching
+    # because it only activates per-sim when the random Q3 margin
+    # exceeds 15. A -14 spread means the market is TELLING us the
+    # starters will sit early — force that into the baseline minutes.
+    #
+    # Scale: -11 → -1.5 min, -12 → -2.0, -13 → -2.5, -14 → -3.0,
+    #        -15+ → -3.5 min (capped). Only applies to starters/stars
+    #        (bench_tier 0-1). Bench players (tier 3) get a boost.
+    _pregame_blowout_cut = 0.0
+    abs_spread = abs(spread)
+    if abs_spread >= 11.0 and bench_tier <= 1:
+        _pregame_blowout_cut = min(1.5 + (abs_spread - 11.0) * 0.5, 3.5)
+        proj_minutes = max(proj_minutes - _pregame_blowout_cut, 12.0)
+        # Also tighten the blowout cap — in sims where the blowout
+        # actually materialises, starters sit even earlier.
+        blowout_minute_cap = min(blowout_minute_cap, 26.0)
+    elif abs_spread >= 11.0 and bench_tier == 3:
+        # Garbage-time beneficiary: projected minutes tick UP slightly
+        proj_minutes += min((abs_spread - 11.0) * 0.5, 2.0)
+
+    # Shift mean_proj down proportionally so the re-centering step (1b)
+    # doesn't undo the pre-game cut.  The cut IS the edge — the market
+    # prices the full-game minutes; we know they'll sit.
+    if _pregame_blowout_cut > 0.0:
+        mean_proj = mean_proj * (proj_minutes / (proj_minutes + _pregame_blowout_cut))
     rate = mean_proj / proj_minutes
 
     # Look-ahead spot: player's team is a heavy favourite tonight AND faces a
@@ -245,6 +275,7 @@ def monte_carlo_over_under(
 
     # ── 1. Simulate effective minutes ──────────────────────────────────────
     sim_min = np.full(n_sims, proj_minutes, dtype=np.float64)
+    is_blowout = np.zeros(n_sims, dtype=bool)
 
     if spread != 0.0 and total > 0.0:
         # Mode A: per-sim Q3 game state derived from spread + total.
@@ -311,7 +342,15 @@ def monte_carlo_over_under(
     }
     if revenge_game and market in _REVENGE_MARKETS:
         alpha *= 1.10
-    variance = expected + alpha * (expected ** 2)
+    # Garbage-time variance: bench players in blowouts face other bench
+    # players → stat production is noisier. Inflate alpha per-sim where
+    # is_blowout triggered for bench-tier players.
+    if bench_tier == 3 and np.any(is_blowout):
+        alpha_arr = np.full(n_sims, alpha)
+        alpha_arr[is_blowout] *= 1.40
+        variance = expected + alpha_arr * (expected ** 2)
+    else:
+        variance = expected + alpha * (expected ** 2)
 
     overdispersed = (variance > expected * 1.001) & (expected > 0.0)
 
@@ -367,12 +406,14 @@ def get_probability_distribution(
 
     Falls back to parametric / bootstrap when none of the above apply.
     """
-    # Hard cap: no single leg can ever exceed 85% to account for unknown unknowns
-    # (unexpected hot games, stale lines, last-minute lineup changes, etc.)
-    _MAX_SINGLE_PROB = 0.85
+    # Dynamic cap: scale by how far the line is from the mean.
+    # Extreme mismatches (e.g. 28-pt scorer on a 15.5 line) can express
+    # higher confidence, but we still cap to guard against unknown unknowns.
+    _z = abs(mean - line) / max(mean * 0.3, 1.0) if mean > 0 else 0.0
+    _MAX_SINGLE_PROB = min(0.75 + _z * 0.05, 0.93)
 
     if mean <= 0:
-        return {"prob_over": 0.0, "prob_under": min(1.0, _MAX_SINGLE_PROB)}
+        return {"prob_over": 0.0, "prob_under": min(1.0, 0.75)}
 
     def _cap(result: Dict[str, float]) -> Dict[str, float]:
         return {
@@ -512,4 +553,122 @@ def project_game_markets(
         'away_cover': float(np.clip(away_cover, 0.0, 1.0)),
         'over':       float(np.clip(prob_over,  0.0, 1.0)),
         'under':      float(np.clip(prob_under, 0.0, 1.0)),
+    }
+
+
+# ── Q1 / 1H game-market projections ──────────────────────────────────────────
+# Q1 has no blowout risk and negligible foul-trouble variance, so std devs are
+# much tighter than full-game.  Empirical NBA Q1 margins: σ ≈ 5–6 pts.
+
+_Q1_MARGIN_STD = 5.5   # Q1 score-margin std dev
+_Q1_TOTAL_STD  = 3.5   # Q1 combined-total std dev
+
+
+def project_q1_markets(
+    home_q1_expected: float,
+    away_q1_expected: float,
+    book_q1_spread: float,
+    book_q1_total: float,
+) -> Dict[str, float]:
+    """
+    Project true probabilities for Q1 Moneyline, Spread, and Total markets.
+
+    Parameters
+    ----------
+    home_q1_expected : Pace-adjusted Q1 projected score, home team (≈ full_game * 0.25).
+    away_q1_expected : Same for away team.
+    book_q1_spread   : Q1 home-team spread (negative = home favored).
+    book_q1_total    : Q1 combined over/under total.
+
+    Returns the same keys as project_game_markets: home_win, away_win,
+    home_cover, away_cover, over, under.
+    """
+    expected_margin = away_q1_expected - home_q1_expected
+    expected_total  = home_q1_expected + away_q1_expected
+
+    # ── Moneyline ─────────────────────────────────────────────────────────────
+    home_win = float(norm.cdf(0.0, loc=expected_margin, scale=_Q1_MARGIN_STD))
+    away_win = 1.0 - home_win
+
+    # ── Spread ────────────────────────────────────────────────────────────────
+    is_whole_spread = book_q1_spread != 0.0 and abs(book_q1_spread - round(book_q1_spread)) < 0.01
+    if is_whole_spread:
+        push_prob  = float(
+            norm.cdf(book_q1_spread + 0.5, loc=expected_margin, scale=_Q1_MARGIN_STD)
+            - norm.cdf(book_q1_spread - 0.5, loc=expected_margin, scale=_Q1_MARGIN_STD)
+        )
+        raw_home   = float(norm.cdf(book_q1_spread - 0.5, loc=expected_margin, scale=_Q1_MARGIN_STD))
+        raw_away   = 1.0 - float(norm.cdf(book_q1_spread + 0.5, loc=expected_margin, scale=_Q1_MARGIN_STD))
+        denom      = max(1.0 - push_prob, 1e-6)
+        home_cover = raw_home / denom
+        away_cover = raw_away / denom
+    else:
+        home_cover = float(norm.cdf(book_q1_spread, loc=expected_margin, scale=_Q1_MARGIN_STD))
+        away_cover = 1.0 - home_cover
+
+    # ── Total ─────────────────────────────────────────────────────────────────
+    is_whole_total = book_q1_total > 0.0 and abs(book_q1_total - round(book_q1_total)) < 0.01
+    if is_whole_total:
+        push_prob  = float(
+            norm.cdf(book_q1_total + 0.5, loc=expected_total, scale=_Q1_TOTAL_STD)
+            - norm.cdf(book_q1_total - 0.5, loc=expected_total, scale=_Q1_TOTAL_STD)
+        )
+        raw_over   = 1.0 - float(norm.cdf(book_q1_total + 0.5, loc=expected_total, scale=_Q1_TOTAL_STD))
+        raw_under  = float(norm.cdf(book_q1_total - 0.5, loc=expected_total, scale=_Q1_TOTAL_STD))
+        denom      = max(1.0 - push_prob, 1e-6)
+        prob_over  = raw_over  / denom
+        prob_under = raw_under / denom
+    else:
+        prob_over  = 1.0 - float(norm.cdf(book_q1_total, loc=expected_total, scale=_Q1_TOTAL_STD))
+        prob_under = float(norm.cdf(book_q1_total, loc=expected_total, scale=_Q1_TOTAL_STD))
+
+    return {
+        'home_win':   home_win,
+        'away_win':   away_win,
+        'home_cover': float(np.clip(home_cover, 0.0, 1.0)),
+        'away_cover': float(np.clip(away_cover, 0.0, 1.0)),
+        'over':       float(np.clip(prob_over,  0.0, 1.0)),
+        'under':      float(np.clip(prob_under, 0.0, 1.0)),
+    }
+
+
+# ── Team totals projections ───────────────────────────────────────────────────
+# Betting a single team's score isolates the edge and removes the opponent's
+# offensive variance entirely.  Empirical NBA team-score std dev ≈ 8–9 pts.
+
+_TEAM_TOTAL_STD = 8.5
+
+
+def project_team_totals(
+    team_expected_score: float,
+    book_team_total: float,
+) -> Dict[str, float]:
+    """
+    Project Over/Under probabilities for a single team's total.
+
+    Parameters
+    ----------
+    team_expected_score : Pace-and-defense-adjusted projected score for the team.
+    book_team_total     : The book's posted team total line.
+
+    Returns {'over': p, 'under': p}.
+    """
+    is_whole = book_team_total > 0.0 and abs(book_team_total - round(book_team_total)) < 0.01
+    if is_whole:
+        push_prob  = float(
+            norm.cdf(book_team_total + 0.5, loc=team_expected_score, scale=_TEAM_TOTAL_STD)
+            - norm.cdf(book_team_total - 0.5, loc=team_expected_score, scale=_TEAM_TOTAL_STD)
+        )
+        raw_over   = 1.0 - float(norm.cdf(book_team_total + 0.5, loc=team_expected_score, scale=_TEAM_TOTAL_STD))
+        raw_under  = float(norm.cdf(book_team_total - 0.5, loc=team_expected_score, scale=_TEAM_TOTAL_STD))
+        denom      = max(1.0 - push_prob, 1e-6)
+        prob_over  = raw_over  / denom
+        prob_under = raw_under / denom
+    else:
+        prob_over  = 1.0 - float(norm.cdf(book_team_total, loc=team_expected_score, scale=_TEAM_TOTAL_STD))
+        prob_under = float(norm.cdf(book_team_total, loc=team_expected_score, scale=_TEAM_TOTAL_STD))
+
+    return {
+        'over':  float(np.clip(prob_over,  0.0, 1.0)),
+        'under': float(np.clip(prob_under, 0.0, 1.0)),
     }

@@ -2,16 +2,21 @@ from src.clients.odds_api import OddsApiClient
 from src.data.db import DatabaseClient
 from src.utils.logging_utils import get_logger
 from datetime import datetime
+from typing import List, Dict, Any, Optional
 import dateutil.parser
 
 logger = get_logger(__name__)
 
-def sync_events():
+def sync_events(prefetched_events: Optional[List[Dict[str, Any]]] = None):
     client = OddsApiClient()
     db = DatabaseClient()
-    
-    events = client.get_events()
-    logger.info(f"Fetched {len(events)} events.")
+
+    if prefetched_events is not None:
+        events = prefetched_events
+        logger.info(f"sync_events: using {len(events)} pre-fetched events (0 credits).")
+    else:
+        events = client.get_events()
+        logger.info(f"Fetched {len(events)} events.")
     
     with db.get_conn() as conn:
         cursor = conn.cursor()

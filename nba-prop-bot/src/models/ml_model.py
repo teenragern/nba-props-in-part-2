@@ -5,7 +5,7 @@ Trains one XGBRegressor per market (points/rebounds/assists/threes) on
 historical player game logs. Predictions are blended 50/50 with the
 Bayesian model in scan_props.py.
 
-Feature vector per game prediction (32 features):
+Feature vector per game prediction (35 features):
   Base rates:
     rate_5g               per-minute rate over last 5 games
     rate_10g              per-minute rate over last 10 games
@@ -37,9 +37,12 @@ Feature vector per game prediction (32 features):
   BDL season profile — tracking + playtype (real at inference; 0 during training):
     avg_touches           per-game ball touches (BDL V2 advanced)
     pnr_bh_freq           PnR ball-handler play frequency (BDL playtype/prballhandler)
+    pnr_roll_freq         PnR roll-man play frequency (BDL playtype/prrollman) — bigs near basket
     iso_freq              isolation play frequency (BDL playtype/isolation)
     spotup_freq           spot-up play frequency (BDL playtype/spotup)
     transition_freq       transition play frequency (BDL playtype/transition)
+    postup_freq           post-up play frequency (BDL playtype/postup) — big men paint scoring
+    drives_per_game       drives per game (BDL tracking/drives) — penetration/FTA/AST proxy
   BDL V2 advanced tracking (real at inference; 0 during training):
     avg_speed             average court speed mph (BDL V2 advanced)
     avg_contested_fg_pct  contested FG% — shot-difficulty proxy (BDL V2 advanced)
@@ -89,10 +92,13 @@ FEATURE_NAMES = [
     'opp_def_rating', 'pace_factor',
     'opp_pace', 'opp_rebound_pct', 'opp_pts_paint',
     # BDL season profile: tracking + playtype (real at inference, 0.0 at training)
-    'avg_touches', 'pnr_bh_freq', 'iso_freq', 'spotup_freq', 'transition_freq',
+    'avg_touches', 'pnr_bh_freq', 'pnr_roll_freq', 'iso_freq', 'spotup_freq',
+    'transition_freq', 'postup_freq', 'drives_per_game',
     # BDL V2 advanced tracking (real at inference, 0.0 at training)
     'avg_speed', 'avg_contested_fg_pct', 'avg_deflections',
     'avg_points_paint', 'avg_pct_pts_paint',
+    # Foul rate: per-minute foul rate from recent logs (minutes variance signal)
+    'player_foul_rate',
 ]
 
 # Opponent stat column per market (mirrors nba_stats._MARKET_OPP_COL)
@@ -225,16 +231,20 @@ class PropMLModel:
                        real_usage_pct: float = 0.0,
                        avg_touches: float = 0.0,
                        pnr_bh_freq: float = 0.0,
+                       pnr_roll_freq: float = 0.0,
                        iso_freq: float = 0.0,
                        spotup_freq: float = 0.0,
                        transition_freq: float = 0.0,
+                       postup_freq: float = 0.0,
+                       drives_per_game: float = 0.0,
                        ts_pct: float = 0.0,
                        # BDL V2 advanced tracking (real at inference; 0 at training)
                        avg_speed: float = 0.0,
                        avg_contested_fg_pct: float = 0.0,
                        avg_deflections: float = 0.0,
                        avg_points_paint: float = 0.0,
-                       avg_pct_pts_paint: float = 0.0) -> Optional[Dict]:
+                       avg_pct_pts_paint: float = 0.0,
+                       player_foul_rate: float = 0.0) -> Optional[Dict]:
         """Build feature dict from game logs. Returns None if insufficient data."""
         if logs.empty or len(logs) < 3:
             return None
@@ -278,15 +288,20 @@ class PropMLModel:
             # BDL season profile: 0.0 during training; real values at inference
             'avg_touches':           float(avg_touches),
             'pnr_bh_freq':           float(pnr_bh_freq),
+            'pnr_roll_freq':         float(pnr_roll_freq),
             'iso_freq':              float(iso_freq),
             'spotup_freq':           float(spotup_freq),
             'transition_freq':       float(transition_freq),
+            'postup_freq':           float(postup_freq),
+            'drives_per_game':       float(drives_per_game),
             # BDL V2 advanced tracking: 0.0 during training; real values at inference
             'avg_speed':             float(avg_speed),
             'avg_contested_fg_pct':  float(avg_contested_fg_pct),
             'avg_deflections':       float(avg_deflections),
             'avg_points_paint':      float(avg_points_paint),
             'avg_pct_pts_paint':     float(avg_pct_pts_paint),
+            # Foul rate: higher → more minutes variance (foul trouble risk)
+            'player_foul_rate':      float(player_foul_rate),
         }
 
     def build_training_data(self, logs: pd.DataFrame,
@@ -368,10 +383,20 @@ class PropMLModel:
             prev_matchup = str(chron.iloc[i - 1].get('MATCHUP', ''))
             t_miles, t_tz, t_alt = travel_features_for_game(matchup, prev_matchup, own_abbr)
 
+            # Compute player foul rate from history for training
+            _hist_foul_rate = 0.0
+            if 'PF' in history.columns and 'MIN' in history.columns:
+                _h5 = history.head(5)
+                _h5_min = _h5['MIN'].sum()
+                if _h5_min > 0:
+                    _h5_pf = _h5['PF'].fillna(0).sum()
+                    _hist_foul_rate = float(_h5_pf / _h5_min)
+
             feats = self.build_features(
                 history, is_home, rest, opp_def, pace,
                 opp_pace_norm, opp_reb_pct, opp_paint,
                 travel_miles=t_miles, tz_shift_hours=t_tz, altitude_flag=t_alt,
+                player_foul_rate=_hist_foul_rate,
             )
             if feats is None:
                 continue
@@ -447,16 +472,20 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
                       real_usage_pct: float = 0.0,
                       avg_touches: float = 0.0,
                       pnr_bh_freq: float = 0.0,
+                      pnr_roll_freq: float = 0.0,
                       iso_freq: float = 0.0,
                       spotup_freq: float = 0.0,
                       transition_freq: float = 0.0,
+                      postup_freq: float = 0.0,
+                      drives_per_game: float = 0.0,
                       ts_pct: float = 0.0,
                       # BDL V2 advanced tracking features
                       avg_speed: float = 0.0,
                       avg_contested_fg_pct: float = 0.0,
                       avg_deflections: float = 0.0,
                       avg_points_paint: float = 0.0,
-                      avg_pct_pts_paint: float = 0.0) -> Optional[float]:
+                      avg_pct_pts_paint: float = 0.0,
+                      player_foul_rate: float = 0.0) -> Optional[float]:
     """
     Public API: return ML mean projection for a player/market.
     Returns None if model is untrained or data insufficient.
@@ -476,12 +505,14 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
 
     _bdl_kwargs = dict(
         real_usage_pct=real_usage_pct, avg_touches=avg_touches,
-        pnr_bh_freq=pnr_bh_freq, iso_freq=iso_freq,
-        spotup_freq=spotup_freq, transition_freq=transition_freq,
-        ts_pct=ts_pct,
+        pnr_bh_freq=pnr_bh_freq, pnr_roll_freq=pnr_roll_freq,
+        iso_freq=iso_freq, spotup_freq=spotup_freq,
+        transition_freq=transition_freq, postup_freq=postup_freq,
+        drives_per_game=drives_per_game, ts_pct=ts_pct,
         avg_speed=avg_speed, avg_contested_fg_pct=avg_contested_fg_pct,
         avg_deflections=avg_deflections, avg_points_paint=avg_points_paint,
         avg_pct_pts_paint=avg_pct_pts_paint,
+        player_foul_rate=player_foul_rate,
     )
     _travel_kwargs = dict(travel_miles=travel_miles, tz_shift_hours=tz_shift_hours,
                           altitude_flag=altitude_flag)

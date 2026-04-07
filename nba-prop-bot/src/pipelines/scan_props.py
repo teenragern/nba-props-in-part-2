@@ -36,7 +36,8 @@ from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
 from src.config import (
-    PROP_MARKETS, EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN,
+    PROP_MARKETS, ALT_PROP_MARKETS, ALT_TO_BASE_MARKET,
+    EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN,
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
 )
@@ -46,6 +47,8 @@ from src.models.distributions import (
     compute_player_foul_rate,
     classify_bench_tier,
     project_game_markets,
+    project_q1_markets,
+    project_team_totals,
 )
 from src.models.devig import (
     decimal_to_implied_prob, devig_two_way, devig_shin,
@@ -53,8 +56,8 @@ from src.models.devig import (
 )
 from src.models.edge_ranker import rank_edges, set_db as set_ranker_db
 from src.models.ml_model import get_ml_projection
-from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert
-from src.pipelines.combos import generate_and_alert_combos
+from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert, send_line_disagreement_alert
+from src.pipelines.combos import generate_and_alert_combos, generate_slate_ultimate, generate_four_leg_parlays
 from src.models.sgp_correlations import build_team_correlation_matrix
 from src.clients.on_off_splits import OnOffSplitsClient
 from src.clients.rotation_model import RotationModel
@@ -78,6 +81,17 @@ _SHARP_RECENT_SEC    = 120
 
 # Game markets are highly efficient — require a stricter edge threshold.
 _GAME_MARKET_EDGE_MIN = 0.015  # 1.5 %
+
+# ── Credit-conservation: events TTL cache ─────────────────────────────────────
+# get_events() costs 1 credit. Between 90-min scans the event list is
+# essentially static. Cache it for up to 45 minutes so consecutive scans
+# (or breaking-news triggered scans) reuse the same fetch.
+_EVENTS_CACHE: Dict[str, Any] = {'data': [], 'fetched_at': None}
+_EVENTS_CACHE_TTL_SEC = 5400  # 90 minutes — matches scan interval
+
+# Only fetch sharp Pinnacle odds when the game tips off within this window.
+# Saves 1 Odds API credit per out-of-window game per scan.
+_TIP_OFF_SHARP_HOURS = 4  # was 6 — Pinnacle barely moves 4-6h out
 
 
 def _get_team_adv_row(df, team_name: str):
@@ -142,6 +156,127 @@ def _team_fatigue_mult(team_abbr: str, home_arena_abbr: str) -> float:
         penalty += 0.02
 
     return round(max(0.93, 1.0 - penalty), 4)
+
+
+# ── Rest asymmetry ────────────────────────────────────────────────────────
+# NBA fatigue is relative: a B2B team vs. a 3-day-rest team is far worse
+# than two B2B teams facing each other.  The schedule delta drives edges
+# the current travel-fatigue model misses entirely.
+
+_REST_CACHE: Dict[str, int] = {}   # team_name → rest_days (per-scan)
+
+
+def _get_team_rest_days(team_name: str) -> int:
+    """
+    Return days of rest for a team before tonight's game.
+    Uses nba_api TeamGameLog (cached per scan to avoid repeated calls).
+    0 = back-to-back, 1 = one day off, etc.  Default 2 if lookup fails.
+    """
+    if team_name in _REST_CACHE:
+        return _REST_CACHE[team_name]
+
+    rest = 2  # safe default
+    try:
+        import pandas as pd
+        from nba_api.stats.endpoints import teamgamelog
+        from nba_api.stats.static import teams as nba_teams
+
+        # Resolve team ID from name
+        matches = [t for t in nba_teams.get_teams()
+                   if t['full_name'].lower() == team_name.lower()]
+        if not matches:
+            last = team_name.lower().split()[-1]
+            matches = [t for t in nba_teams.get_teams()
+                       if last in t['full_name'].lower()]
+        if not matches:
+            _REST_CACHE[team_name] = rest
+            return rest
+
+        time.sleep(0.6)
+        tgl = teamgamelog.TeamGameLog(
+            team_id=matches[0]['id'],
+            season_type_all_star='Regular Season',
+        )
+        df = tgl.get_data_frames()[0]
+        if not df.empty and 'GAME_DATE' in df.columns:
+            last_game = pd.to_datetime(df.iloc[0]['GAME_DATE'])
+            today = pd.Timestamp.today().normalize()
+            rest = max(0, int((today - last_game).days) - 1)
+    except Exception:
+        pass
+
+    _REST_CACHE[team_name] = rest
+    return rest
+
+
+def compute_rest_asymmetry(
+    home_team: str, away_team: str,
+) -> Dict[str, Any]:
+    """
+    Compute the rest advantage for game-market and player-prop adjustments.
+
+    Returns:
+        home_rest:     int   — home team rest days
+        away_rest:     int   — away team rest days
+        rest_delta:    int   — home_rest - away_rest (positive = home more rested)
+        home_off_mult: float — offensive rating multiplier for home team
+        home_def_mult: float — defensive rating multiplier for home team
+        away_off_mult: float — offensive rating multiplier for away team
+        away_def_mult: float — defensive rating multiplier for away team
+    """
+    home_rest = _get_team_rest_days(home_team)
+    away_rest = _get_team_rest_days(away_team)
+    delta = home_rest - away_rest   # positive = home advantage
+
+    # Base: no adjustment when rest is symmetric
+    h_off, h_def = 1.0, 1.0
+    a_off, a_def = 1.0, 1.0
+
+    # Asymmetry tiers.  Each expected-score line absorbs ONE offensive
+    # multiplier and ONE defensive multiplier (they compound), so keep
+    # each factor modest.  Historical NBA B2B-vs-rested data shows a
+    # ~3-5 point net swing.  With two ~110-pt teams:
+    #   |delta| >= 3  →  ±2.5% each → ~5.4 pt swing per team, ~10.8 net
+    #   |delta| == 2  →  ±1.5% each → ~3.3 pt swing per team, ~6.6 net
+    #   |delta| == 1  →  ±0.7% each → ~1.5 pt swing per team, ~3.1 net
+    abs_delta = abs(delta)
+
+    if abs_delta >= 3:
+        off_boost, def_degrade = 1.025, 1.025
+    elif abs_delta == 2:
+        off_boost, def_degrade = 1.015, 1.015
+    elif abs_delta == 1:
+        off_boost, def_degrade = 1.007, 1.007
+    else:
+        return {
+            'home_rest': home_rest, 'away_rest': away_rest,
+            'rest_delta': delta,
+            'home_off_mult': 1.0, 'home_def_mult': 1.0,
+            'away_off_mult': 1.0, 'away_def_mult': 1.0,
+        }
+
+    if delta > 0:
+        # Home is more rested
+        h_off = off_boost           # home offense sharper
+        a_def = def_degrade         # away defense degraded (higher = worse)
+        a_off = 1.0 / off_boost    # tired away offense sluggish
+        h_def = 1.0 / def_degrade  # rested home defense tighter (lower = better)
+    else:
+        # Away is more rested — mirror
+        a_off = off_boost
+        h_def = def_degrade
+        h_off = 1.0 / off_boost
+        a_def = 1.0 / def_degrade
+
+    return {
+        'home_rest': home_rest, 'away_rest': away_rest,
+        'rest_delta': delta,
+        'home_off_mult': round(h_off, 4),
+        'home_def_mult': round(h_def, 4),
+        'away_off_mult': round(a_off, 4),
+        'away_def_mult': round(a_def, 4),
+    }
+
 
 # ─── BDL integration (conditional import) ─────────────────────────────
 
@@ -342,6 +477,132 @@ def _get_best_bdl_odds(
     return best_over, best_under
 
 
+# ─── Sharp line disagreement detection ────────────────────────────────
+
+_SHARP_LINE_BOOKS = {'pinnacle', 'circa', 'bookmaker'}
+_SOFT_LINE_BOOKS  = {'draftkings', 'fanduel', 'betmgm', 'caesars',
+                     'pointsbet', 'betrivers', 'unibet'}
+_MIN_LINE_GAP     = 1.0   # full integer (e.g. 9.5 vs 10.5)
+
+
+def _build_book_line_map(
+    line_records: List[tuple],
+    sharp_bookmakers: Optional[List[Dict]] = None,
+) -> Dict[tuple, Dict[str, set]]:
+    """
+    Build {(player, market) → {book_lower: set_of_lines}} from all sources.
+
+    Each book can offer multiple lines for the same player/market (main +
+    alternates).  We collect all of them so the disagreement detector can
+    identify the primary line per book.
+    """
+    book_lines: Dict[tuple, Dict[str, set]] = {}
+
+    for rec in line_records:
+        player, market, book, line_val = rec[0], rec[1], rec[2], rec[3]
+        key = (player, market)
+        book_lines.setdefault(key, {}).setdefault(book.lower(), set()).add(line_val)
+
+    if sharp_bookmakers:
+        for book in sharp_bookmakers:
+            bname = book.get('title', '').lower()
+            if bname not in _SHARP_LINE_BOOKS:
+                continue
+            for mkt in book.get('markets', []):
+                mkt_key = mkt.get('key', '')
+                for outcome in mkt.get('outcomes', []):
+                    player = outcome.get('description')
+                    line_val = outcome.get('point')
+                    if player and line_val is not None:
+                        key = (player, mkt_key)
+                        book_lines.setdefault(key, {}).setdefault(bname, set()).add(line_val)
+
+    return book_lines
+
+
+def detect_line_disagreements(
+    line_records: List[tuple],
+    sharp_bookmakers: Optional[List[Dict]],
+    home_team: str, away_team: str, game_date: str, event_id: str,
+    db, bot,
+):
+    """
+    Scan for cases where a sharp book's line differs from a soft book's by
+    >= 1 full point.  Fire a priority alert for each disagreement.
+
+    Example: Pinnacle has Rebounds @ 9.5, DraftKings has Rebounds @ 10.5
+             → alert UNDER 10.5 on DraftKings.
+    """
+    book_lines = _build_book_line_map(line_records, sharp_bookmakers)
+    alerted: set = set()
+
+    for (player, market), books in book_lines.items():
+        sharp_books = {b: lines for b, lines in books.items() if b in _SHARP_LINE_BOOKS}
+        soft_books  = {b: lines for b, lines in books.items() if b in _SOFT_LINE_BOOKS}
+
+        if not sharp_books or not soft_books:
+            continue
+
+        # Reference sharp line: use Pinnacle if available.
+        # Take the line closest to the center of the market (most books
+        # will converge here) — i.e. pick the line that also appears in
+        # the most soft books.  If ambiguous, take the lowest (sharp
+        # books move down first when adjusting).
+        if 'pinnacle' in sharp_books:
+            ref_sharp_book = 'pinnacle'
+            ref_sharp_lines = sharp_books['pinnacle']
+        else:
+            ref_sharp_book = next(iter(sharp_books))
+            ref_sharp_lines = sharp_books[ref_sharp_book]
+
+        # If Pinnacle offers multiple lines (main + alts), use the one
+        # that most soft books also offer — that's the "main" line.
+        # Fallback: the minimum (sharps tend to shade low).
+        all_soft_lines = set()
+        for sl in soft_books.values():
+            all_soft_lines.update(sl)
+
+        shared = ref_sharp_lines & all_soft_lines
+        ref_sharp_line = min(shared) if shared else min(ref_sharp_lines)
+
+        for soft_book, soft_line_set in soft_books.items():
+            for soft_line in soft_line_set:
+                gap = soft_line - ref_sharp_line
+
+                if abs(gap) < _MIN_LINE_GAP:
+                    continue
+
+                # If soft_line > sharp_line → UNDER on soft book
+                # If soft_line < sharp_line → OVER on soft book
+                side = "UNDER" if gap > 0 else "OVER"
+
+                dedup_key = (player, market, soft_book, side)
+                if dedup_key in alerted:
+                    continue
+                alerted.add(dedup_key)
+
+                # Look up the best price on the soft book for this line+side
+                soft_odds = 1.91  # default -110 if we can't find exact price
+                for rec in line_records:
+                    r_player, r_mkt, r_book, r_line, r_side, r_price, _ = rec
+                    if (r_player == player and r_mkt == market
+                            and r_book.lower() == soft_book
+                            and abs(r_line - soft_line) < 0.01
+                            and r_side.upper() == side
+                            and r_price > soft_odds):
+                        soft_odds = r_price
+
+                send_line_disagreement_alert(
+                    player=player, market=market,
+                    sharp_book=ref_sharp_book.title(), sharp_line=ref_sharp_line,
+                    soft_book=soft_book.title(), soft_line=soft_line,
+                    side=side, soft_odds=soft_odds,
+                    game_date=game_date, event_id=event_id,
+                    home_team=home_team, away_team=away_team,
+                    db=db, _bot=bot,
+                )
+
+
 def _sync_injuries_bdl(db: DatabaseClient, game_date: str):
     """Sync injuries from BDL (structured API — no scraping)."""
     injuries = _bdl_bridge.get_injuries_for_date()
@@ -389,6 +650,7 @@ def _sync_injuries_legacy(db: DatabaseClient, injury_client: InjuryClient, game_
 # ─── Main scan pipeline ──────────────────────────────────────────────
 
 def scan_props():
+    _REST_CACHE.clear()  # fresh team-rest lookups each scan cycle
     logger.info(f"Initializing scan pipeline ({'BDL+Sharp' if BDL_ENABLED_RUNTIME else 'Odds API only'})...")
 
     db             = DatabaseClient()
@@ -417,7 +679,20 @@ def scan_props():
     odds_events = []
     odds_map = {}
     try:
-        events = odds_client.get_events()
+        # Use cached event list if still fresh — saves 1 credit per scan.
+        now_utc = datetime.now(timezone.utc)
+        cache_age = (
+            (now_utc - _EVENTS_CACHE['fetched_at']).total_seconds()
+            if _EVENTS_CACHE['fetched_at'] else float('inf')
+        )
+        if cache_age < _EVENTS_CACHE_TTL_SEC and _EVENTS_CACHE['data']:
+            events = _EVENTS_CACHE['data']
+            logger.info(f"Events cache hit ({cache_age:.0f}s old) — skipping get_events() call.")
+        else:
+            events = odds_client.get_events()
+            _EVENTS_CACHE['data'] = events
+            _EVENTS_CACHE['fetched_at'] = now_utc
+            logger.info(f"Events cache refreshed ({len(events)} events).")
         odds_events = [
             e for e in events
             if dateutil.parser.isoparse(e['commence_time'])
@@ -483,19 +758,38 @@ def scan_props():
             bdl_player_map   = bdl_data["player_id_map"]
 
             # Insert line history
-            if bdl_data["line_records"]:
-                db.insert_line_history_batch(bdl_data["line_records"])
+            _all_line_records = bdl_data["line_records"]
+            if _all_line_records:
+                db.insert_line_history_batch(_all_line_records)
 
-            # Fetch sharp books from Odds API (1 credit per game — Pinnacle only)
+            # Fetch sharp books from Odds API (1 credit per game — Pinnacle only).
+            # Skip if the game is more than _TIP_OFF_SHARP_HOURS away — sharp
+            # lines barely move that far out, and this is the largest single
+            # source of credit waste on morning/afternoon scans.
             sharp_bookmakers = []
-            try:
-                sharp_odds = odds_client.get_event_odds(
-                    event_id=event_id,
-                    markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals']
+            _tip_hours_away = float('inf')
+            if commence_str:
+                try:
+                    _tip_dt = dateutil.parser.isoparse(commence_str).astimezone(local_zone)
+                    _tip_hours_away = (
+                        _tip_dt - datetime.now(local_zone)
+                    ).total_seconds() / 3600
+                except Exception:
+                    pass
+            if _tip_hours_away <= _TIP_OFF_SHARP_HOURS:
+                try:
+                    sharp_odds = odds_client.get_event_odds(
+                        event_id=event_id,
+                        markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals', 'team_totals']
+                    )
+                    sharp_bookmakers = sharp_odds.get('bookmakers', [])
+                except Exception as _se:
+                    logger.debug(f"Sharp book fetch skipped for {event_id}: {_se}")
+            else:
+                logger.info(
+                    f"Skipping Odds API fetch for {home_team} vs {away_team} "
+                    f"({_tip_hours_away:.1f}h to tip — outside {_TIP_OFF_SHARP_HOURS}h window)."
                 )
-                sharp_bookmakers = sharp_odds.get('bookmakers', [])
-            except Exception as _se:
-                logger.debug(f"Sharp book fetch skipped for {event_id}: {_se}")
 
             # Game context from BDL odds (spreads/totals)
             _ctx = bdl_odds_ctx.get(bdl_game_id, {})
@@ -521,7 +815,7 @@ def scan_props():
             try:
                 odds_data = odds_client.get_event_odds(
                     event_id=event_id,
-                    markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals']
+                    markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals', 'team_totals']
                 )
             except Exception:
                 continue
@@ -537,10 +831,10 @@ def scan_props():
 
             players_in_event = set()
             prices_by_market = {}
+            _all_line_records = []
 
             for mkt in PROP_MARKETS:
                 prices_by_market[mkt] = {}
-                line_records = []
                 for book in bookmakers:
                     for book_mkt in book.get('markets', []):
                         if book_mkt['key'] != mkt:
@@ -555,11 +849,46 @@ def scan_props():
                             side  = outcome.get('name', '').upper()
                             price = outcome.get('price', 0.0)
                             if price > 0:
-                                line_records.append(
+                                _all_line_records.append(
                                     (player, mkt, book.get('title'), line, side, price, 1.0 / price)
                                 )
-                if line_records:
-                    db.insert_line_history_batch(line_records)
+            if _all_line_records:
+                db.insert_line_history_batch(_all_line_records)
+
+        # ── Collect alt-lines from sharp bookmakers ───────────────────
+        # Alt-lines are sourced from Pinnacle (already fetched above at 0 extra
+        # credits).  We only process alt-lines for players already known to be
+        # in the event — avoids pulling game-logs for players with no main-line prop.
+        if sharp_bookmakers:
+            for _alt_mkt in ALT_PROP_MARKETS:
+                if _alt_mkt not in prices_by_market:
+                    prices_by_market[_alt_mkt] = {}
+                for _bk in sharp_bookmakers:
+                    for _bk_mkt in _bk.get('markets', []):
+                        if _bk_mkt.get('key') != _alt_mkt:
+                            continue
+                        for _oc in _bk_mkt.get('outcomes', []):
+                            _p   = _oc.get('description')
+                            _ln  = _oc.get('point')
+                            if not _p or _ln is None:
+                                continue
+                            # Only attach alt-lines for players already in event
+                            if _p not in players_in_event:
+                                continue
+                            prices_by_market[_alt_mkt].setdefault(_p, set()).add(float(_ln))
+
+        # ── Sharp line disagreement scan ──────────────────────────────
+        # Detect when Pinnacle/Circa have moved to a different line than
+        # DraftKings/FanDuel etc. A full-integer gap is free money.
+        if _all_line_records or sharp_bookmakers:
+            try:
+                detect_line_disagreements(
+                    _all_line_records, sharp_bookmakers,
+                    home_team, away_team, game_date, event_id,
+                    db=db, bot=bot,
+                )
+            except Exception as _ld_err:
+                logger.debug(f"Line disagreement scan failed: {_ld_err}")
 
         # ── Hours to tip-off ──────────────────────────────────────────
         _hours_to_tip = 4.0
@@ -578,6 +907,36 @@ def scan_props():
         # ── Referee whistle factor ────────────────────────────────────
         _event_refs  = match_event_refs(home_team, away_team, _all_ref_assignments)
         _crew_factor = get_crew_foul_factor(_event_refs, db)
+
+        # ── Foul-trouble cascade signal ───────────────────────────────
+        # When the opponent draws fouls at a top-5 rate (opp_fta_rate ≥ 1.08)
+        # OR the crew has a tight whistle, the starting Center faces elevated
+        # foul-trouble risk.  Cascade: starter C minutes × 0.85, backup C × 1.30.
+        #
+        # Compute per-side: a home player's opponent is the away team and v.v.
+        _home_opp_ctx = stats_client.get_opponent_matchup_context(away_team)
+        _away_opp_ctx = stats_client.get_opponent_matchup_context(home_team)
+        _crew_foul_mult = _crew_factor.get("foul_rate_multiplier", 1.0)
+        _tight_whistle  = _crew_factor.get("tight_whistle", False)
+
+        # Combined foul-pressure signal: opponent foul-draw rate × crew whistle
+        _home_foul_pressure = _home_opp_ctx.get('opp_fta_rate', 1.0) * _crew_foul_mult
+        _away_foul_pressure = _away_opp_ctx.get('opp_fta_rate', 1.0) * _crew_foul_mult
+
+        # Cascade activates when combined pressure ≥ 1.08 (top ~5 teams)
+        # OR when tight whistle alone pushes it over threshold.
+        _FOUL_CASCADE_THRESHOLD = 1.08
+        _home_foul_cascade = _home_foul_pressure >= _FOUL_CASCADE_THRESHOLD
+        _away_foul_cascade = _away_foul_pressure >= _FOUL_CASCADE_THRESHOLD
+
+        if _home_foul_cascade or _away_foul_cascade:
+            logger.info(
+                f"Foul-cascade signal: "
+                f"home={_home_foul_pressure:.3f} ({'ACTIVE' if _home_foul_cascade else 'off'}), "
+                f"away={_away_foul_pressure:.3f} ({'ACTIVE' if _away_foul_cascade else 'off'}) "
+                f"| crew_mult={_crew_foul_mult:.3f} tight={_tight_whistle} "
+                f"| {home_team} vs {away_team}"
+            )
 
         # ── Cross-player correlations ─────────────────────────────────
         for _team in (home_team, away_team):
@@ -615,8 +974,29 @@ def scan_props():
                         pass
             _out_player_avg_mins = min(_out_player_avg_mins, 40.0)
 
+        # ── Role-shift: identify OUT primary initiators ──────────────
+        _out_initiator_ids: List[int] = []
+        for _aid in absent_ids:
+            if db.is_primary_initiator(_aid):
+                _out_initiator_ids.append(_aid)
+        _initiators_out = len(_out_initiator_ids)
+        if _out_initiator_ids:
+            logger.info(
+                f"Role-shift active: {_initiators_out} primary initiator(s) OUT "
+                f"(ids={_out_initiator_ids}) for {home_team} vs {away_team}"
+            )
+
         # ── Pace data ─────────────────────────────────────────────────
         pace_info = stats_client.get_team_pace(home_team, away_team)
+
+        # ── Rest asymmetry ────────────────────────────────────────────
+        _rest_asym = compute_rest_asymmetry(home_team, away_team)
+        if _rest_asym['rest_delta'] != 0:
+            logger.info(
+                f"Rest asymmetry: {home_team} {_rest_asym['home_rest']}d vs "
+                f"{away_team} {_rest_asym['away_rest']}d "
+                f"(delta={_rest_asym['rest_delta']:+d})"
+            )
 
         # BDL standings context (rest risk + blowout risk)
         _standings_ctx = {}
@@ -631,6 +1011,8 @@ def scan_props():
         # Run before the player loop so team-level edges are reported
         # independently of prop availability.  Requires sharp book odds
         # (h2h + spreads + totals) from the Odds API.
+        _home_exp = 0.0
+        _away_exp = 0.0
         if sharp_bookmakers:
             _gm_home_abbr = TEAM_NAME_TO_ABBR.get(home_team, home_team.split()[-1][:3].upper())
             _gm_away_abbr = TEAM_NAME_TO_ABBR.get(away_team, away_team.split()[-1][:3].upper())
@@ -661,6 +1043,11 @@ def scan_props():
                     # Team travel-fatigue multipliers
                     _home_exp *= _team_fatigue_mult(_gm_home_abbr, _gm_home_abbr)
                     _away_exp *= _team_fatigue_mult(_gm_away_abbr, _gm_home_abbr)
+
+                    # Rest asymmetry: rested team's offense sharpens,
+                    # tired team's defense degrades.
+                    _home_exp *= _rest_asym['home_off_mult'] * _rest_asym['away_def_mult']
+                    _away_exp *= _rest_asym['away_off_mult'] * _rest_asym['home_def_mult']
 
                     _book_spread = _home_spread or 0.0
                     _book_total  = _game_total  or 0.0
@@ -694,7 +1081,7 @@ def scan_props():
                                     model_prob=_gm_model_p, book_prob=_gm_book_p,
                                     book_odds=_gm_odds, book=_h2h_book,
                                     game_date=game_date, event_id=event_id,
-                                    line=0.0, db=db, bot=bot,
+                                    line=0.0, db=db, _bot=bot,
                                     home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
                                 )
 
@@ -726,7 +1113,7 @@ def scan_props():
                                         model_prob=_gm_model_p, book_prob=_gm_book_p,
                                         book_odds=_gm_odds, book=_sp_book,
                                         game_date=game_date, event_id=event_id,
-                                        line=_book_spread, db=db, bot=bot,
+                                        line=_book_spread, db=db, _bot=bot,
                                         home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
                                     )
 
@@ -756,12 +1143,184 @@ def scan_props():
                                         model_prob=_gm_model_p, book_prob=_gm_book_p,
                                         book_odds=_gm_odds, book=_tot_book,
                                         game_date=game_date, event_id=event_id,
-                                        line=_book_total, db=db, bot=bot,
+                                        line=_book_total, db=db, _bot=bot,
                                         home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
                                     )
 
             except Exception as _gm_err:
                 logger.warning(f"Game markets scan failed for {_gm_matchup}: {_gm_err}")
+
+        # ── Q1 Markets Scan ───────────────────────────────────────────
+        # Uses the same expected-score math but scaled to 12 minutes (×0.25)
+        # with tighter std devs — no blowout risk, no foul-trouble variance.
+        # Q1 markets are fetched for free inside the existing get_event_odds call.
+        if sharp_bookmakers and _home_exp > 0:
+            try:
+                _q1_home_exp = _home_exp * 0.25
+                _q1_away_exp = _away_exp * 0.25
+
+                # Extract Q1 consensus lines for spread/total anchor
+                _q1_spread = OddsApiClient.extract_consensus_spread(
+                    [b for b in sharp_bookmakers
+                     if any(m.get('key') == 'spreads_q1'
+                            for m in b.get('markets', []))],
+                    home_team
+                ) or 0.0
+                _q1_total = OddsApiClient.extract_consensus_total(
+                    [b for b in sharp_bookmakers
+                     if any(m.get('key') == 'totals_q1'
+                            for m in b.get('markets', []))]
+                ) or 0.0
+
+                if _q1_home_exp > 0 and _q1_away_exp > 0:
+                    _q1_probs = project_q1_markets(
+                        _q1_home_exp, _q1_away_exp, _q1_spread, _q1_total
+                    )
+
+                    # ── Q1 Moneyline ──────────────────────────────────
+                    _q1_h2h = OddsApiClient.extract_q1_h2h_odds(
+                        sharp_bookmakers, home_team, away_team
+                    )
+                    if _q1_h2h:
+                        _q1_hp, _q1_ap, _q1_book = _q1_h2h
+                        _q1_true_h, _q1_true_a = devig_shin(
+                            decimal_to_implied_prob(_q1_hp),
+                            decimal_to_implied_prob(_q1_ap),
+                        )
+                        for _q1_model_p, _q1_book_p, _q1_odds, _q1_side in [
+                            (_q1_probs['home_win'], _q1_true_h, _q1_hp, home_team),
+                            (_q1_probs['away_win'], _q1_true_a, _q1_ap, away_team),
+                        ]:
+                            _q1_edge = _q1_model_p - _q1_book_p
+                            if _q1_edge >= _GAME_MARKET_EDGE_MIN:
+                                _q1_ev = _q1_model_p * (_q1_odds - 1) - (1 - _q1_model_p)
+                                send_game_market_alert(
+                                    home_team=home_team, away_team=away_team,
+                                    home_score=_q1_home_exp, away_score=_q1_away_exp,
+                                    market='h2h_q1', side=_q1_side,
+                                    edge=_q1_edge, ev=_q1_ev,
+                                    model_prob=_q1_model_p, book_prob=_q1_book_p,
+                                    book_odds=_q1_odds, book=_q1_book,
+                                    game_date=game_date, event_id=event_id,
+                                    line=0.0, db=db, _bot=bot,
+                                    home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                )
+
+                    # ── Q1 Spread ─────────────────────────────────────
+                    if _q1_spread != 0.0:
+                        _q1_sp = OddsApiClient.extract_q1_spread_odds_at_line(
+                            sharp_bookmakers, home_team, _q1_spread
+                        )
+                        if _q1_sp:
+                            _q1_sp_hp, _q1_sp_ap, _q1_sp_book = _q1_sp
+                            _q1_true_h, _q1_true_a = devig_shin(
+                                decimal_to_implied_prob(_q1_sp_hp),
+                                decimal_to_implied_prob(_q1_sp_ap),
+                            )
+                            for _q1_model_p, _q1_book_p, _q1_odds, _q1_side in [
+                                (_q1_probs['home_cover'], _q1_true_h, _q1_sp_hp,
+                                 f"{home_team} Q1 {_q1_spread:+.1f}"),
+                                (_q1_probs['away_cover'], _q1_true_a, _q1_sp_ap,
+                                 f"{away_team} Q1 {-_q1_spread:+.1f}"),
+                            ]:
+                                _q1_edge = _q1_model_p - _q1_book_p
+                                if _q1_edge >= _GAME_MARKET_EDGE_MIN:
+                                    _q1_ev = _q1_model_p * (_q1_odds - 1) - (1 - _q1_model_p)
+                                    send_game_market_alert(
+                                        home_team=home_team, away_team=away_team,
+                                        home_score=_q1_home_exp, away_score=_q1_away_exp,
+                                        market='spreads_q1', side=_q1_side,
+                                        edge=_q1_edge, ev=_q1_ev,
+                                        model_prob=_q1_model_p, book_prob=_q1_book_p,
+                                        book_odds=_q1_odds, book=_q1_sp_book,
+                                        game_date=game_date, event_id=event_id,
+                                        line=_q1_spread, db=db, _bot=bot,
+                                        home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                    )
+
+                    # ── Q1 Total ──────────────────────────────────────
+                    if _q1_total > 0.0:
+                        _q1_tot = OddsApiClient.extract_q1_total_odds_at_line(
+                            sharp_bookmakers, _q1_total
+                        )
+                        if _q1_tot:
+                            _q1_tot_op, _q1_tot_up, _q1_tot_book = _q1_tot
+                            _q1_true_o, _q1_true_u = devig_shin(
+                                decimal_to_implied_prob(_q1_tot_op),
+                                decimal_to_implied_prob(_q1_tot_up),
+                            )
+                            for _q1_model_p, _q1_book_p, _q1_odds, _q1_side in [
+                                (_q1_probs['over'],  _q1_true_o, _q1_tot_op, 'Q1 Over'),
+                                (_q1_probs['under'], _q1_true_u, _q1_tot_up, 'Q1 Under'),
+                            ]:
+                                _q1_edge = _q1_model_p - _q1_book_p
+                                if _q1_edge >= _GAME_MARKET_EDGE_MIN:
+                                    _q1_ev = _q1_model_p * (_q1_odds - 1) - (1 - _q1_model_p)
+                                    send_game_market_alert(
+                                        home_team=home_team, away_team=away_team,
+                                        home_score=_q1_home_exp, away_score=_q1_away_exp,
+                                        market='totals_q1', side=_q1_side,
+                                        edge=_q1_edge, ev=_q1_ev,
+                                        model_prob=_q1_model_p, book_prob=_q1_book_p,
+                                        book_odds=_q1_odds, book=_q1_tot_book,
+                                        game_date=game_date, event_id=event_id,
+                                        line=_q1_total, db=db, _bot=bot,
+                                        home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                    )
+
+            except Exception as _q1_err:
+                logger.warning(f"Q1 markets scan failed for {_gm_matchup}: {_q1_err}")
+
+        # ── Team Totals Scan ──────────────────────────────────────────
+        # Isolates each team's expected score independently — removes the
+        # opponent's offensive variance that contaminates game total bets.
+        # Team total std dev (~8.5 pts) is much tighter than game total (14.0).
+        if sharp_bookmakers and _home_exp > 0:
+            try:
+                for _tt_team, _tt_exp in (
+                    (home_team, _home_exp),
+                    (away_team, _away_exp),
+                ):
+                    _tt_line = OddsApiClient.extract_consensus_team_total(
+                        sharp_bookmakers, _tt_team
+                    ) or 0.0
+                    if not _tt_line:
+                        continue
+
+                    _tt_probs = project_team_totals(_tt_exp, _tt_line)
+                    _tt = OddsApiClient.extract_team_total_odds(
+                        sharp_bookmakers, _tt_team, _tt_line
+                    )
+                    if not _tt:
+                        continue
+
+                    _tt_op, _tt_up, _tt_book = _tt
+                    _tt_true_o, _tt_true_u = devig_shin(
+                        decimal_to_implied_prob(_tt_op),
+                        decimal_to_implied_prob(_tt_up),
+                    )
+                    for _tt_model_p, _tt_book_p, _tt_odds, _tt_side in [
+                        (_tt_probs['over'],  _tt_true_o, _tt_op,
+                         f"{_tt_team} Over {_tt_line}"),
+                        (_tt_probs['under'], _tt_true_u, _tt_up,
+                         f"{_tt_team} Under {_tt_line}"),
+                    ]:
+                        _tt_edge = _tt_model_p - _tt_book_p
+                        if _tt_edge >= _GAME_MARKET_EDGE_MIN:
+                            _tt_ev = _tt_model_p * (_tt_odds - 1) - (1 - _tt_model_p)
+                            send_game_market_alert(
+                                home_team=home_team, away_team=away_team,
+                                home_score=_home_exp, away_score=_away_exp,
+                                market='team_totals', side=_tt_side,
+                                edge=_tt_edge, ev=_tt_ev,
+                                model_prob=_tt_model_p, book_prob=_tt_book_p,
+                                book_odds=_tt_odds, book=_tt_book,
+                                game_date=game_date, event_id=event_id,
+                                line=_tt_line, db=db, _bot=bot,
+                                home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                            )
+            except Exception as _tt_err:
+                logger.warning(f"Team totals scan failed for {_gm_matchup}: {_tt_err}")
 
         # ── Per-player loop ───────────────────────────────────────────
         for player_name in players_in_event:
@@ -850,6 +1409,23 @@ def scan_props():
             _opp_ctx = stats_client.get_opponent_matchup_context(opp_team)
             _player_foul_rate = compute_player_foul_rate(logs)
 
+            # Revenge game: player previously played for tonight's opponent
+            _revenge_game = False
+            if not logs.empty and 'TEAM_ABBREVIATION' in logs.columns:
+                _opp_abbr = TEAM_NAME_TO_ABBR.get(opp_team, '')
+                if _opp_abbr:
+                    _current_abbr = str(logs.iloc[0]['TEAM_ABBREVIATION']).upper()
+                    _all_abbrs = {str(a).upper() for a in logs['TEAM_ABBREVIATION'].unique()}
+                    _revenge_game = _opp_abbr.upper() in _all_abbrs and _opp_abbr.upper() != _current_abbr
+
+            # Next-opponent win%: opponent's season win% from standings context
+            _next_opp_win_pct = 0.0
+            if _standings_ctx:
+                _next_opp_win_pct = (
+                    _standings_ctx.get('away_win_pct', 0.0) if home_flag
+                    else _standings_ctx.get('home_win_pct', 0.0)
+                )
+
             # Rotation model
             _rotation_mins = 0.0
             if absent_ids and player_id_int:
@@ -892,12 +1468,14 @@ def scan_props():
                 except Exception:
                     pass
 
-            for mkt in PROP_MARKETS:
+            for mkt in [*PROP_MARKETS, *ALT_PROP_MARKETS]:
                 if player_name not in prices_by_market.get(mkt, {}):
                     continue
+                # base_mkt: used for all stat/model calls (strips "_alternate" suffix)
+                base_mkt = ALT_TO_BASE_MARKET.get(mkt, mkt)
 
                 opp_multiplier = stats_client.get_positional_def_multiplier(
-                    opp_team, mkt, _position_group
+                    opp_team, base_mkt, _position_group
                 )
 
                 for line in prices_by_market[mkt][player_name]:
@@ -906,7 +1484,7 @@ def scan_props():
                         shifts = [
                             on_off_client.get_usage_multiplier(
                                 target_player_id=int(player_id_int),
-                                absent_player_id=_aid, market=mkt, db=db,
+                                absent_player_id=_aid, market=base_mkt, db=db,
                             ) - 1.0
                             for _aid in absent_ids
                         ]
@@ -914,8 +1492,30 @@ def scan_props():
                     else:
                         _usage_shift = 0.0
 
+                    # ── Role-shift override ──────────────────────────
+                    # When a primary initiator is OUT, look up the
+                    # player's isolated rate_without from on_off_splits
+                    # and hard-override the Bayesian baseline.
+                    _role_shift_rate = 0.0
+                    if _out_initiator_ids and player_id_int:
+                        for _init_id in _out_initiator_ids:
+                            _rw = db.get_on_off_rate_without(
+                                int(player_id_int), _init_id,
+                                base_mkt, stats_client.season,
+                            )
+                            if _rw is not None and _rw > 0:
+                                # Use the highest rate_without if multiple
+                                # initiators are out (most impactful split)
+                                _role_shift_rate = max(_role_shift_rate, _rw)
+                        if _role_shift_rate > 0:
+                            logger.info(
+                                f"Role-shift: {player_name} {base_mkt} "
+                                f"rate_without={_role_shift_rate:.4f} "
+                                f"(initiators_out={_initiators_out})"
+                            )
+
                     proj = build_player_projection(
-                        player_id=player_name, market=mkt, line=line,
+                        player_id=player_name, market=base_mkt, line=line,
                         recent_logs=logs, season_logs=logs,
                         injury_status=injury_status,
                         team_pace=pace_info['home_pace'] if home_flag else pace_info['away_pace'],
@@ -928,6 +1528,8 @@ def scan_props():
                         out_player_avg_mins=_out_player_avg_mins,
                         projected_minutes_override=_rotation_mins,
                         fatigue_multiplier=_adj_fatigue_mult,
+                        role_shift_rate=_role_shift_rate,
+                        initiators_out=_initiators_out,
                     )
 
                     if not proj or proj.get('mean', 0) == 0:
@@ -943,7 +1545,7 @@ def scan_props():
                         / (2.0 * _league_avg_pace)
                     )
                     ml_mean = get_ml_projection(
-                        mkt, logs, proj['projected_minutes'], home_flag, rest_days,
+                        base_mkt, logs, proj['projected_minutes'], home_flag, rest_days,
                         opp_def_rating=opp_multiplier,
                         pace_factor=_pace_factor,
                         opp_pace=_opp_ctx['opp_pace'],
@@ -955,15 +1557,19 @@ def scan_props():
                         real_usage_pct=_bdl_profile.get('real_usage_pct', 0.0),
                         avg_touches=_bdl_profile.get('avg_touches', 0.0),
                         pnr_bh_freq=_bdl_profile.get('pnr_bh_freq', 0.0),
+                        pnr_roll_freq=_bdl_profile.get('pnr_roll_freq', 0.0),
                         iso_freq=_bdl_profile.get('iso_freq', 0.0),
                         spotup_freq=_bdl_profile.get('spotup_freq', 0.0),
                         transition_freq=_bdl_profile.get('transition_freq', 0.0),
+                        postup_freq=_bdl_profile.get('postup_freq', 0.0),
+                        drives_per_game=_bdl_profile.get('drives_per_game', 0.0),
                         ts_pct=_bdl_profile.get('ts_pct', 0.0),
                         avg_speed=_bdl_profile.get('avg_speed', 0.0),
                         avg_contested_fg_pct=_bdl_profile.get('avg_contested_fg_pct', 0.0),
                         avg_deflections=_bdl_profile.get('avg_deflections', 0.0),
                         avg_points_paint=_bdl_profile.get('avg_points_paint', 0.0),
                         avg_pct_pts_paint=_bdl_profile.get('avg_pct_pts_paint', 0.0),
+                        player_foul_rate=_player_foul_rate,
                     )
                     if ml_mean is not None and ml_mean > 0:
                         proj['mean'] = 0.5 * proj['mean'] + 0.5 * ml_mean
@@ -975,7 +1581,7 @@ def scan_props():
                             _bdl_booster,
                             bdl_player_id=bdl_player_map[player_name],
                             opponent_team=opp_team,
-                            market=mkt,
+                            market=base_mkt,
                             season=_season_int,
                             player_profile=_bdl_profile,
                         )
@@ -983,12 +1589,12 @@ def scan_props():
                             proj['mean'] *= _bdl_mult
                             proj['bdl_boost'] = _bdl_mult
                             logger.debug(
-                                f"BDL boost: {player_name} {mkt} × {_bdl_mult:.3f} "
+                                f"BDL boost: {player_name} {base_mkt} × {_bdl_mult:.3f} "
                                 f"vs {opp_team}"
                             )
 
                     # BDL PBP foul-draw boost: high foul-draw rate → more FTAs → more pts
-                    if _pbp_profile and mkt in {
+                    if _pbp_profile and base_mkt in {
                         'player_points', 'player_points_rebounds_assists'
                     }:
                         _fdr = _pbp_profile.get('foul_draw_rate', 0.0)
@@ -1003,7 +1609,7 @@ def scan_props():
                         proj['projected_minutes'] *= _standings_min_adj
 
                     # Tight whistle
-                    if _crew_factor["tight_whistle"] and mkt in {
+                    if _crew_factor["tight_whistle"] and base_mkt in {
                         "player_points", "player_points_rebounds_assists"
                     }:
                         proj['mean'] *= 1.02
@@ -1011,15 +1617,52 @@ def scan_props():
                     # Altitude fatigue
                     if (b2b_flag and _fatigue['altitude_flag']
                         and _fatigue['miles_traveled'] > 800 and not home_flag):
-                        if mkt == 'player_threes':
+                        if base_mkt == 'player_threes':
                             proj['mean'] *= 0.95
-                        elif mkt == 'player_rebounds':
+                        elif base_mkt == 'player_rebounds':
                             proj['mean'] *= 0.97
+
+                    # Rest asymmetry: player-level adjustment.
+                    # The rested team's players get an offensive boost;
+                    # the tired team's players get a penalty — this is the
+                    # schedule delta the market consistently underprices.
+                    if _rest_asym['rest_delta'] != 0:
+                        _ra_off = (_rest_asym['home_off_mult']
+                                   if home_flag else _rest_asym['away_off_mult'])
+                        if _ra_off != 1.0:
+                            proj['mean'] *= _ra_off
+                            proj['rest_asymmetry'] = _ra_off
+
+                    # ── Foul-trouble cascade ──────────────────────────
+                    # When opponent draws fouls at a top-5 rate + tight
+                    # whistle, Centers face predictable foul trouble.
+                    # Slash starter C minutes, boost backup C minutes.
+                    _foul_cascade_active = (
+                        _home_foul_cascade if home_flag else _away_foul_cascade
+                    )
+                    if _foul_cascade_active and _position_group == 'Center':
+                        _old_mins = proj['projected_minutes']
+                        if starter_flag:
+                            # Starter C: expected to sit ~5 min with
+                            # early fouls → 0.85x minutes
+                            proj['projected_minutes'] *= 0.85
+                            proj['mean'] *= 0.85
+                            proj['foul_cascade'] = 'starter_C_cut'
+                        else:
+                            # Backup C: absorbs the starter's lost
+                            # minutes → 1.30x minutes
+                            proj['projected_minutes'] *= 1.30
+                            proj['mean'] *= 1.30
+                            proj['foul_cascade'] = 'backup_C_boost'
+                        logger.info(
+                            f"Foul-cascade: {player_name} ({proj['foul_cascade']}) "
+                            f"mins {_old_mins:.1f} → {proj['projected_minutes']:.1f}"
+                        )
 
                     _bench_tier = classify_bench_tier(proj['projected_minutes'])
 
                     dists = get_probability_distribution(
-                        mkt, proj['mean'], line, logs=logs,
+                        base_mkt, proj['mean'], line, logs=logs,
                         variance_scale=proj.get('variance_scale', 1.0),
                         proj_minutes=proj['projected_minutes'],
                         spread=_home_spread or 0.0,
@@ -1027,6 +1670,8 @@ def scan_props():
                         player_foul_rate=_player_foul_rate,
                         opp_foul_rate=_opp_ctx['opp_fta_rate'] * _crew_factor["foul_rate_multiplier"],
                         bench_tier=_bench_tier,
+                        next_opp_win_pct=_next_opp_win_pct,
+                        revenge_game=_revenge_game,
                     )
 
                     # ── Get best odds (BDL primary, Odds API for sharp) ───
@@ -1066,6 +1711,9 @@ def scan_props():
                             sharp_bookmakers, player_name, mkt, line, _book_weights
                         )
 
+                    # Sharp line shift: detect if sharp books moved this line
+                    _sharp_shift = db.get_sharp_line_shift(player_name, base_mkt)
+
                     common = {
                         **proj,
                         "home_team": home_team, "away_team": away_team,
@@ -1076,6 +1724,7 @@ def scan_props():
                         "consensus_prob": _consensus_o,
                         "consensus_label": _consensus_label,
                         "hours_to_tipoff": _hours_to_tip,
+                        "sharp_line_shift": _sharp_shift,
                     }
 
                     if best_over.get('price', 0) > 0 and imp_over > 0:
@@ -1151,6 +1800,8 @@ def scan_props():
         evaluate_and_alert(edge, db, bot)
 
     generate_and_alert_combos(actionable, bot, db=db)
+    generate_four_leg_parlays(actionable, bot, db=db)
+    generate_slate_ultimate(actionable, bot, db=db)
 
     if BDL_ENABLED_RUNTIME and _bdl_bridge:
         logger.info(f"BDL requests this scan: {_bdl_bridge.bdl.requests_made}")

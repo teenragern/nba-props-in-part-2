@@ -352,9 +352,12 @@ class BDLBridge:
             "pct_pts_3pt":          0.0,
             "ts_pct":               0.0,
             "pnr_bh_freq":          0.0,
+            "pnr_roll_freq":        0.0,
             "iso_freq":             0.0,
             "spotup_freq":          0.0,
             "transition_freq":      0.0,
+            "postup_freq":          0.0,
+            "drives_per_game":      0.0,
             "avg_speed":            0.0,
             "avg_contested_fg_pct": 0.0,
             "avg_deflections":      0.0,
@@ -391,9 +394,11 @@ class BDLBridge:
         # ── Layer 3: Playtype season averages ────────────────────────────
         _playtype_targets = {
             "prballhandler": "pnr_bh_freq",
+            "prrollman":     "pnr_roll_freq",
             "isolation":     "iso_freq",
             "spotup":        "spotup_freq",
             "transition":    "transition_freq",
+            "postup":        "postup_freq",
         }
         for stat_type, feature_key in _playtype_targets.items():
             try:
@@ -409,11 +414,26 @@ class BDLBridge:
             except Exception as e:
                 logger.debug(f"BDL playtype/{stat_type} failed for {bdl_player_id}: {e}")
 
+        # ── Layer 4: Tracking drives ──────────────────────────────────────
+        try:
+            drives_rows = self.bdl.get_season_averages(
+                season=season,
+                player_ids=[bdl_player_id],
+                category="tracking",
+                stat_type="drives",
+            )
+            if drives_rows:
+                result["drives_per_game"] = float(drives_rows[0].get("drives", 0.0) or 0.0)
+        except Exception as e:
+            logger.debug(f"BDL tracking/drives failed for {bdl_player_id}: {e}")
+
         logger.debug(
             f"BDL season profile for {bdl_player_id}: "
             f"usage={result['real_usage_pct']:.1%} ts={result['ts_pct']:.3f} "
-            f"pnr={result['pnr_bh_freq']:.2f} iso={result['iso_freq']:.2f} "
+            f"pnr={result['pnr_bh_freq']:.2f} roll={result['pnr_roll_freq']:.2f} "
+            f"iso={result['iso_freq']:.2f} post={result['postup_freq']:.2f} "
             f"spotup={result['spotup_freq']:.2f} trans={result['transition_freq']:.2f} "
+            f"drives={result['drives_per_game']:.1f} "
             f"speed={result['avg_speed']:.2f} paint_pts={result['avg_points_paint']:.1f} "
             f"deflections={result['avg_deflections']:.2f}"
         )

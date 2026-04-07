@@ -9,7 +9,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))
 MIN_PROJECTED_MINUTES = float(os.getenv("MIN_PROJECTED_MINUTES", "15.0"))
 ODDS_REGION = os.getenv("ODDS_REGION", "us")
-BOOKMAKERS_RAW = os.getenv("BOOKMAKERS", "draftkings,fanduel,betmgm,caesars")
+BOOKMAKERS_RAW = os.getenv("BOOKMAKERS", "draftkings,fanduel,betmgm,caesars,betonlineag,lowvig")
 BOOKMAKERS = BOOKMAKERS_RAW.split(",") if BOOKMAKERS_RAW else []
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -26,7 +26,7 @@ NEWS_POLL_INTERVAL     = int(os.getenv("NEWS_POLL_INTERVAL",     "60"))
 TWITTER_POLL_INTERVAL  = int(os.getenv("TWITTER_POLL_INTERVAL",  "15"))
 
 # Sharp-line devigging — top-down signal
-SHARP_BOOKS_RAW = os.getenv("SHARP_BOOKS", "pinnacle")
+SHARP_BOOKS_RAW = os.getenv("SHARP_BOOKS", "pinnacle,bookmaker,circa")
 SHARP_BOOKS     = [b.strip() for b in SHARP_BOOKS_RAW.split(",") if b.strip()]
 REC_BOOKS_RAW   = os.getenv("REC_BOOKS", "draftkings,fanduel")
 REC_BOOKS       = [b.strip() for b in REC_BOOKS_RAW.split(",") if b.strip()]
@@ -57,3 +57,27 @@ PROP_MARKETS = [
     "player_blocks",
     "player_steals",
 ]
+
+# Alternate-line markets (fat-tail pricing inefficiency).
+# Books underprice extreme alt-lines; the same distribution engine
+# produces sharper probabilities at these tails than the book's flat markup.
+ALT_PROP_MARKETS = [
+    "player_points_alternate",
+    "player_rebounds_alternate",
+    "player_assists_alternate",
+    "player_threes_alternate",
+    "player_points_rebounds_assists_alternate",
+    "player_blocks_alternate",
+    "player_steals_alternate",
+]
+
+# Maps each alt-market back to its statistical base market for projection/distribution.
+ALT_TO_BASE_MARKET: dict = {
+    "player_points_alternate":                  "player_points",
+    "player_rebounds_alternate":                "player_rebounds",
+    "player_assists_alternate":                 "player_assists",
+    "player_threes_alternate":                  "player_threes",
+    "player_points_rebounds_assists_alternate": "player_points_rebounds_assists",
+    "player_blocks_alternate":                  "player_blocks",
+    "player_steals_alternate":                  "player_steals",
+}

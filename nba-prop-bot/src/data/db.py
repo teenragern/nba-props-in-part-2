@@ -58,6 +58,8 @@ class DatabaseClient:
             "ALTER TABLE clv_tracking ADD COLUMN clv REAL",
             # bet_results — push detection (settlement v2)
             "ALTER TABLE bet_results ADD COLUMN push BOOLEAN NOT NULL DEFAULT 0",
+            # players — role shift: primary ball-handler tag
+            "ALTER TABLE players ADD COLUMN is_primary_initiator BOOLEAN NOT NULL DEFAULT 0",
             # pending_alerts — two-tier alert batching (flush v1)
             # (table created by schema; migration ensures forward-compat if
             #  an older DB predates the CREATE TABLE statement above)
@@ -444,6 +446,53 @@ class DatabaseClient:
                  games_processed, minutes_with, minutes_without,
                  rate_with, rate_without, usage_multiplier)
             )
+
+    # ── Role-shift: primary initiator helpers ──────────────────────────
+
+    def get_team_initiator_ids(self, team_id: int) -> list:
+        """Return player_ids tagged as primary initiators for a team."""
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT player_id FROM players WHERE team_id = ? AND is_primary_initiator = 1",
+                (team_id,)
+            ).fetchall()
+            return [r['player_id'] for r in rows]
+
+    def is_primary_initiator(self, player_id: int) -> bool:
+        """Check if a player is tagged as a primary initiator."""
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT is_primary_initiator FROM players WHERE player_id = ?",
+                (player_id,)
+            ).fetchone()
+            return bool(row and row['is_primary_initiator'])
+
+    def get_on_off_rate_without(self, player_id: int, absent_player_id: int,
+                                 market: str, season: str) -> Optional[float]:
+        """Return the raw per-minute rate_without from on_off_splits, or None."""
+        with self.get_conn() as conn:
+            row = conn.execute(
+                """SELECT rate_without, minutes_without FROM on_off_splits
+                   WHERE player_id = ? AND absent_player_id = ?
+                     AND market = ? AND season = ?""",
+                (player_id, absent_player_id, market, season)
+            ).fetchone()
+            if row and row['minutes_without'] >= 10.0:
+                return float(row['rate_without'])
+            return None
+
+    def set_primary_initiators(self, team_id: int, player_ids: list):
+        """Tag players as primary initiators; clear old tags for the team first."""
+        with self.get_conn() as conn:
+            conn.execute(
+                "UPDATE players SET is_primary_initiator = 0 WHERE team_id = ?",
+                (team_id,)
+            )
+            for pid in player_ids:
+                conn.execute(
+                    "UPDATE players SET is_primary_initiator = 1 WHERE player_id = ? AND team_id = ?",
+                    (pid, team_id)
+                )
 
     def get_rotation_slots(self, team_abbr: str, season: str) -> dict:
         """

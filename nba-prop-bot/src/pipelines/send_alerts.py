@@ -19,6 +19,37 @@ _MARKET_SHORT: Dict[str, str] = {
 }
 
 
+_CROSS_GAME_KELLY_MULTIPLIER = 0.5   # cross-game parlays have no structural edge
+
+
+def _parlay_kelly_stake(
+    legs: List[Dict[str, Any]],
+    joint_true_prob: float,
+    combined_decimal: float,
+    max_pct: float = 0.005,
+) -> float:
+    """
+    Kelly-sized stake for a multi-leg parlay.
+
+    SGPs (all legs share one event_id) may have a Gaussian Copula edge baked in,
+    so they use the full KELLY_FRACTION.  Cross-game parlays have no hidden
+    correlation value — the book prices independent legs correctly — so their
+    Kelly fraction is halved to account for the higher variance with no structural
+    offset.
+    """
+    ev = joint_true_prob * (combined_decimal - 1) - (1 - joint_true_prob)
+    if ev <= 0 or combined_decimal <= 1:
+        return 0.0
+
+    event_ids = {leg.get('event_id', '') for leg in legs if leg.get('event_id')}
+    is_sgp = len(event_ids) <= 1
+    effective_kelly = KELLY_FRACTION if is_sgp else KELLY_FRACTION * _CROSS_GAME_KELLY_MULTIPLIER
+
+    stake = BANKROLL * (ev / (combined_decimal - 1)) * effective_kelly
+    stake = min(stake, BANKROLL * max_pct)
+    return _camouflage_stake(stake)
+
+
 def _camouflage_stake(stake: float) -> float:
     """Round to natural recreational-bettor increments to avoid sharp-profiling flags."""
     if stake <= 0:
@@ -62,8 +93,8 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         stake = min(stake, BANKROLL * 0.05)  # hard cap: 5% per bet
     stake = _camouflage_stake(stake)
 
-    MAX_DAILY_RISK = BANKROLL * 0.25
-    MAX_PER_GAME   = BANKROLL * 0.10
+    MAX_DAILY_RISK = BANKROLL * 0.50
+    MAX_PER_GAME   = BANKROLL * 0.20
 
     with db.get_conn() as conn:
         cursor = conn.cursor()
@@ -143,6 +174,52 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     logger.info(f"Alert queued: {player} {market} {side} {line} @ {book}")
 
 
+def send_line_disagreement_alert(
+    player: str, market: str, sharp_book: str, sharp_line: float,
+    soft_book: str, soft_line: float, side: str, soft_odds: float,
+    game_date: str, event_id: str, home_team: str, away_team: str,
+    db: DatabaseClient, _bot: TelegramBotClient,
+):
+    """
+    Fire a priority alert when a sharp book's line differs from a soft book
+    by >= 1 full point.  These are the highest-ROI bets in the market — the
+    soft book hasn't adjusted yet and is offering a line the sharp book has
+    already moved past.
+    """
+    line_gap = abs(sharp_line - soft_line)
+
+    # Dedup: don't re-alert on the same disagreement within a scan
+    if db.check_recent_alert(player, market, soft_line, side, edge=0.0):
+        return
+
+    mkt_short = _MARKET_SHORT.get(market, market[:3].title())
+
+    msg = (
+        f"<b>⚡ SHARP LINE DISAGREEMENT</b>\n\n"
+        f"Game: {away_team} @ {home_team}  ({game_date})\n"
+        f"Player: {player}\n"
+        f"Market: {market.replace('_', ' ').title()}\n\n"
+        f"<b>{sharp_book}</b> line: {sharp_line}\n"
+        f"<b>{soft_book}</b> line:  {soft_line}  ({line_gap:+.1f} gap)\n\n"
+        f"Action: <b>{side} {soft_line}</b> on {soft_book}\n"
+        f"Odds: {soft_odds}\n\n"
+        f"A {line_gap:.1f}-point line gap on a Poisson distribution is massive.\n"
+        f"Hammer this before {soft_book} adjusts."
+    )
+
+    title = (
+        f"⚡ {player} {side[0]}{soft_line} {mkt_short} "
+        f"@{soft_book} | {sharp_book} @ {sharp_line} ({line_gap:+.1f})"
+    )
+
+    # Queue as highest-priority alert (priority = line_gap to sort above normal edges)
+    db.queue_pending_alert('prop', title, msg, priority=line_gap, game_date=game_date)
+    logger.info(
+        f"LINE DISAGREEMENT: {player} {market} — {sharp_book} {sharp_line} vs "
+        f"{soft_book} {soft_line} ({side})"
+    )
+
+
 _PARLAY_MARKET_LABELS: Dict[str, str] = {
     'player_points':                  'Points',
     'player_rebounds':                'Rebounds',
@@ -189,11 +266,9 @@ def send_parlay_alert(
     edge = joint_true_prob - joint_book_prob
     ev   = joint_true_prob * (combined_decimal - 1) - (1 - joint_true_prob)
 
-    # Hard cap: parlays are high-variance bets — even a model with real edge
-    # can go on cold streaks.  Cap at 0.5% (4-leg) / 0.25% (8-leg) of bankroll
-    # regardless of Kelly, to prevent ruin from model over-confidence.
     _PARLAY_MAX_PCT = {4: 0.005, 8: 0.0025}
-    max_parlay_stake = BANKROLL * _PARLAY_MAX_PCT.get(n, 0.0025)
+    max_pct = _PARLAY_MAX_PCT.get(n, 0.0025)
+    kelly_stake = _parlay_kelly_stake(legs, joint_true_prob, combined_decimal, max_pct=max_pct)
 
     lines = [f"{icon} <b>{n}-Leg High-Probability Parlay</b>\n"]
     for leg in legs:
@@ -223,7 +298,7 @@ def send_parlay_alert(
         f"Book Implied:   {joint_book_prob:.2%}\n"
         f"Edge:           +{edge:.2%}\n"
         f"EV:             {ev:+.2%}\n"
-        f"Max Stake:      ${_camouflage_stake(max_parlay_stake):.0f} ({_PARLAY_MAX_PCT.get(n, 0.0025):.2%} bankroll cap)"
+        f"Suggested Stake (Kelly): ${kelly_stake:.0f} (cap: {max_pct:.2%} bankroll)"
     )
 
     msg = "\n".join(lines)
@@ -294,8 +369,8 @@ def send_game_market_alert(
         stake = min(stake, BANKROLL * 0.03)
     stake = _camouflage_stake(stake)
 
-    MAX_DAILY_RISK = BANKROLL * 0.25
-    MAX_PER_GAME   = BANKROLL * 0.10
+    MAX_DAILY_RISK = BANKROLL * 0.50
+    MAX_PER_GAME   = BANKROLL * 0.20
 
     with db.get_conn() as conn:
         cursor = conn.cursor()

@@ -4,7 +4,7 @@ from src.config import BANKROLL
 
 def check_exposure():
     db = DatabaseClient()
-    MAX_DAILY_RISK = BANKROLL * 0.25
+    MAX_DAILY_RISK = BANKROLL * 0.50
     MAX_PER_GAME = BANKROLL * 0.10
     
     with db.get_conn() as conn:

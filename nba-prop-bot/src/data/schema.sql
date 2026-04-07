@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS players (
     target_name TEXT,
     team_id INTEGER,
     position TEXT,
+    is_primary_initiator BOOLEAN NOT NULL DEFAULT 0,
     FOREIGN KEY(team_id) REFERENCES teams(team_id)
 );
 

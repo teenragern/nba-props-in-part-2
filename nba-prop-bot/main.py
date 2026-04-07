@@ -37,12 +37,30 @@ def main():
     exposure_parser = subparsers.add_parser("exposure", help="Check current portfolio exposure against bankroll limits")
     timing_parser = subparsers.add_parser("timing_analysis", help="Analyze average edge decay timing to tip-off")
     
+    # Tag primary initiators
+    tag_parser = subparsers.add_parser("tag_initiators", help="Auto-tag top 2 assist-men per team as primary initiators")
+
     # Continuous Scheduler
     run_parser = subparsers.add_parser("run", help="Start the continuous automated scheduler")
+    
+    # Full Run Sequence
+    full_run_parser = subparsers.add_parser("full_run", help="Settle alerts, run calibration, then start scheduler")
     
     args = parser.parse_args()
     
     if args.command == "run":
+        from src.pipelines.run_scheduler import start_scheduler
+        start_scheduler()
+    elif args.command == "full_run":
+        print("--- Running Settlement ---")
+        from src.pipelines.settle_results import settle_alerts
+        settle_alerts()
+        
+        print("--- Running Calibration ---")
+        from src.pipelines.calibration import check_calibration
+        check_calibration()
+        
+        print("--- Starting Continuous Scheduler ---")
         from src.pipelines.run_scheduler import start_scheduler
         start_scheduler()
     elif args.command == "scan":
@@ -80,6 +98,9 @@ def main():
     elif args.command == "timing_analysis":
         from src.pipelines.timing_analysis import analyze_timing
         analyze_timing()
+    elif args.command == "tag_initiators":
+        from src.pipelines.tag_initiators import tag_initiators
+        tag_initiators()
     else:
         parser.print_help()
 
