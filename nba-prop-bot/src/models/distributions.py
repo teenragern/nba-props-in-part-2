@@ -118,6 +118,16 @@ DISPERSION_ALPHAS = {
     'player_steals':   0.35,   # opportunity-driven, game-script dependent
 }
 
+# Playoff overlay: tighter defense + sellout-game variance widens the tails
+# for scoring and 3PM markets. Steals/blocks are already well-dispersed and
+# driven more by matchup than venue atmosphere — leave them unchanged.
+DISPERSION_ALPHAS_PLAYOFF = {
+    **DISPERSION_ALPHAS,
+    'player_points':                  0.12,   # RS default is 0.10 (fallback)
+    'player_threes':                  0.24,   # RS 0.20 → +20%
+    'player_points_rebounds_assists': 0.13,   # PRA tracks scoring variance
+}
+
 
 # ---------------------------------------------------------------------------
 # Blowout & foul-trouble helpers
@@ -196,6 +206,9 @@ def monte_carlo_over_under(
     bench_tier: int = 1,
     next_opp_win_pct: float = 0.0,
     revenge_game: bool = False,
+    playoff_mode: bool = False,
+    must_win: bool = False,
+    closeout_game: bool = False,
 ) -> Dict[str, float]:
     """
     Vectorized Monte Carlo simulation over n_sims game scenarios.
@@ -235,6 +248,16 @@ def monte_carlo_over_under(
 
     rng = np.random.default_rng()
 
+    # In the playoffs, coaches leave starters in much longer even in blowouts
+    if playoff_mode:
+        blowout_minute_cap = max(blowout_minute_cap, 34.0)
+
+    # Must-win (elimination) games: stars and starters play longer and
+    # more consistently. Small minutes bump (capped at 43, matching the
+    # scan_props playoff starter cap) + reduced variance downstream.
+    if must_win and bench_tier <= 1 and proj_minutes > 0:
+        proj_minutes = min(proj_minutes + 1.5, 43.0)
+
     # ── 0. Pre-game blowout cap ───────────────────────────────────────────
     # When the book spread signals a likely blowout (|spread| >= 11),
     # slash projected minutes for starters/stars BEFORE the MC loop.
@@ -249,13 +272,13 @@ def monte_carlo_over_under(
     #        (bench_tier 0-1). Bench players (tier 3) get a boost.
     _pregame_blowout_cut = 0.0
     abs_spread = abs(spread)
-    if abs_spread >= 11.0 and bench_tier <= 1:
+    if abs_spread >= 11.0 and bench_tier <= 1 and not playoff_mode:
         _pregame_blowout_cut = min(1.5 + (abs_spread - 11.0) * 0.5, 3.5)
         proj_minutes = max(proj_minutes - _pregame_blowout_cut, 12.0)
         # Also tighten the blowout cap — in sims where the blowout
         # actually materialises, starters sit even earlier.
         blowout_minute_cap = min(blowout_minute_cap, 26.0)
-    elif abs_spread >= 11.0 and bench_tier == 3:
+    elif abs_spread >= 11.0 and bench_tier == 3 and not playoff_mode:
         # Garbage-time beneficiary: projected minutes tick UP slightly
         proj_minutes += min((abs_spread - 11.0) * 0.5, 2.0)
 
@@ -270,7 +293,7 @@ def monte_carlo_over_under(
     # tough opponent next game (win_pct > 0.65).  Coaches rest stars earlier
     # in garbage time to protect them — tighten the blowout minute cap.
     _effective_blowout_cap = blowout_minute_cap
-    if next_opp_win_pct > 0.65 and bench_tier <= 1:
+    if next_opp_win_pct > 0.65 and bench_tier <= 1 and not playoff_mode:
         _effective_blowout_cap = min(blowout_minute_cap, 24.0)
 
     # ── 1. Simulate effective minutes ──────────────────────────────────────
@@ -332,7 +355,16 @@ def monte_carlo_over_under(
 
     # ── 2. Sample stat outcome (Gamma-Poisson mixture) ─────────────────────
     expected = np.maximum(rate * sim_min, 0.0)
-    alpha = DISPERSION_ALPHAS.get(market, 0.10)
+    _alpha_table = DISPERSION_ALPHAS_PLAYOFF if playoff_mode else DISPERSION_ALPHAS
+    alpha = _alpha_table.get(market, 0.10)
+    # Series-state adjustments. Must-win games compress variance for top
+    # minutes — coaches shorten the bench and stars play through contact.
+    # Closeout games are more likely to become blowouts, which blows out
+    # deep-bench minutes distribution → inflate their variance.
+    if must_win and bench_tier <= 1:
+        alpha *= 0.90
+    if closeout_game and bench_tier == 3:
+        alpha *= 1.15
     # Revenge game: player faces a team they previously played for.
     # Motivation spikes usage and shot attempts → widen the distribution for
     # scoring/playmaking markets so the model captures tail upside the book misses.
@@ -395,6 +427,9 @@ def get_probability_distribution(
     bench_tier: int = 1,
     next_opp_win_pct: float = 0.0,
     revenge_game: bool = False,
+    playoff_mode: bool = False,
+    must_win: bool = False,
+    closeout_game: bool = False,
 ) -> Dict[str, float]:
     """
     Return {prob_over, prob_under} for a player prop.
@@ -440,6 +475,9 @@ def get_probability_distribution(
             bench_tier=bench_tier,
             next_opp_win_pct=next_opp_win_pct,
             revenge_game=revenge_game,
+            playoff_mode=playoff_mode,
+            must_win=must_win,
+            closeout_game=closeout_game,
         ))
 
     # ── Parametric fallback ─────────────────────────────────────────────────

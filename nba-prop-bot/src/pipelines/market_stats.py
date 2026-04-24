@@ -31,8 +31,9 @@ def analyze_market_stats():
     # 1. Bookmaker Profitability / Leader
     # Who often has the sharpest closing line correlation?
     # We measure deviation of book's initial lines from the final closing line
-    df_valid = df.dropna(subset=['implied_closing'])
+    df_valid = df.dropna(subset=['implied_closing']).copy()
     if not df_valid.empty:
+        df_valid['book'] = df_valid['book'].astype(str).str.strip().str.lower()
         df_valid['closing_error'] = abs(df_valid['implied_prob'] - df_valid['implied_closing'])
         leaderboard = df_valid.groupby('book')['closing_error'].mean().sort_values()
         
@@ -48,7 +49,7 @@ def analyze_market_stats():
     if not df_valid.empty:
         # We don't have model prior explicitly in this query without re-joining,
         # but we can look at actual hit rate vs market close.
-        df_graded = df_valid.dropna(subset=['won'])
+        df_graded = df_valid.dropna(subset=['won']).copy()
         if not df_graded.empty:
             df_graded['bias'] = df_graded['won'].astype(float) - df_graded['implied_closing']
             bias_by_market = df_graded.groupby('market')['bias'].mean()

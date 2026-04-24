@@ -26,7 +26,7 @@ from src.models.ml_model import train_models_from_logs, train_models_with_clv_fe
 
 logger = get_logger(__name__)
 
-_DEFAULT_SEASONS = ['2024-25', '2023-24', '2022-23']
+_DEFAULT_SEASONS = ['2025-26', '2024-25', '2023-24']
 _N_SEASONS       = int(os.getenv('TRAIN_SEASONS', '3'))
 _MIN_GP          = int(os.getenv('TRAIN_MIN_GP',  '20'))
 

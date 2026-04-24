@@ -1,9 +1,14 @@
 from typing import List, Dict, Any, Optional
-from src.config import MIN_PROJECTED_MINUTES
+from src.config import (
+    MIN_PROJECTED_MINUTES,
+    PLAYOFF_MIN_PROJECTED_MINUTES,
+    PLAYOFF_EDGE_MIN,
+    PER_MARKET_EDGE_MIN,
+)
 from src.models.distributions import get_probability_distribution
 
 # Priority 7: db is optional — set once from scan_props
-_state: Dict[str, Any] = {'db': None}
+_state: Dict[str, Any] = {'db': None, 'playoff_mode': False}
 
 # CLV-calibrated per-market edge minimums (loaded lazily from settled alerts)
 _clv_edge_mins: Dict[str, float] = {}
@@ -81,7 +86,13 @@ def compute_dynamic_edge_min(hours_to_tipoff: float, market: str = '') -> float:
         _load_clv_thresholds()
 
     early = _clv_edge_mins.get(market, _EARLY_EDGE_MIN) if market else _EARLY_EDGE_MIN
-    late = _LATE_EDGE_MIN
+    if _state.get('playoff_mode'):
+        # Playoff lines are sharper; require a higher early-edge floor.
+        early = max(early, PLAYOFF_EDGE_MIN)
+    market_floor = PER_MARKET_EDGE_MIN.get(market, 0.0) if market else 0.0
+    if market_floor:
+        early = max(early, market_floor)
+    late = max(_LATE_EDGE_MIN, market_floor)
 
     if hours_to_tipoff >= _EARLY_HOURS:
         return early
@@ -94,6 +105,11 @@ def compute_dynamic_edge_min(hours_to_tipoff: float, market: str = '') -> float:
 def set_db(db):
     """Call once from scan_props to give edge_ranker access to DB for bias lookups."""
     _state['db'] = db
+
+
+def set_playoff_mode(playoff_mode: bool) -> None:
+    """Call once from scan_props to enable playoff-tightened edge/minutes gates."""
+    _state['playoff_mode'] = bool(playoff_mode)
 
 
 def get_market_feedback_factor(market: str, book: Optional[str] = None) -> float:
@@ -126,7 +142,8 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         var_scale    = c.get('variance_scale', 1.0)
         book         = c.get('book', '')
 
-        if proj_mins < MIN_PROJECTED_MINUTES:
+        _min_minutes = PLAYOFF_MIN_PROJECTED_MINUTES if _state.get('playoff_mode') else MIN_PROJECTED_MINUTES
+        if proj_mins < _min_minutes:
             continue
 
         edge = model_prob - implied_prob

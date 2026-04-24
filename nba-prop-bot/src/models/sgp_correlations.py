@@ -53,6 +53,24 @@ LEAGUE_AVG_CORRELATIONS: Dict[Tuple[str, str], float] = {
     ('player_steals',   'player_threes'):   0.05,
 }
 
+# Playoff defaults: rotations compress, minutes concentrate on stars, and role
+# players' opportunities cluster — so within-player cross-stat correlations
+# rise ~20-35% on the load-bearing pairs. Weak RS pairs stay approximately flat.
+LEAGUE_AVG_CORRELATIONS_PLAYOFF: Dict[Tuple[str, str], float] = {
+    ('player_assists',  'player_points'):   0.32,   # 0.25 → +28%
+    ('player_assists',  'player_rebounds'): 0.06,
+    ('player_assists',  'player_threes'):   0.14,   # 0.10 → +40%
+    ('player_blocks',   'player_points'):  -0.05,
+    ('player_blocks',   'player_rebounds'): 0.36,   # 0.30 → +20%
+    ('player_blocks',   'player_steals'):   0.12,
+    ('player_points',   'player_rebounds'): 0.20,   # 0.15 → +33%
+    ('player_points',   'player_steals'):   0.12,
+    ('player_points',   'player_threes'):   0.62,   # 0.55 → +13%
+    ('player_rebounds', 'player_steals'):  -0.05,
+    ('player_rebounds', 'player_threes'):  -0.13,
+    ('player_steals',   'player_threes'):   0.05,
+}
+
 _MARKET_COL = {
     'player_points':   'PTS',
     'player_rebounds': 'REB',
@@ -96,11 +114,14 @@ def compute_player_correlations(logs: pd.DataFrame) -> Dict[Tuple[str, str], flo
 
 
 def get_pairwise_correlation(market_a: str, market_b: str,
-                              player_logs: Optional[pd.DataFrame] = None) -> float:
+                              player_logs: Optional[pd.DataFrame] = None,
+                              playoff_mode: bool = False) -> float:
     """
     Return the correlation between two markets for a player.
     Uses player-specific historical data if available (>= 15 games),
-    otherwise falls back to league-wide defaults.
+    otherwise falls back to league-wide defaults. When playoff_mode is True
+    and no player-specific correlation is available, uses the playoff default
+    dict (higher within-player correlations under compressed rotations).
     """
     key = tuple(sorted([market_a, market_b]))
     if key[0] == key[1]:
@@ -111,7 +132,8 @@ def get_pairwise_correlation(market_a: str, market_b: str,
         if key in player_corrs:
             return player_corrs[key]
 
-    return LEAGUE_AVG_CORRELATIONS.get(key, 0.0)
+    defaults = LEAGUE_AVG_CORRELATIONS_PLAYOFF if playoff_mode else LEAGUE_AVG_CORRELATIONS
+    return defaults.get(key, 0.0)
 
 
 # Props with lines at or below this threshold use the Poisson–Gaussian copula
@@ -219,7 +241,8 @@ def adjust_joint_probability(
     return float(np.clip(joint, 0.001, 0.999))
 
 
-def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -> Dict:
+def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None,
+                 playoff_mode: bool = False) -> Dict:
     """
     Evaluate a same-game parlay's true edge accounting for inter-stat correlations.
 
@@ -241,7 +264,8 @@ def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -
     implied_probs = [leg['implied_prob'] for leg in legs]
 
     if len(legs) == 2:
-        corr = get_pairwise_correlation(legs[0]['market'], legs[1]['market'], player_logs)
+        corr = get_pairwise_correlation(legs[0]['market'], legs[1]['market'],
+                                        player_logs, playoff_mode=playoff_mode)
         joint_true = adjust_joint_probability(
             true_probs[0], true_probs[1], corr,
             mean_a=legs[0].get('mean'), mean_b=legs[1].get('mean'),
@@ -256,7 +280,8 @@ def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None) -
         joint_true = true_probs[0]
         corr_applied = 0.0
         for i in range(1, len(legs)):
-            corr = get_pairwise_correlation(legs[i - 1]['market'], legs[i]['market'], player_logs)
+            corr = get_pairwise_correlation(legs[i - 1]['market'], legs[i]['market'],
+                                            player_logs, playoff_mode=playoff_mode)
             mean_a = legs[i - 1].get('mean') if i == 1 else None
             line_a = legs[i - 1].get('line') if i == 1 else None
             joint_true = adjust_joint_probability(
@@ -287,6 +312,7 @@ def compute_synthetic_pra_prob(
     mean_ast: float,
     pra_line: float,
     n_sims: int = 10_000,
+    playoff_mode: bool = False,
 ) -> Dict[str, float]:
     """
     Compute P(PTS + REB + AST > pra_line) via a trivariate Gaussian copula
@@ -312,9 +338,9 @@ def compute_synthetic_pra_prob(
     if mean_pts <= 0 or mean_reb <= 0 or mean_ast <= 0 or pra_line <= 0:
         return {}
 
-    rho_pr = get_pairwise_correlation('player_points',   'player_rebounds', logs)
-    rho_pa = get_pairwise_correlation('player_points',   'player_assists',  logs)
-    rho_ra = get_pairwise_correlation('player_rebounds', 'player_assists',  logs)
+    rho_pr = get_pairwise_correlation('player_points',   'player_rebounds', logs, playoff_mode=playoff_mode)
+    rho_pa = get_pairwise_correlation('player_points',   'player_assists',  logs, playoff_mode=playoff_mode)
+    rho_ra = get_pairwise_correlation('player_rebounds', 'player_assists',  logs, playoff_mode=playoff_mode)
 
     corr_matrix = np.array([
         [1.0,    rho_pr, rho_pa],
@@ -458,6 +484,8 @@ def build_team_correlation_matrix(
             f"{m_a.split('_')[1]}/{m_b.split('_')[1]}={c:.3f}(n={n})"
             for (m_a, m_b), (c, n) in corr_pairs.items()
         )
+    )
+
 
 def build_full_team_correlation_matrix(
     team_name: str,
@@ -482,7 +510,6 @@ def build_full_team_correlation_matrix(
                 # Insert reverse pair
                 db.upsert_cross_player_correlation(
                     team_name, p_b, p_a, mkt_b, mkt_a, corr, n)
-    )
 
 
 # ── Cross-team (opposing-player) correlations ─────────────────────────────────
@@ -523,22 +550,76 @@ def get_cross_team_default_corr(market_a: str, market_b: str) -> float:
     return CROSS_TEAM_DEFAULTS.get(key, 0.0)
 
 
+def compute_empirical_series_correlation(
+    logs_a: pd.DataFrame,
+    logs_b: pd.DataFrame,
+    col_a: str,
+    col_b: str,
+    opp_abbr_for_a: str,
+    min_games: int = 3,
+) -> Optional[float]:
+    """
+    Pearson correlation between stat col_a (player A) and col_b (player B) across
+    the current playoff series, determined by filtering both logs to playoff
+    games (SEASON_ID prefix '4') and aligning rows by GAME_ID.
+
+    Returns None when fewer than min_games aligned series games exist or when
+    required columns are missing. The returned correlation is in stat-space, so
+    the caller should treat it the same way as league CROSS_TEAM_DEFAULTS values.
+    """
+    required = {'GAME_ID', 'MATCHUP', 'SEASON_ID'}
+    if (logs_a is None or logs_b is None or logs_a.empty or logs_b.empty
+            or not required.issubset(logs_a.columns)
+            or not required.issubset(logs_b.columns)
+            or col_a not in logs_a.columns or col_b not in logs_b.columns):
+        return None
+
+    opp_upper = str(opp_abbr_for_a).upper()
+    series_a = logs_a[
+        logs_a['SEASON_ID'].astype(str).str.startswith('4')
+        & logs_a['MATCHUP'].astype(str).str.upper().str.contains(
+            opp_upper, na=False, regex=False
+        )
+    ]
+    if len(series_a) < min_games:
+        return None
+
+    series_b = logs_b[logs_b['SEASON_ID'].astype(str).str.startswith('4')]
+
+    a_side = series_a[['GAME_ID', col_a]].rename(columns={col_a: '__stat_a'})
+    b_side = series_b[['GAME_ID', col_b]].rename(columns={col_b: '__stat_b'})
+    merged = a_side.merge(b_side, on='GAME_ID', how='inner')
+    if len(merged) < min_games:
+        return None
+
+    val = merged['__stat_a'].corr(merged['__stat_b'])
+    if pd.isna(val):
+        return None
+    return float(val)
+
+
 def build_cross_team_correlation_matrix(
     home_team: str,
     away_team: str,
     stats_client: Any,
     db: Any,
+    home_player_logs: Optional[Dict[str, pd.DataFrame]] = None,
+    away_player_logs: Optional[Dict[str, pd.DataFrame]] = None,
+    away_abbr: str = "",
+    playoff_mode: bool = False,
 ) -> None:
     """
     Identify the opposing bigs for the home/away matchup and persist
-    cross-team correlation defaults for finite-resource market pairs.
+    cross-team correlation records for finite-resource market pairs.
 
-    Uses league-wide defaults rather than head-to-head empirical data
-    because two teams meet only 2–4 times per season — too sparse to
-    compute reliable Pearson correlations from aligned game logs.
+    In playoff_mode, when ≥3 series games exist and aligned player logs are
+    supplied, compute Pearson correlations empirically from the head-to-head
+    games and overwrite the league defaults. Otherwise use the defaults.
 
-    The DB record has a 7-day TTL (same as cross_player_correlations)
-    so the same matchup is only processed once per week.
+    Caching behavior:
+      - Regular season: 7-day TTL (matches the cross_player_correlations cache).
+      - Playoff mode: the TTL check is bypassed so the record tracks the
+        evolving series score each scan.
     """
     home_roster = stats_client.get_team_pg_and_big(home_team)
     away_roster = stats_client.get_team_pg_and_big(away_team)
@@ -554,27 +635,51 @@ def build_cross_team_correlation_matrix(
 
     matchup = "|".join(sorted([home_team.lower(), away_team.lower()]))
 
-    # Skip recomputation if a fresh DB record already exists for primary pair
-    if db.get_cross_team_correlation(
+    # Regular-season fast path: skip recomputation if a fresh DB record exists.
+    # Playoff scans always recompute — the series state changes game-to-game.
+    if not playoff_mode and db.get_cross_team_correlation(
         matchup, home_big['name'], away_big['name'],
         'player_rebounds', 'player_rebounds',
     ) is not None:
         return
 
+    home_logs = home_player_logs.get(home_big['name']) if home_player_logs else None
+    away_logs = away_player_logs.get(away_big['name']) if away_player_logs else None
+
+    used_empirical_pairs: List[str] = []
     for mkt_a, mkt_b in _CROSS_TEAM_PAIRS:
-        corr = CROSS_TEAM_DEFAULTS.get(tuple(sorted([mkt_a, mkt_b])), 0.0)
+        default_corr = CROSS_TEAM_DEFAULTS.get(tuple(sorted([mkt_a, mkt_b])), 0.0)
+        corr = default_corr
+        n_games = 0
+
+        if playoff_mode and home_logs is not None and away_logs is not None and away_abbr:
+            empirical = compute_empirical_series_correlation(
+                home_logs, away_logs,
+                _MARKET_COL.get(mkt_a, ''), _MARKET_COL.get(mkt_b, ''),
+                opp_abbr_for_a=away_abbr,
+                min_games=3,
+            )
+            if empirical is not None:
+                corr = empirical
+                # Recount aligned series games for DB bookkeeping
+                series_a = home_logs[
+                    home_logs['SEASON_ID'].astype(str).str.startswith('4')
+                    & home_logs['MATCHUP'].astype(str).str.upper().str.contains(
+                        away_abbr.upper(), na=False, regex=False
+                    )
+                ]
+                n_games = int(len(series_a))
+                used_empirical_pairs.append(f"{mkt_a.split('_')[1]}/{mkt_b.split('_')[1]}")
+
         # Store both orderings so lookups succeed regardless of leg order
         db.upsert_cross_team_correlation(
-            matchup, home_big['name'], away_big['name'], mkt_a, mkt_b, corr, 0)
+            matchup, home_big['name'], away_big['name'], mkt_a, mkt_b, corr, n_games)
         db.upsert_cross_team_correlation(
-            matchup, away_big['name'], home_big['name'], mkt_b, mkt_a, corr, 0)
+            matchup, away_big['name'], home_big['name'], mkt_b, mkt_a, corr, n_games)
 
+    tag = "EMPIRICAL" if used_empirical_pairs else "DEFAULT"
     logger.debug(
-        f"Cross-team corr stored: {home_team} {home_big['name']} ↔ "
-        f"{away_team} {away_big['name']} | "
-        + ", ".join(
-            f"{m_a.split('_')[1]}/{m_b.split('_')[1]}="
-            f"{CROSS_TEAM_DEFAULTS.get(tuple(sorted([m_a, m_b])), 0.0):.2f}"
-            for m_a, m_b in _CROSS_TEAM_PAIRS
-        )
+        f"Cross-team corr [{tag}]: {home_team} {home_big['name']} ↔ "
+        f"{away_team} {away_big['name']}"
+        + (f" | empirical: {','.join(used_empirical_pairs)}" if used_empirical_pairs else "")
     )

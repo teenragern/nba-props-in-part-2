@@ -17,13 +17,17 @@ Feature vector per game prediction (38 features):
   Minutes:
     avg_min_5g            average minutes last 5 games
     std_min_5g            std-dev of minutes last 5 games (consistency)
+    max_min_10g           maximum minutes played in last 10 games (ceiling proxy)
   Situational:
     home_flag             1 = home, 0 = away
     rest_days             days since last game (capped at 7)
     b2b_flag              1 = back-to-back
+    playoff_flag          1 = playoff game (target game)
+    playoff_share_5g      fraction of last 5 games that were playoffs (RS→PO window composition)
     games_played          total season games (proxy for small-sample risk)
     streak_factor         rate last 3 games / rate games 4-10 (hot/cold momentum, clamped 0.5-2.0)
     home_rate_delta       historical home per-min rate minus away per-min rate
+    series_game_num       consecutive games vs same opponent (playoff adaptation signal)
   Usage & efficiency (BDL real values at inference; box-score proxy at training):
     real_usage_pct        BDL true usage % (replaces (FGA+0.44*FTA+TOV)/MIN proxy)
     ts_pct_5g             true shooting % = PTS/(2*(FGA+0.44*FTA)); BDL general/advanced at inference
@@ -84,10 +88,11 @@ FEATURE_NAMES = [
     'rate_5g', 'rate_10g', 'rate_20g', 'rate_season',
     'ewm_rate_5g', 'ewm_rate_10g', 'ewm_rate_20g',
     # Minutes
-    'avg_min_5g', 'std_min_5g',
+    'avg_min_5g', 'std_min_5g', 'max_min_10g',
     # Situational
-    'home_flag', 'rest_days', 'b2b_flag', 'games_played',
-    'streak_factor', 'home_rate_delta',
+    'home_flag', 'rest_days', 'b2b_flag', 'playoff_flag', 'playoff_share_5g',
+    'games_played',
+    'streak_factor', 'home_rate_delta', 'series_game_num',
     # Usage & efficiency (BDL real at inference; proxy/computed at training)
     'real_usage_pct', 'ts_pct_5g',
     # Travel fatigue
@@ -218,9 +223,23 @@ class PropMLModel:
         away_logs = logs[logs['MATCHUP'].str.contains('@', na=False)].head(30)
         return self._safe_rate(home_logs) - self._safe_rate(away_logs)
 
+    def _playoff_share(self, logs: pd.DataFrame, n: int = 5) -> float:
+        """
+        Fraction of the last n games that were playoff games (SEASON_ID starts '4').
+        Signals how much of the rolling-rate window is playoff-composed so the
+        model can learn the RS→PO drift implicit in rate_5g / ewm_rate_5g.
+        """
+        recent = logs.head(n)
+        if recent.empty or 'SEASON_ID' not in recent.columns:
+            return 0.0
+        is_po = recent['SEASON_ID'].astype(str).str.startswith('4')
+        return float(is_po.sum()) / float(len(recent))
+
     def build_features(self, logs: pd.DataFrame,
                        home_flag: bool = False,
                        rest_days: int = 2,
+                       playoff_flag: bool = False,
+                       opp_abbr: str = "",
                        opp_def_rating: float = 1.0,
                        pace_factor: float = 1.0,
                        opp_pace: float = 1.0,
@@ -259,6 +278,16 @@ class PropMLModel:
         avg_min = r5['MIN'].mean()
         std_min = r5['MIN'].std() if len(r5) > 1 else 0.0
 
+        # Calculate series game number (consecutive games vs same opponent)
+        series_count = 1
+        if opp_abbr and 'MATCHUP' in logs.columns:
+            for _, row in logs.iterrows():
+                hist_opp = _extract_opp_abbr(str(row.get('MATCHUP', '')))
+                if hist_opp == opp_abbr:
+                    series_count += 1
+                else:
+                    break
+
         return {
             # Base rates (expanded)
             'rate_5g':          self._safe_rate(r5),
@@ -271,13 +300,17 @@ class PropMLModel:
             # Minutes
             'avg_min_5g':       float(avg_min) if not pd.isna(avg_min) else 0.0,
             'std_min_5g':       float(std_min) if not pd.isna(std_min) else 0.0,
+            'max_min_10g':      float(r10['MIN'].max()) if not r10.empty else 0.0,
             # Situational
             'home_flag':        int(home_flag),
             'rest_days':        min(rest_days, 7),
             'b2b_flag':         int(rest_days == 0),
+            'playoff_flag':     int(playoff_flag),
+            'playoff_share_5g': self._playoff_share(logs, n=5),
             'games_played':     len(logs),
             'streak_factor':    self._streak_factor(logs),
             'home_rate_delta':  self._home_rate_delta(logs),
+            'series_game_num':  series_count,
             # Usage & efficiency
             'real_usage_pct':   real_usage_pct if real_usage_pct > 0 else self._usage_proxy(logs, n=5),
             'ts_pct_5g':        ts_pct if ts_pct > 0 else self._ts_pct(logs, n=5),
@@ -372,6 +405,8 @@ class PropMLModel:
             prev_matchup = str(chron.iloc[i - 1].get('MATCHUP', ''))
             t_miles, t_tz, t_alt = travel_features_for_game(matchup, prev_matchup, own_abbr)
 
+            is_playoff = str(current.get('SEASON_ID', '')).startswith('4')
+
             _hist_foul_rate = 0.0
             if 'PF' in history.columns and 'MIN' in history.columns:
                 _h5 = history.head(5)
@@ -381,7 +416,7 @@ class PropMLModel:
                     _hist_foul_rate = float(_h5_pf / _h5_min)
 
             feats = self.build_features(
-                history, is_home, rest, opp_def, pace,
+                history, is_home, rest, is_playoff, opp_abbr, opp_def, pace,
                 opp_pace_norm, opp_reb_pct, opp_paint,
                 travel_miles=t_miles, tz_shift_hours=t_tz, altitude_flag=t_alt,
                 player_foul_rate=_hist_foul_rate,
@@ -427,7 +462,10 @@ class PropMLModel:
             self.model.fit(np.array(X), np.array(y), sample_weight=sw)
             joblib.dump(self.model, self.model_path)
             return True
-        except Exception:
+        except Exception as _e:
+            import traceback as _tb
+            from src.utils.logging_utils import get_logger as _gl
+            _gl(__name__).error(f"XGB train failed for {self.market}: {_e}\n{_tb.format_exc()}")
             self.model = None
             return False
 
@@ -470,7 +508,15 @@ class EnsembleModel:
         if os.path.exists(self.ensemble_path):
             try:
                 import joblib
-                self.ensemble = joblib.load(self.ensemble_path)
+                loaded = joblib.load(self.ensemble_path)
+                stored_feats = loaded.get('feature_names', []) if isinstance(loaded, dict) else []
+                if stored_feats != FEATURE_NAMES:
+                    # Feature set changed since training → discard rather than
+                    # feed a wrong-shape vector. Scan will fall back to the
+                    # Bayesian projection until train_ml is re-run.
+                    self.ensemble = None
+                else:
+                    self.ensemble = loaded
             except Exception:
                 self.ensemble = None
 
@@ -545,7 +591,10 @@ class EnsembleModel:
             }
             joblib.dump(self.ensemble, self.ensemble_path)
             return True
-        except Exception:
+        except Exception as _e:
+            import traceback as _tb
+            from src.utils.logging_utils import get_logger as _gl
+            _gl(__name__).error(f"Ensemble train failed for {self.market}: {_e}\n{_tb.format_exc()}")
             self.ensemble = None
             return False
 
@@ -578,6 +627,8 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
                       proj_minutes: float,
                       home_flag: bool = False,
                       rest_days: int = 2,
+                      playoff_flag: bool = False,
+                      opp_abbr: str = "",
                       opp_def_rating: float = 1.0,
                       pace_factor: float = 1.0,
                       opp_pace: float = 1.0,
@@ -628,13 +679,13 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
                           altitude_flag=altitude_flag)
 
     if market == 'player_points_rebounds_assists':
-        pts = get_ml_projection('player_points',  logs, proj_minutes, home_flag, rest_days,
+        pts = get_ml_projection('player_points',  logs, proj_minutes, home_flag, rest_days, playoff_flag, opp_abbr,
                                 opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
                                 **_travel_kwargs, **_bdl_kwargs)
-        reb = get_ml_projection('player_rebounds', logs, proj_minutes, home_flag, rest_days,
+        reb = get_ml_projection('player_rebounds', logs, proj_minutes, home_flag, rest_days, playoff_flag, opp_abbr,
                                 opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
                                 **_travel_kwargs, **_bdl_kwargs)
-        ast = get_ml_projection('player_assists',  logs, proj_minutes, home_flag, rest_days,
+        ast = get_ml_projection('player_assists',  logs, proj_minutes, home_flag, rest_days, playoff_flag, opp_abbr,
                                 opp_def_rating, pace_factor, opp_pace, opp_rebound_pct, opp_pts_paint,
                                 **_travel_kwargs, **_bdl_kwargs)
         if any(v is None for v in [pts, reb, ast]):
@@ -643,7 +694,7 @@ def get_ml_projection(market: str, logs: pd.DataFrame,
 
     # Build features once, try ensemble then XGB fallback
     prop_model = PropMLModel(market)
-    feats = prop_model.build_features(logs, home_flag, rest_days, opp_def_rating, pace_factor,
+    feats = prop_model.build_features(logs, home_flag, rest_days, playoff_flag, opp_abbr, opp_def_rating, pace_factor,
                                       opp_pace, opp_rebound_pct, opp_pts_paint,
                                       **_travel_kwargs, **_bdl_kwargs)
     if feats is None:

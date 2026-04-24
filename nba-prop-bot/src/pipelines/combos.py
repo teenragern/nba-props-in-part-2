@@ -28,7 +28,7 @@ Rules:
 import dateutil.parser
 from itertools import combinations
 from math import prod
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Tuple
 from datetime import datetime
 
 from src.models.sgp_correlations import (
@@ -106,7 +106,7 @@ def _american(decimal_odds: float) -> str:
     return f"-{int(100 / (decimal_odds - 1))}"
 
 
-def _leg_passes_quality_gate(leg: Dict) -> bool:
+def _leg_passes_quality_gate(leg: Dict, playoff_mode: bool = False) -> bool:
     """
     Return True only if this leg is independently strong enough to
     be included in a parlay. This is the single most important filter.
@@ -115,7 +115,7 @@ def _leg_passes_quality_gate(leg: Dict) -> bool:
     implied  = leg.get('implied_prob', 0.0)
 
     # Use calibrated probability for the quality check
-    cal_prob = calibrate_prob(raw_prob)
+    cal_prob = calibrate_prob(raw_prob, playoff_mode=playoff_mode)
 
     if cal_prob < PER_LEG_PROB_MIN:
         return False
@@ -201,7 +201,7 @@ def _compatible(legs: List[Dict]) -> bool:
     return True
 
 
-def _combo_edge(legs: List[Dict], db=None) -> Dict:
+def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
     """
     Compute joint edge for a combo using CALIBRATED probabilities.
 
@@ -209,7 +209,7 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
     Same-Team, and Cross-Team SGP sequences. Assumes independence for 
     cross-game links.
     """
-    cal_probs = [calibrate_prob(leg.get('model_prob', 0.5)) for leg in legs]
+    cal_probs = [calibrate_prob(leg.get('model_prob', 0.5), playoff_mode=playoff_mode) for leg in legs]
     implied_probs = [leg['implied_prob'] for leg in legs]
 
     joint_true = cal_probs[0]
@@ -227,7 +227,7 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
 
             if pa == pb:
                 # Same-player SGP (e.g. Points + Assists)
-                corr = get_pairwise_correlation(ma, mb)
+                corr = get_pairwise_correlation(ma, mb, playoff_mode=playoff_mode)
             elif team_a and team_a == team_b and db is not None:
                 # Same-team, cross-player SGP (e.g. Point Guard Assists + Center Points)
                 db_corr = db.get_cross_player_correlation(team_a, pa, pb, ma, mb)
@@ -236,8 +236,18 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
                 if db_corr is not None:
                     corr = db_corr
             elif team_a and team_b and team_a != team_b:
-                # Cross-team SGP (e.g. finite rebounding logic)
-                corr = get_cross_team_default_corr(ma, mb)
+                # Cross-team SGP (e.g. finite rebounding logic).
+                # Prefer the matchup's DB record — in playoff_mode with ≥3 series
+                # games, it holds an empirical Pearson. Fall back to the league
+                # default when no record exists.
+                corr = None
+                if db is not None:
+                    matchup_key = "|".join(sorted([team_a.lower(), team_b.lower()]))
+                    corr = db.get_cross_team_correlation(matchup_key, pa, pb, ma, mb)
+                    if corr is None:
+                        corr = db.get_cross_team_correlation(matchup_key, pb, pa, mb, ma)
+                if corr is None:
+                    corr = get_cross_team_default_corr(ma, mb)
 
         # Copula applied to first pair; subsequent legs sequence via Bivariate Normal
         mean_a = leg_a.get('mean') if i == 1 else None
@@ -264,7 +274,7 @@ def _combo_edge(legs: List[Dict], db=None) -> Dict:
     }
 
 
-def _format_combo(legs: List[Dict], edge: float, joint_prob: float) -> str:
+def _format_combo(legs: List[Dict], edge: float, joint_prob: float, playoff_mode: bool = False) -> str:
     combined = prod(leg['odds'] for leg in legs)
     event_ids = {leg.get('event_id', '') for leg in legs}
     if len(event_ids) == 1:
@@ -278,7 +288,7 @@ def _format_combo(legs: List[Dict], edge: float, joint_prob: float) -> str:
     for leg in legs:
         market = _MARKET_LABELS.get(leg['market'], leg['market'])
         raw_p  = leg.get('model_prob', 0)
-        cal_p  = calibrate_prob(raw_p)
+        cal_p  = calibrate_prob(raw_p, playoff_mode=playoff_mode)
         lines.append(
             f"• <b>{leg['player_id']}</b> {leg['side']} {leg['line']} {market}"
             f" @ {leg.get('book', '')} ({_american(leg['odds'])})"
@@ -311,7 +321,8 @@ def _four_leg_sent_today_count(db) -> int:
 
 
 def _format_four_leg_parlay(
-    legs: List[Dict], edge: float, joint_prob: float, stake: float, ticket_num: int
+    legs: List[Dict], edge: float, joint_prob: float, stake: float, ticket_num: int,
+    playoff_mode: bool = False,
 ) -> str:
     combined = prod(leg['odds'] for leg in legs)
     n_events = len({leg.get('event_id', '') for leg in legs})
@@ -320,7 +331,7 @@ def _format_four_leg_parlay(
     lines     = [header]
     for leg in legs:
         market = _MARKET_LABELS.get(leg['market'], leg['market'])
-        cal_p  = calibrate_prob(leg.get('model_prob', 0))
+        cal_p  = calibrate_prob(leg.get('model_prob', 0), playoff_mode=playoff_mode)
         away   = leg.get('away_team', '')
         home   = leg.get('home_team', '')
         game   = f"[{away}@{home}]" if away and home else ''
@@ -340,6 +351,7 @@ def generate_four_leg_parlays(
     actionable: List[Dict[str, Any]],
     bot: TelegramBotClient,
     db=None,
+    playoff_mode: bool = False,
 ) -> None:
     """
     Generate up to 2 non-overlapping 4-leg parlays per day.
@@ -359,7 +371,7 @@ def generate_four_leg_parlays(
         logger.info("4-Leg Parlays: daily limit reached — skipping.")
         return
 
-    parlay_eligible = [e for e in actionable if _leg_passes_quality_gate(e)]
+    parlay_eligible = [e for e in actionable if _leg_passes_quality_gate(e, playoff_mode=playoff_mode)]
     if len(parlay_eligible) < 4:
         logger.info(
             f"4-Leg Parlays: only {len(parlay_eligible)} eligible legs (need ≥4). Skipping."
@@ -389,7 +401,7 @@ def generate_four_leg_parlays(
             if not _compatible(legs):
                 continue
 
-            cal_probs     = [calibrate_prob(l.get('model_prob', 0.5)) for l in legs]
+            cal_probs     = [calibrate_prob(l.get('model_prob', 0.5), playoff_mode=playoff_mode) for l in legs]
             implied_probs = [l['implied_prob'] for l in legs]
 
             jt         = prod(cal_probs) * FOUR_LEG_REALITY_TAX
@@ -412,7 +424,7 @@ def generate_four_leg_parlays(
         combined   = prod(l['odds'] for l in legs)
 
         stake = _parlay_kelly_stake(legs, joint_prob, combined, max_pct=FOUR_LEG_KELLY_CAP)
-        msg   = _format_four_leg_parlay(legs, joint_edge, joint_prob, stake, ticket_num)
+        msg   = _format_four_leg_parlay(legs, joint_edge, joint_prob, stake, ticket_num, playoff_mode=playoff_mode)
 
         n_events = len({l.get('event_id', '') for l in legs})
         kind     = 'SGP' if n_events == 1 else f'{n_events}-game'
@@ -457,7 +469,8 @@ def _slate_ultimate_sent_today(db) -> bool:
 
 
 def _format_slate_ultimate(
-    legs: List[Dict], edge: float, joint_prob: float, stake: float
+    legs: List[Dict], edge: float, joint_prob: float, stake: float,
+    playoff_mode: bool = False,
 ) -> str:
     combined = prod(leg['odds'] for leg in legs)
     n_games  = len({leg.get('event_id', '') for leg in legs})
@@ -465,7 +478,7 @@ def _format_slate_ultimate(
     lines    = [header]
     for leg in legs:
         market = _MARKET_LABELS.get(leg['market'], leg['market'])
-        cal_p  = calibrate_prob(leg.get('model_prob', 0))
+        cal_p  = calibrate_prob(leg.get('model_prob', 0), playoff_mode=playoff_mode)
         away   = leg.get('away_team', '')
         home   = leg.get('home_team', '')
         game   = f"[{away}@{home}]" if away and home else ''
@@ -485,6 +498,7 @@ def generate_slate_ultimate(
     actionable: List[Dict[str, Any]],
     bot: TelegramBotClient,
     db=None,
+    playoff_mode: bool = False,
 ) -> None:
     """
     Generate and queue exactly one 8-leg 'Slate Ultimate' Golden Ticket per day.
@@ -502,7 +516,7 @@ def generate_slate_ultimate(
         logger.info("Slate Ultimate: already queued today — skipping.")
         return
 
-    parlay_eligible = [e for e in actionable if _leg_passes_quality_gate(e)]
+    parlay_eligible = [e for e in actionable if _leg_passes_quality_gate(e, playoff_mode=playoff_mode)]
 
     # One best leg per game
     best_per_game: Dict[str, Dict] = {}
@@ -536,7 +550,7 @@ def generate_slate_ultimate(
         if len({l['player_id'] for l in legs}) < len(legs):
             continue
 
-        cal_probs     = [calibrate_prob(l.get('model_prob', 0.5)) for l in legs]
+        cal_probs     = [calibrate_prob(l.get('model_prob', 0.5), playoff_mode=playoff_mode) for l in legs]
         implied_probs = [l['implied_prob'] for l in legs]
 
         jt         = prod(cal_probs) * SLATE_ULTIMATE_REALITY
@@ -559,7 +573,7 @@ def generate_slate_ultimate(
     combined   = prod(l['odds'] for l in legs)
 
     stake = _parlay_kelly_stake(legs, joint_prob, combined, max_pct=SLATE_ULTIMATE_KELLY_CAP)
-    msg   = _format_slate_ultimate(legs, joint_edge, joint_prob, stake)
+    msg   = _format_slate_ultimate(legs, joint_edge, joint_prob, stake, playoff_mode=playoff_mode)
 
     n_games = len({l.get('event_id', '') for l in legs})
     title   = (
@@ -582,6 +596,7 @@ def generate_and_alert_combos(
     actionable: List[Dict[str, Any]],
     bot: TelegramBotClient,
     db=None,
+    playoff_mode: bool = False,
 ) -> None:
     """
     Generate the best parlay from the slate (SGP or cross-game).
@@ -598,7 +613,7 @@ def generate_and_alert_combos(
         return
 
     # ── Step 1: Filter to parlay-quality legs only ────────────────────────
-    parlay_eligible = [e for e in actionable if _leg_passes_quality_gate(e)]
+    parlay_eligible = [e for e in actionable if _leg_passes_quality_gate(e, playoff_mode=playoff_mode)]
 
     if len(parlay_eligible) < 2:
         logger.info(
@@ -628,7 +643,7 @@ def generate_and_alert_combos(
             if not _compatible(legs):
                 continue
 
-            result = _combo_edge(legs, db=db)
+            result = _combo_edge(legs, db=db, playoff_mode=playoff_mode)
             raw_joint = result.get('joint_true_prob', 0)
 
             _is_sgp = len({l.get('event_id') for l in legs}) == 1
@@ -648,7 +663,7 @@ def generate_and_alert_combos(
                 }
 
     if best:
-        msg = _format_combo(best['legs'], best['edge'], best['joint_prob'])
+        msg = _format_combo(best['legs'], best['edge'], best['joint_prob'], playoff_mode=playoff_mode)
         bot.send_message(msg)
         n_events = len({l.get('event_id') for l in best['legs']})
         kind = 'SGP' if n_events == 1 else 'cross-game'

@@ -4,18 +4,25 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-def generate_analytics():
+def generate_analytics(since: str = None):
     db = DatabaseClient()
-    
+
+    params = ()
+    where = ""
+    if since:
+        where = " WHERE a.timestamp >= ?"
+        params = (since,)
+
     with db.get_conn() as conn:
-        query = """
+        query = f"""
         SELECT a.id, a.player_name, a.market, a.edge, b.won, b.actual_result,
                c.clv, c.closing_odds, a.odds as alert_odds
         FROM alerts_sent a
         JOIN bet_results b ON a.id = b.alert_id
         LEFT JOIN clv_tracking c ON a.player_name = c.player_id AND a.market = c.market
+        {where}
         """
-        df = pd.read_sql_query(query, conn)
+        df = pd.read_sql_query(query, conn, params=params)
         
     if df.empty:
         print("No settled data available for analytics.")
@@ -47,6 +54,8 @@ def generate_analytics():
     print("\\n===========================================")
     print("      NBA PROP BOT MODEL PERFORMANCE       ")
     print("===========================================")
+    if since:
+        print(f"Filter: since {since}")
     print(f"Total Settled Alerts : {total_bets}")
     print(f"Win Rate             : {win_rate:.2%}")
     print(f"Estimated ROI        : {roi:.2%}")

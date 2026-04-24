@@ -45,37 +45,56 @@ _KNOTS = [
 ]
 
 
-def calibrate_prob(raw_prob: float) -> float:
+# Fraction of the RS-fit correction to apply when playoff_mode=True.
+# 0.50 → blend 50/50 raw↔calibrated. The curve was fit on 206 regular-season
+# settled alerts; until playoff outcomes are tagged and re-fit, we damp the
+# correction to avoid overapplying a misfit shape to a different distribution.
+_PLAYOFF_CALIBRATION_STRENGTH = 0.50
+
+
+def calibrate_prob(raw_prob: float, playoff_mode: bool = False) -> float:
     """
     Map a raw model probability to a calibrated probability using
     piecewise-linear interpolation through empirical knots.
 
     Args:
         raw_prob: model's predicted P(side hits), range [0, 1].
+        playoff_mode: when True, blend the RS-fit correction with the raw
+            probability at _PLAYOFF_CALIBRATION_STRENGTH (default 0.50). The
+            knots were fit on regular-season alerts and are not validated
+            for playoff outcomes yet.
 
     Returns:
         Calibrated probability, clamped to [0.01, 0.99].
     """
     if raw_prob <= _KNOTS[0][0]:
-        return max(0.01, _KNOTS[0][1])
-    if raw_prob >= _KNOTS[-1][0]:
-        return min(0.99, _KNOTS[-1][1])
+        calibrated = _KNOTS[0][1]
+    elif raw_prob >= _KNOTS[-1][0]:
+        calibrated = _KNOTS[-1][1]
+    else:
+        calibrated = raw_prob
+        for i in range(len(_KNOTS) - 1):
+            x0, y0 = _KNOTS[i]
+            x1, y1 = _KNOTS[i + 1]
+            if x0 <= raw_prob <= x1:
+                if x1 == x0:
+                    calibrated = y0
+                else:
+                    t = (raw_prob - x0) / (x1 - x0)
+                    calibrated = y0 + t * (y1 - y0)
+                break
 
-    # Find the surrounding knots and interpolate
-    for i in range(len(_KNOTS) - 1):
-        x0, y0 = _KNOTS[i]
-        x1, y1 = _KNOTS[i + 1]
-        if x0 <= raw_prob <= x1:
-            if x1 == x0:
-                return y0
-            t = (raw_prob - x0) / (x1 - x0)
-            calibrated = y0 + t * (y1 - y0)
-            return float(max(0.01, min(0.99, calibrated)))
+    if playoff_mode:
+        calibrated = (
+            _PLAYOFF_CALIBRATION_STRENGTH * calibrated
+            + (1.0 - _PLAYOFF_CALIBRATION_STRENGTH) * raw_prob
+        )
 
-    return raw_prob
+    return float(max(0.01, min(0.99, calibrated)))
 
 
-def calibrate_edge_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+def calibrate_edge_candidate(candidate: Dict[str, Any],
+                             playoff_mode: bool = False) -> Dict[str, Any]:
     """
     Apply calibration to a single edge candidate dict (in-place).
     Stores both raw and calibrated values for transparency.
@@ -87,13 +106,14 @@ def calibrate_edge_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
     """
     raw = candidate.get('model_prob', 0.5)
     candidate['raw_model_prob'] = raw
-    candidate['model_prob'] = calibrate_prob(raw)
+    candidate['model_prob'] = calibrate_prob(raw, playoff_mode=playoff_mode)
     candidate['calibrated'] = True
     return candidate
 
 
-def calibrate_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def calibrate_candidates(candidates: List[Dict[str, Any]],
+                         playoff_mode: bool = False) -> List[Dict[str, Any]]:
     """Calibrate a list of edge candidates. Mutates in place and returns the list."""
     for c in candidates:
-        calibrate_edge_candidate(c)
+        calibrate_edge_candidate(c, playoff_mode=playoff_mode)
     return candidates

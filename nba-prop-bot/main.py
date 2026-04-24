@@ -25,6 +25,7 @@ def main():
     
     # stats command
     stats_parser = subparsers.add_parser("stats", help="Show performance analytics")
+    stats_parser.add_argument("--since", help="Only include alerts on/after this date (e.g. 2026-04-18)")
     
     # Phase 4 Commands
     cal_parser = subparsers.add_parser("calibration", help="Check probability calibration and Brier score")
@@ -75,7 +76,7 @@ def main():
         settle_alerts()
     elif args.command == "stats":
         from src.pipelines.analytics import generate_analytics
-        generate_analytics()
+        generate_analytics(since=args.since)
     elif args.command == "calibration":
         from src.pipelines.calibration import check_calibration
         check_calibration()

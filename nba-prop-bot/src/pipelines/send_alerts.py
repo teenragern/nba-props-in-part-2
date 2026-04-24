@@ -93,8 +93,8 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         stake = min(stake, BANKROLL * 0.05)  # hard cap: 5% per bet
     stake = _camouflage_stake(stake)
 
-    MAX_DAILY_RISK = BANKROLL * 0.50
-    MAX_PER_GAME   = BANKROLL * 0.20
+    MAX_DAILY_RISK = BANKROLL * 1.00
+    MAX_PER_GAME   = BANKROLL * 0.40
 
     with db.get_conn() as conn:
         cursor = conn.cursor()
@@ -369,8 +369,8 @@ def send_game_market_alert(
         stake = min(stake, BANKROLL * 0.03)
     stake = _camouflage_stake(stake)
 
-    MAX_DAILY_RISK = BANKROLL * 0.50
-    MAX_PER_GAME   = BANKROLL * 0.20
+    MAX_DAILY_RISK = BANKROLL * 1.00
+    MAX_PER_GAME   = BANKROLL * 0.40
 
     with db.get_conn() as conn:
         cursor = conn.cursor()

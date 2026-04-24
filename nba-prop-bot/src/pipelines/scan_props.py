@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 import dateutil.parser
 from dateutil import tz
 from typing import List, Dict, Any, Tuple, Optional
+import pandas as pd
 
 from src.utils.logging_utils import get_logger
 from src.data.db import DatabaseClient
@@ -38,6 +39,7 @@ from src.clients.telegram_bot import TelegramBotClient
 from src.config import (
     PROP_MARKETS, ALT_PROP_MARKETS, ALT_TO_BASE_MARKET,
     EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN,
+    PLAYOFF_EDGE_MIN, PLAYOFF_SHARP_EDGE_MIN,
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
 )
@@ -54,7 +56,11 @@ from src.models.devig import (
     decimal_to_implied_prob, devig_two_way, devig_shin,
     build_consensus_true_prob, get_theoretical_hold,
 )
-from src.models.edge_ranker import rank_edges, set_db as set_ranker_db
+from src.models.edge_ranker import (
+    rank_edges,
+    set_db as set_ranker_db,
+    set_playoff_mode as set_ranker_playoff_mode,
+)
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert, send_line_disagreement_alert
 from src.pipelines.combos import generate_and_alert_combos, generate_slate_ultimate, generate_four_leg_parlays
@@ -82,6 +88,9 @@ _SHARP_RECENT_SEC    = 120
 
 # Game markets are highly efficient — require a stricter edge threshold.
 _GAME_MARKET_EDGE_MIN = 0.015  # 1.5 %
+
+# Toggle this to True during the playoffs to tighten rotations and disable regular-season rest logic
+PLAYOFF_MODE = True
 
 # ── Credit-conservation: events TTL cache ─────────────────────────────────────
 # get_events() costs 1 credit. Between 90-min scans the event list is
@@ -194,13 +203,24 @@ def _get_team_rest_days(team_name: str) -> int:
             return rest
 
         time.sleep(0.6)
-        tgl = teamgamelog.TeamGameLog(
+        tgl_rs = teamgamelog.TeamGameLog(
             team_id=matches[0]['id'],
             season_type_all_star='Regular Season',
         )
-        df = tgl.get_data_frames()[0]
+        df_rs = tgl_rs.get_data_frames()[0]
+
+        time.sleep(0.6)
+        tgl_po = teamgamelog.TeamGameLog(
+            team_id=matches[0]['id'],
+            season_type_all_star='Playoffs',
+        )
+        df_po = tgl_po.get_data_frames()[0]
+
+        df = pd.concat([df_rs, df_po], ignore_index=True)
         if not df.empty and 'GAME_DATE' in df.columns:
-            last_game = pd.to_datetime(df.iloc[0]['GAME_DATE'])
+            df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+            df = df.sort_values('GAME_DATE', ascending=False)
+            last_game = df.iloc[0]['GAME_DATE']
             today = pd.Timestamp.today().normalize()
             rest = max(0, int((today - last_game).days) - 1)
     except Exception:
@@ -665,6 +685,7 @@ def scan_props():
     rotation_model = RotationModel(stats_client)
 
     set_ranker_db(db)
+    set_ranker_playoff_mode(PLAYOFF_MODE)
     db.init_bookmaker_profiles()
     _book_weights = db.get_sharp_book_weights()
 
@@ -752,6 +773,18 @@ def scan_props():
             home_team   = event['home_team']
             away_team   = event['away_team']
             commence_str = event.get('commence_time', '')
+
+        # Pre-match only — skip any game that has already tipped off
+        if commence_str:
+            try:
+                _cd = dateutil.parser.isoparse(commence_str)
+                if _cd.tzinfo is None:
+                    _cd = _cd.replace(tzinfo=timezone.utc)
+                if _cd <= datetime.now(timezone.utc):
+                    logger.info(f"Skipping in-progress game: {home_team} vs {away_team} (tipped at {_cd})")
+                    continue
+            except Exception:
+                pass
 
         game_date = today
 
@@ -921,8 +954,8 @@ def scan_props():
         # foul-trouble risk.  Cascade: starter C minutes × 0.85, backup C × 1.30.
         #
         # Compute per-side: a home player's opponent is the away team and v.v.
-        _home_opp_ctx = stats_client.get_opponent_matchup_context(away_team)
-        _away_opp_ctx = stats_client.get_opponent_matchup_context(home_team)
+        _home_opp_ctx = stats_client.get_opponent_matchup_context(away_team, playoff_blend=PLAYOFF_MODE)
+        _away_opp_ctx = stats_client.get_opponent_matchup_context(home_team, playoff_blend=PLAYOFF_MODE)
         _crew_foul_mult = _crew_factor.get("foul_rate_multiplier", 1.0)
         _tight_whistle  = _crew_factor.get("tight_whistle", False)
 
@@ -987,7 +1020,7 @@ def scan_props():
             )
 
         # ── Pace data ─────────────────────────────────────────────────
-        pace_info = stats_client.get_team_pace(home_team, away_team)
+        pace_info = stats_client.get_team_pace(home_team, away_team, playoff_blend=PLAYOFF_MODE)
 
         # ── Rest asymmetry ────────────────────────────────────────────
         _rest_asym = compute_rest_asymmetry(home_team, away_team)
@@ -1000,7 +1033,9 @@ def scan_props():
 
         # BDL standings context (rest risk + blowout risk)
         _standings_ctx = {}
-        if _bdl_standings:
+        if PLAYOFF_MODE:
+            logger.debug("Playoff mode active: ignoring regular season standings blowout risk.")
+        elif _bdl_standings:
             _standings_ctx = _bdl_standings.get_game_context(
                 home_team, away_team, season=_season_int
             )
@@ -1427,7 +1462,7 @@ def scan_props():
                 starter_flag = NbaStatsClient.infer_starter_flag(logs)
 
             opp_team = away_team if home_flag else home_team
-            _opp_ctx = stats_client.get_opponent_matchup_context(opp_team)
+            _opp_ctx = stats_client.get_opponent_matchup_context(opp_team, playoff_blend=PLAYOFF_MODE)
             _player_foul_rate = compute_player_foul_rate(logs)
 
             # Revenge game: player previously played for tonight's opponent
@@ -1496,7 +1531,7 @@ def scan_props():
                 base_mkt = ALT_TO_BASE_MARKET.get(mkt, mkt)
 
                 opp_multiplier = stats_client.get_positional_def_multiplier(
-                    opp_team, base_mkt, _position_group
+                    opp_team, base_mkt, _position_group, playoff_blend=PLAYOFF_MODE
                 )
 
                 # BDL defense context: position-specific DRTG-weighted factor.
@@ -1545,6 +1580,7 @@ def scan_props():
                                 f"(initiators_out={_initiators_out})"
                             )
 
+                    _opp_abbr_proj = TEAM_NAME_TO_ABBR.get(opp_team, opp_team.split()[-1][:3].upper())
                     proj = build_player_projection(
                         player_id=player_name, market=base_mkt, line=line,
                         recent_logs=logs, season_logs=logs,
@@ -1561,6 +1597,8 @@ def scan_props():
                         fatigue_multiplier=_adj_fatigue_mult,
                         role_shift_rate=_role_shift_rate,
                         initiators_out=_initiators_out,
+                        playoff_mode=PLAYOFF_MODE,
+                        opp_abbr=_opp_abbr_proj,
                     )
 
                     if not proj or proj.get('mean', 0) == 0:
@@ -1569,14 +1607,38 @@ def scan_props():
                     if proj.get('projected_minutes', 0) < 10:
                         continue
 
+                    # ── Playoff Rotation Adjustments ──────────────────────────
+                    if PLAYOFF_MODE:
+                        if starter_flag:
+                            # Starters play heavier minutes in the playoffs (boost by ~10%, cap at 43)
+                            proj['projected_minutes'] = min(43.0, proj['projected_minutes'] * 1.10)
+                            proj['mean'] *= 1.10
+                            # Minutes are more predictable for starters, reducing variance
+                            proj['variance_scale'] = proj.get('variance_scale', 1.0) * 0.85
+                        elif proj['projected_minutes'] < 16.0:
+                            # Deep bench gets squeezed out of the rotation
+                            proj['projected_minutes'] *= 0.50
+                            proj['mean'] *= 0.50
+                            # High volatility for deep bench (dependent on garbage time/fouls)
+                            proj['variance_scale'] = proj.get('variance_scale', 1.0) * 1.25
+                        else:
+                            # Regular bench rotation also sees increased volatility in playoffs
+                            proj['variance_scale'] = proj.get('variance_scale', 1.0) * 1.15
+
                     # XGBoost blend
-                    _league_avg_pace = 99.0
+                    _league_avg_pace = pace_info.get('league_avg', 99.0)
+                    if PLAYOFF_MODE:
+                        # Playoff pace runs ~3% slower than regular season.
+                        _league_avg_pace = min(_league_avg_pace, 96.0)
                     _pace_factor = (
                         (pace_info['home_pace'] + pace_info['away_pace'])
                         / (2.0 * _league_avg_pace)
                     )
+                    _opp_abbr_ml = TEAM_NAME_TO_ABBR.get(opp_team, opp_team.split()[-1][:3].upper())
                     ml_mean = get_ml_projection(
                         base_mkt, logs, proj['projected_minutes'], home_flag, rest_days,
+                            playoff_flag=PLAYOFF_MODE,
+                        opp_abbr=_opp_abbr_ml,
                         opp_def_rating=opp_multiplier,
                         pace_factor=_pace_factor,
                         opp_pace=_opp_ctx['opp_pace'],
@@ -1703,6 +1765,9 @@ def scan_props():
                         bench_tier=_bench_tier,
                         next_opp_win_pct=_next_opp_win_pct,
                         revenge_game=_revenge_game,
+                        playoff_mode=PLAYOFF_MODE,
+                        must_win=bool(proj.get('must_win', False)),
+                        closeout_game=bool(proj.get('closeout_opportunity', False)),
                     )
 
                     # ── Get best odds (BDL primary, Odds API for sharp) ───
@@ -1802,7 +1867,8 @@ def scan_props():
                                 continue
                             rec_implied = decimal_to_implied_prob(rec_price)
                             sharp_gap = true_prob - rec_implied
-                            if sharp_gap < SHARP_EDGE_MIN:
+                            _sharp_edge_min = PLAYOFF_SHARP_EDGE_MIN if PLAYOFF_MODE else SHARP_EDGE_MIN
+                            if sharp_gap < _sharp_edge_min:
                                 continue
                             dedup_key = (player_name, mkt, line, chk_side)
                             if dedup_key in sharp_alerted:
@@ -1826,9 +1892,24 @@ def scan_props():
             except Exception as e:
                 logger.warning(f"Failed to build full team correlation matrix for {_t_name}: {e}")
 
+        # ── Cross-Team Correlations (big-vs-big, empirical in playoffs) ──
+        try:
+            from src.models.sgp_correlations import build_cross_team_correlation_matrix
+            _away_abbr_corr = TEAM_NAME_TO_ABBR.get(away_team, '')
+            build_cross_team_correlation_matrix(
+                home_team, away_team, stats_client, db,
+                home_player_logs=team_player_logs.get(home_team),
+                away_player_logs=team_player_logs.get(away_team),
+                away_abbr=_away_abbr_corr,
+                playoff_mode=PLAYOFF_MODE,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to build cross-team correlation matrix for {home_team} vs {away_team}: {e}")
+
     # ── Rank and alert ────────────────────────────────────────────────
     ranked_edges = rank_edges(candidates)
-    actionable = [e for e in ranked_edges if e.get('edge', 0) >= e.get('edge_min_applied', EDGE_MIN)]
+    _edge_min_floor = PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN
+    actionable = [e for e in ranked_edges if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)]
 
     logger.info(
         f"Scan complete: {len(candidates)} candidates, {len(actionable)} actionable edges. "
@@ -1838,9 +1919,9 @@ def scan_props():
     for edge in actionable:
         evaluate_and_alert(edge, db, bot)
 
-    generate_and_alert_combos(actionable, bot, db=db)
-    generate_four_leg_parlays(actionable, bot, db=db)
-    generate_slate_ultimate(actionable, bot, db=db)
+    generate_and_alert_combos(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+    generate_four_leg_parlays(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+    generate_slate_ultimate(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
 
     if BDL_ENABLED_RUNTIME and _bdl_bridge:
         logger.info(f"BDL requests this scan: {_bdl_bridge.bdl.requests_made}")

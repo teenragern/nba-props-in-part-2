@@ -8,6 +8,20 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))
 MIN_PROJECTED_MINUTES = float(os.getenv("MIN_PROJECTED_MINUTES", "15.0"))
+
+# Playoff overrides. Lines tighten (sharper books, more handle) and rotations
+# compress (bench rarely sees the floor). When scan_props runs with
+# PLAYOFF_MODE=True it selects these in place of the regular-season values.
+PLAYOFF_EDGE_MIN              = float(os.getenv("PLAYOFF_EDGE_MIN", "0.06"))
+PLAYOFF_MIN_PROJECTED_MINUTES = float(os.getenv("PLAYOFF_MIN_PROJECTED_MINUTES", "18.0"))
+
+# Per-market edge-floor overrides (applied on top of the dynamic floor).
+# Blocks are priced sharp — market_stats shows +0.10% bias, no real edge.
+PER_MARKET_EDGE_MIN: dict = {
+    'player_blocks': float(os.getenv("EDGE_MIN_BLOCKS", "0.09")),
+    'player_assists': float(os.getenv("EDGE_MIN_ASSISTS", "0.25")),
+    'player_points_rebounds_assists': float(os.getenv("EDGE_MIN_PRA", "0.15")),
+}
 ODDS_REGION = os.getenv("ODDS_REGION", "us")
 BOOKMAKERS_RAW = os.getenv("BOOKMAKERS", "draftkings,fanduel,betmgm,caesars,betonlineag,lowvig")
 BOOKMAKERS = BOOKMAKERS_RAW.split(",") if BOOKMAKERS_RAW else []
@@ -31,6 +45,7 @@ SHARP_BOOKS     = [b.strip() for b in SHARP_BOOKS_RAW.split(",") if b.strip()]
 REC_BOOKS_RAW   = os.getenv("REC_BOOKS", "draftkings,fanduel")
 REC_BOOKS       = [b.strip() for b in REC_BOOKS_RAW.split(",") if b.strip()]
 SHARP_EDGE_MIN  = float(os.getenv("SHARP_EDGE_MIN", "0.03"))
+PLAYOFF_SHARP_EDGE_MIN = float(os.getenv("PLAYOFF_SHARP_EDGE_MIN", "0.035"))
 
 # Consensus sharp books for synthetic true probability
 CONSENSUS_BOOKS_RAW = os.getenv("CONSENSUS_BOOKS", "pinnacle,circa,bookmaker")

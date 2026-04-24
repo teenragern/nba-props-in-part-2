@@ -88,14 +88,78 @@ _POSITION_FACTORS: dict = {
 _POSITION_BLEND = 0.25
 
 
+def _playoff_blend_weight(po_gp: float) -> float:
+    """
+    Blend weight placed on playoff stats vs. regular season, based on the number
+    of playoff games the team has played.
+      < 3 games → 0.0  (too small a sample, pure RS)
+      3-4 games → 0.40
+      5+ games  → 0.60
+    """
+    if po_gp < 3:
+        return 0.0
+    if po_gp < 5:
+        return 0.40
+    return 0.60
+
+
+def _blend_playoff_stats(rs_df: pd.DataFrame, po_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-team weighted blend of RS and Playoff team-stats frames.
+    Teams below the playoff-games threshold keep pure RS values; others blend
+    per-column based on their playoff GP.
+    Non-numeric and identifier columns (TEAM_ID/GP/W/L/MIN) are never blended.
+    """
+    if rs_df is None or rs_df.empty:
+        return rs_df
+    if po_df is None or po_df.empty:
+        return rs_df.copy()
+    if 'TEAM_NAME' not in rs_df.columns or 'TEAM_NAME' not in po_df.columns:
+        return rs_df.copy()
+
+    skip = {'TEAM_ID', 'TEAM_NAME', 'TEAM_ABBREVIATION', 'GP', 'W', 'L', 'MIN'}
+    numeric_cols = [
+        c for c in rs_df.columns
+        if c not in skip
+        and c in po_df.columns
+        and pd.api.types.is_numeric_dtype(rs_df[c])
+        and pd.api.types.is_numeric_dtype(po_df[c])
+    ]
+
+    blended = rs_df.copy()
+    po_indexed = po_df.copy()
+    po_indexed['_tn_lower'] = po_indexed['TEAM_NAME'].astype(str).str.lower()
+    po_indexed = po_indexed.drop_duplicates(subset=['_tn_lower']).set_index('_tn_lower')
+
+    for idx in blended.index:
+        team_name_lower = str(blended.at[idx, 'TEAM_NAME']).lower()
+        if team_name_lower not in po_indexed.index:
+            continue
+        po_row = po_indexed.loc[team_name_lower]
+        po_gp = float(po_row.get('GP', 0) or 0)
+        w_po = _playoff_blend_weight(po_gp)
+        if w_po <= 0.0:
+            continue
+        for col in numeric_cols:
+            rs_val = float(blended.at[idx, col])
+            po_val = float(po_row.get(col, rs_val))
+            blended.at[idx, col] = (1.0 - w_po) * rs_val + w_po * po_val
+    return blended
+
+
 class NbaStatsClient:
     def __init__(self, season: str = None):
         self.season = season or get_current_nba_season()
         self.cache_db = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'stats_cache.db')
         self._init_cache()
-        self._opp_stats_cache: Optional[pd.DataFrame] = None   # Opponent PerGame
-        self._adv_stats_cache: Optional[pd.DataFrame] = None   # Advanced (PACE, DEF_RATING, DREB_PCT)
-        self._def_stats_cache: Optional[pd.DataFrame] = None   # Defense dashboard (OPP_PTS_PAINT)
+        # Caches keyed by season_type ('Regular Season' | 'Playoffs')
+        self._opp_stats_cache: Dict[str, pd.DataFrame] = {}
+        self._adv_stats_cache: Dict[str, pd.DataFrame] = {}
+        self._def_stats_cache: Dict[str, pd.DataFrame] = {}
+        # Blended (RS + Playoffs per-team) caches
+        self._blended_adv_cache: Optional[pd.DataFrame] = None
+        self._blended_def_cache: Optional[pd.DataFrame] = None
+        self._blended_opp_cache: Optional[pd.DataFrame] = None
         self._player_season_cache: Optional[pd.DataFrame] = None  # PerGame player stats (PG/big detection)
 
     def _init_cache(self):
@@ -140,12 +204,25 @@ class NbaStatsClient:
                 return pd.read_json(io.StringIO(row[1]))
 
         logger.info(f"Fetching game logs for player {player_id}")
-        logs = playergamelogs.PlayerGameLogs(
+        logs_rs = playergamelogs.PlayerGameLogs(
             player_id_nullable=player_id,
-            season_nullable=self.season
+            season_nullable=self.season,
+            season_type_nullable='Regular Season'
         )
         time.sleep(0.6)
-        df = logs.get_data_frames()[0]
+        df_rs = logs_rs.get_data_frames()[0]
+
+        logs_po = playergamelogs.PlayerGameLogs(
+            player_id_nullable=player_id,
+            season_nullable=self.season,
+            season_type_nullable='Playoffs'
+        )
+        time.sleep(0.6)
+        df_po = logs_po.get_data_frames()[0]
+
+        df = pd.concat([df_po, df_rs], ignore_index=True)
+        if not df.empty and 'GAME_DATE' in df.columns:
+            df = df.sort_values('GAME_DATE', ascending=False).reset_index(drop=True)
 
         with sqlite3.connect(self.cache_db) as conn:
             conn.execute(
@@ -181,12 +258,25 @@ class NbaStatsClient:
 
         logger.info(f"Fetching historical logs: player={player_id} season={season}")
         try:
-            logs = playergamelogs.PlayerGameLogs(
+            logs_rs = playergamelogs.PlayerGameLogs(
                 player_id_nullable=player_id,
                 season_nullable=season,
+                season_type_nullable='Regular Season'
             )
             time.sleep(0.7)
-            df = logs.get_data_frames()[0]
+            df_rs = logs_rs.get_data_frames()[0]
+
+            logs_po = playergamelogs.PlayerGameLogs(
+                player_id_nullable=player_id,
+                season_nullable=season,
+                season_type_nullable='Playoffs'
+            )
+            time.sleep(0.7)
+            df_po = logs_po.get_data_frames()[0]
+
+            df = pd.concat([df_po, df_rs], ignore_index=True)
+            if not df.empty and 'GAME_DATE' in df.columns:
+                df = df.sort_values('GAME_DATE', ascending=False).reset_index(drop=True)
         except Exception as e:
             logger.warning(f"Historical log fetch failed ({player_id}/{season}): {e}")
             return pd.DataFrame()
@@ -224,62 +314,99 @@ class NbaStatsClient:
     # ------------------------------------------------------------------ #
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
-    def get_team_stats(self) -> pd.DataFrame:
+    def get_team_stats(self, season_type: str = 'Regular Season') -> pd.DataFrame:
         """Advanced stats: PACE, DEF_RATING, DREB_PCT, NET_RATING, etc."""
-        if self._adv_stats_cache is not None:
-            return self._adv_stats_cache
-        logger.info("Fetching team advanced stats (pace, ratings)")
+        if season_type in self._adv_stats_cache:
+            return self._adv_stats_cache[season_type]
+        logger.info(f"Fetching team advanced stats (pace, ratings) [{season_type}]")
         stats = leaguedashteamstats.LeagueDashTeamStats(
             season=self.season,
+            season_type_all_star=season_type,
             measure_type_detailed_defense='Advanced'
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
-        self._adv_stats_cache = df
+        self._adv_stats_cache[season_type] = df
         return df
 
+    def get_blended_team_stats(self) -> pd.DataFrame:
+        """Advanced stats blended per-team with playoff data (see _blend_playoff_stats)."""
+        if self._blended_adv_cache is not None:
+            return self._blended_adv_cache
+        rs = self.get_team_stats('Regular Season')
+        try:
+            po = self.get_team_stats('Playoffs')
+        except Exception as e:
+            logger.warning(f"Playoff advanced stats fetch failed, falling back to RS: {e}")
+            po = pd.DataFrame()
+        self._blended_adv_cache = _blend_playoff_stats(rs, po)
+        return self._blended_adv_cache
+
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
-    def get_team_defense_stats(self) -> pd.DataFrame:
+    def get_team_defense_stats(self, season_type: str = 'Regular Season') -> pd.DataFrame:
         """
         Defense dashboard stats per game: OPP_PTS_PAINT, OPP_PTS_OFF_TOV, etc.
-        Cached in-memory and in SQLite (refreshed daily).
+        Regular-season data is cached in SQLite (refreshed daily); playoff data
+        is in-memory only.
         """
-        if self._def_stats_cache is not None:
-            return self._def_stats_cache
+        if season_type in self._def_stats_cache:
+            return self._def_stats_cache[season_type]
 
-        today = datetime.now().strftime('%Y-%m-%d')
-        with sqlite3.connect(self.cache_db) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT date_fetched, data_json FROM def_stats_cache WHERE season = ?", (self.season,))
-            row = cursor.fetchone()
-            if row and row[0] == today:
-                import io
-                df = pd.read_json(io.StringIO(row[1]))
-                self._def_stats_cache = df
-                return df
+        if season_type == 'Regular Season':
+            today = datetime.now().strftime('%Y-%m-%d')
+            with sqlite3.connect(self.cache_db) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT date_fetched, data_json FROM def_stats_cache WHERE season = ?", (self.season,))
+                row = cursor.fetchone()
+                if row and row[0] == today:
+                    import io
+                    df = pd.read_json(io.StringIO(row[1]))
+                    self._def_stats_cache[season_type] = df
+                    return df
 
-        logger.info("Fetching team defense dashboard stats from nba_api")
+        logger.info(f"Fetching team defense dashboard stats from nba_api [{season_type}]")
         stats = leaguedashteamstats.LeagueDashTeamStats(
             season=self.season,
+            season_type_all_star=season_type,
             measure_type_detailed_defense='Defense',
             per_mode_detailed='PerGame',
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
 
-        with sqlite3.connect(self.cache_db) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO def_stats_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
-                (self.season, today, df.to_json())
-            )
+        if season_type == 'Regular Season':
+            with sqlite3.connect(self.cache_db) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO def_stats_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
+                    (self.season, today, df.to_json())
+                )
 
-        self._def_stats_cache = df
+        self._def_stats_cache[season_type] = df
         return df
 
-    def get_opponent_matchup_context(self, opp_team_name: str) -> Dict[str, float]:
+    def get_blended_team_defense_stats(self) -> pd.DataFrame:
+        """Defense dashboard blended per-team with playoff data."""
+        if self._blended_def_cache is not None:
+            return self._blended_def_cache
+        rs = self.get_team_defense_stats('Regular Season')
+        try:
+            po = self.get_team_defense_stats('Playoffs')
+        except Exception as e:
+            logger.warning(f"Playoff defense stats fetch failed, falling back to RS: {e}")
+            po = pd.DataFrame()
+        self._blended_def_cache = _blend_playoff_stats(rs, po)
+        return self._blended_def_cache
+
+    def get_opponent_matchup_context(
+        self, opp_team_name: str, playoff_blend: bool = False
+    ) -> Dict[str, float]:
         """
         Return normalized matchup context features for a given opponent team.
         All values normalized so league average = 1.0.
+
+        When playoff_blend=True, per-team stats are blended with playoff data
+        (see _blend_playoff_stats). League averages are also drawn from the
+        blended frames so normalization stays consistent.
 
         Returns:
             opp_pace:        opponent pace / league avg pace
@@ -293,9 +420,14 @@ class NbaStatsClient:
             'opp_fta_rate': 1.0,   # normalized opponent FTA drawn (foul aggressiveness proxy)
         }
         try:
-            adv_df = self.get_team_stats()
-            def_df = self.get_team_defense_stats()
-            opp_df = self.get_opponent_stats()  # OPP_FTA lives here
+            if playoff_blend:
+                adv_df = self.get_blended_team_stats()
+                def_df = self.get_blended_team_defense_stats()
+                opp_df = self.get_blended_opponent_stats()
+            else:
+                adv_df = self.get_team_stats()
+                def_df = self.get_team_defense_stats()
+                opp_df = self.get_opponent_stats()  # OPP_FTA lives here
 
             opp_lower = opp_team_name.lower()
 
@@ -337,42 +469,58 @@ class NbaStatsClient:
         return result
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
-    def get_opponent_stats(self) -> pd.DataFrame:
+    def get_opponent_stats(self, season_type: str = 'Regular Season') -> pd.DataFrame:
         """
         Priority 2: Fetch per-team opponent-allowed stats (what each team gives up).
-        Cached in-memory for the duration of a scan run.
+        Regular-season data is cached in SQLite daily; playoff data is in-memory only.
         """
-        if self._opp_stats_cache is not None:
-            return self._opp_stats_cache
+        if season_type in self._opp_stats_cache:
+            return self._opp_stats_cache[season_type]
 
-        today = datetime.now().strftime('%Y-%m-%d')
-        with sqlite3.connect(self.cache_db) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT date_fetched, data_json FROM opp_stats_cache WHERE season = ?", (self.season,))
-            row = cursor.fetchone()
-            if row and row[0] == today:
-                import io
-                df = pd.read_json(io.StringIO(row[1]))
-                self._opp_stats_cache = df
-                return df
+        if season_type == 'Regular Season':
+            today = datetime.now().strftime('%Y-%m-%d')
+            with sqlite3.connect(self.cache_db) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT date_fetched, data_json FROM opp_stats_cache WHERE season = ?", (self.season,))
+                row = cursor.fetchone()
+                if row and row[0] == today:
+                    import io
+                    df = pd.read_json(io.StringIO(row[1]))
+                    self._opp_stats_cache[season_type] = df
+                    return df
 
-        logger.info("Fetching opponent-allowed stats from nba_api")
+        logger.info(f"Fetching opponent-allowed stats from nba_api [{season_type}]")
         stats = leaguedashteamstats.LeagueDashTeamStats(
             season=self.season,
+            season_type_all_star=season_type,
             measure_type_detailed_defense='Opponent',
             per_mode_detailed='PerGame'
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
 
-        with sqlite3.connect(self.cache_db) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO opp_stats_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
-                (self.season, today, df.to_json())
-            )
+        if season_type == 'Regular Season':
+            with sqlite3.connect(self.cache_db) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO opp_stats_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
+                    (self.season, today, df.to_json())
+                )
 
-        self._opp_stats_cache = df
+        self._opp_stats_cache[season_type] = df
         return df
+
+    def get_blended_opponent_stats(self) -> pd.DataFrame:
+        """Opponent-allowed stats blended per-team with playoff data."""
+        if self._blended_opp_cache is not None:
+            return self._blended_opp_cache
+        rs = self.get_opponent_stats('Regular Season')
+        try:
+            po = self.get_opponent_stats('Playoffs')
+        except Exception as e:
+            logger.warning(f"Playoff opponent stats fetch failed, falling back to RS: {e}")
+            po = pd.DataFrame()
+        self._blended_opp_cache = _blend_playoff_stats(rs, po)
+        return self._blended_opp_cache
 
     # ------------------------------------------------------------------ #
     #  SGP cross-player: identify starting PG and C/PF by team            #
@@ -446,18 +594,21 @@ class NbaStatsClient:
     #  Priority 2: Opponent defensive multiplier per market                #
     # ------------------------------------------------------------------ #
 
-    def get_opponent_def_multiplier(self, opp_team_name: str, market: str) -> float:
+    def get_opponent_def_multiplier(
+        self, opp_team_name: str, market: str, playoff_blend: bool = False
+    ) -> float:
         """
         Return a defensive multiplier for `market` when playing against `opp_team_name`.
         > 1.0 → opponent allows more than average (weak defense → inflate projection).
         < 1.0 → opponent allows less than average (strong defense → deflate).
+        When playoff_blend=True, uses the playoff-blended opponent frame.
         """
         opp_col = _MARKET_OPP_COL.get(market)
         if not opp_col:
             return 1.0  # PRA handled below
 
         try:
-            df = self.get_opponent_stats()
+            df = self.get_blended_opponent_stats() if playoff_blend else self.get_opponent_stats()
             if df.empty or opp_col not in df.columns:
                 return 1.0
 
@@ -482,10 +633,12 @@ class NbaStatsClient:
             logger.warning(f"Could not compute opp multiplier for {opp_team_name}/{market}: {e}")
             return 1.0
 
-    def get_opponent_def_multiplier_pra(self, opp_team_name: str) -> float:
+    def get_opponent_def_multiplier_pra(
+        self, opp_team_name: str, playoff_blend: bool = False
+    ) -> float:
         """Defensive multiplier for PRA (composite of PTS + REB + AST allowed)."""
         try:
-            df = self.get_opponent_stats()
+            df = self.get_blended_opponent_stats() if playoff_blend else self.get_opponent_stats()
             needed = ['OPP_PTS', 'OPP_REB', 'OPP_AST']
             if df.empty or not all(c in df.columns for c in needed):
                 return 1.0
@@ -535,7 +688,8 @@ class NbaStatsClient:
         return 'Forward'
 
     def get_positional_def_multiplier(
-        self, opp_team: str, market: str, position_group: str
+        self, opp_team: str, market: str, position_group: str,
+        playoff_blend: bool = False,
     ) -> float:
         """
         Positional defensive efficiency multiplier.
@@ -559,9 +713,9 @@ class NbaStatsClient:
         """
         # Base team-level multiplier (existing market-level logic)
         if market == 'player_points_rebounds_assists':
-            base = self.get_opponent_def_multiplier_pra(opp_team)
+            base = self.get_opponent_def_multiplier_pra(opp_team, playoff_blend=playoff_blend)
         else:
-            base = self.get_opponent_def_multiplier(opp_team, market)
+            base = self.get_opponent_def_multiplier(opp_team, market, playoff_blend=playoff_blend)
 
         pf    = _POSITION_FACTORS.get(position_group, {}).get(market, 1.0)
         blend = (1.0 - _POSITION_BLEND) + _POSITION_BLEND * pf
@@ -585,12 +739,14 @@ class NbaStatsClient:
             logger.warning(f"get_team_win_pct_map failed: {e}")
             return {}
 
-    def get_team_pace(self, home_team: str, away_team: str) -> Dict[str, float]:
-        """Return pace for both teams. Used to replace hardcoded 99.0."""
+    def get_team_pace(
+        self, home_team: str, away_team: str, playoff_blend: bool = False
+    ) -> Dict[str, float]:
+        """Return pace for both teams + data-driven league average."""
         try:
-            df = self.get_team_stats()
+            df = self.get_blended_team_stats() if playoff_blend else self.get_team_stats()
             if df.empty or 'PACE' not in df.columns:
-                return {'home_pace': 99.0, 'away_pace': 99.0}
+                return {'home_pace': 99.0, 'away_pace': 99.0, 'league_avg': 99.0}
 
             def _pace(name: str) -> float:
                 low = name.lower()
@@ -599,9 +755,14 @@ class NbaStatsClient:
                     row = df[df['TEAM_NAME'].str.lower().str.contains(low.split()[-1], na=False)]
                 return float(row.iloc[0]['PACE']) if not row.empty else 99.0
 
-            return {'home_pace': _pace(home_team), 'away_pace': _pace(away_team)}
+            league_avg = float(df['PACE'].mean()) if not df['PACE'].isna().all() else 99.0
+            return {
+                'home_pace': _pace(home_team),
+                'away_pace': _pace(away_team),
+                'league_avg': league_avg,
+            }
         except Exception:
-            return {'home_pace': 99.0, 'away_pace': 99.0}
+            return {'home_pace': 99.0, 'away_pace': 99.0, 'league_avg': 99.0}
 
     # ------------------------------------------------------------------ #
     #  Priority 4: Home/away + rest day helpers                            #

@@ -15,6 +15,13 @@ _SHARP_DEFAULT_WEIGHTS: Dict[str, float] = {
 
 logger = get_logger(__name__)
 
+
+def normalize_book(book: Optional[str]) -> str:
+    """Canonicalize sportsbook names so BetMGM/betmgm dedupe to one entry."""
+    if not book:
+        return ''
+    return str(book).strip().lower()
+
 class DatabaseClient:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
@@ -123,6 +130,7 @@ class DatabaseClient:
                      edge: float, book: str, odds: float, stake: float = 0.0,
                      game_date: str = None, event_id: str = None,
                      home_away: str = None, rest_days: int = 2) -> int:
+        book = normalize_book(book)
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(

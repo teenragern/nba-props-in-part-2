@@ -1,5 +1,5 @@
 import pandas as pd
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 # Priority 4: Home advantage and rest day factors
 _HOME_ADVANTAGE = 1.02   # ~2% uplift when playing at home
@@ -49,6 +49,86 @@ def get_rest_days_factor(rest_days: int, b2b_flag: bool) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Sample weighting (playoff upweighting)
+# ---------------------------------------------------------------------------
+
+def compute_log_weights(
+    logs: pd.DataFrame,
+    playoff_mode: bool = False,
+    current_opp_abbr: Optional[str] = None,
+) -> pd.Series:
+    """
+    Per-row importance weights for game logs.
+      - Regular-season rows: 1.0
+      - Playoff rows (SEASON_ID starts with '4'): 1.75 when playoff_mode is True
+      - Playoff rows vs current_opp_abbr (same series), once ≥2 such games exist: 2.5
+
+    When playoff_mode is False or the necessary columns are missing, returns
+    a Series of 1.0 so unweighted callers are unaffected.
+    """
+    if logs is None or logs.empty:
+        return pd.Series(dtype=float)
+    weights = pd.Series(1.0, index=logs.index)
+    if not playoff_mode or 'SEASON_ID' not in logs.columns:
+        return weights
+
+    is_playoff = logs['SEASON_ID'].astype(str).str.startswith('4')
+    weights = weights.where(~is_playoff, 1.75)
+
+    if current_opp_abbr and 'MATCHUP' in logs.columns:
+        opp_upper = str(current_opp_abbr).upper()
+        same_series = is_playoff & logs['MATCHUP'].astype(str).str.upper().str.contains(
+            opp_upper, na=False, regex=False
+        )
+        if int(same_series.sum()) >= 2:
+            weights = weights.where(~same_series, 2.5)
+
+    return weights
+
+
+def compute_series_context(
+    logs: pd.DataFrame,
+    opp_abbr: Optional[str],
+) -> Dict[str, int]:
+    """
+    Infer the current playoff-series state from a player's game log by
+    counting consecutive playoff games vs opp_abbr.
+
+    Returns a dict with 'games', 'wins', 'losses' reflecting the series
+    W-L going INTO tonight's game (so a 3-0 lead means the team can close
+    out tonight; a 1-3 hole means it's an elimination game).
+    """
+    ctx = {'games': 0, 'wins': 0, 'losses': 0}
+    if logs is None or logs.empty or not opp_abbr or 'MATCHUP' not in logs.columns:
+        return ctx
+    opp_upper = str(opp_abbr).upper()
+    for _, row in logs.iterrows():
+        season_id = str(row.get('SEASON_ID', ''))
+        matchup   = str(row.get('MATCHUP', '')).upper()
+        if not season_id.startswith('4') or opp_upper not in matchup:
+            break
+        ctx['games'] += 1
+        wl = str(row.get('WL', '')).upper()
+        if wl == 'W':
+            ctx['wins'] += 1
+        elif wl == 'L':
+            ctx['losses'] += 1
+    return ctx
+
+
+def classify_series_state(wins: int, losses: int) -> Dict[str, bool]:
+    """
+    Map a (wins, losses) series score to situational flags.
+
+    must_win: facing elimination — opponent already has 3 wins AND team does not.
+    closeout_opportunity: team has 3 wins AND opponent does not — closer game.
+    """
+    must_win = losses >= 3 and wins < 3
+    closeout = wins >= 3 and losses < 3
+    return {'must_win': must_win, 'closeout_opportunity': closeout}
+
+
+# ---------------------------------------------------------------------------
 # Rolling average helpers (exponential decay)
 # ---------------------------------------------------------------------------
 
@@ -68,27 +148,40 @@ def _ewm_rate(logs: pd.DataFrame, col: str, n: int, alpha: float = 0.3) -> float
     return float(pd.Series(rates[::-1]).ewm(alpha=alpha, adjust=False).mean().iloc[-1])
 
 
-def _rolling_rate(logs: pd.DataFrame, col: str, n: int) -> float:
-    """Simple per-minute rate over the last n games."""
+def _rolling_rate(
+    logs: pd.DataFrame, col: str, n: int,
+    weights: Optional[pd.Series] = None,
+) -> float:
+    """Weighted per-minute rate over the last n games. When weights is None,
+    falls back to a simple mean."""
     subset = logs.head(n)
     if subset.empty or col not in subset.columns or 'MIN' not in subset.columns:
         return 0.0
-    total_min = subset['MIN'].sum()
+    if weights is None:
+        total_min = subset['MIN'].sum()
+        if total_min <= 0:
+            return 0.0
+        return float(subset[col].sum() / total_min)
+    w = weights.reindex(subset.index).fillna(1.0)
+    total_min = float((subset['MIN'] * w).sum())
     if total_min <= 0:
         return 0.0
-    return float(subset[col].sum() / total_min)
+    return float((subset[col] * w).sum() / total_min)
 
 
-def compute_rolling_rates(logs: pd.DataFrame, col: str) -> Dict[str, float]:
+def compute_rolling_rates(
+    logs: pd.DataFrame, col: str,
+    weights: Optional[pd.Series] = None,
+) -> Dict[str, float]:
     """
-    Compute rolling 5/10/20-game simple and EWM per-minute rates.
-    Returns a dict with keys: rate_5g, rate_10g, rate_20g,
-    ewm_5g, ewm_10g, ewm_20g.
+    Compute rolling 5/10/20-game per-minute rates. The simple rate buckets are
+    sample-weighted (playoff upweighting); the EWM buckets remain pure
+    time-decayed recency.
     """
     return {
-        'rate_5g':  _rolling_rate(logs, col, 5),
-        'rate_10g': _rolling_rate(logs, col, 10),
-        'rate_20g': _rolling_rate(logs, col, 20),
+        'rate_5g':  _rolling_rate(logs, col, 5, weights=weights),
+        'rate_10g': _rolling_rate(logs, col, 10, weights=weights),
+        'rate_20g': _rolling_rate(logs, col, 20, weights=weights),
         'ewm_5g':   _ewm_rate(logs, col, 5, alpha=0.3),
         'ewm_10g':  _ewm_rate(logs, col, 10, alpha=0.25),
         'ewm_20g':  _ewm_rate(logs, col, 20, alpha=0.15),
@@ -188,17 +281,42 @@ def estimate_projected_minutes(recent_logs: pd.DataFrame, season_logs: pd.DataFr
     return max(0.0, base_mins * mult)
 
 
-def calculate_rate(logs: pd.DataFrame, col: str) -> float:
-    if logs.empty or col not in logs.columns or logs['MIN'].sum() == 0:
+def calculate_rate(
+    logs: pd.DataFrame, col: str,
+    weights: Optional[pd.Series] = None,
+) -> float:
+    if logs.empty or col not in logs.columns:
         return 0.0
-    return logs[col].sum() / logs['MIN'].sum()
+    if weights is None:
+        total_min = logs['MIN'].sum()
+        if total_min == 0:
+            return 0.0
+        return logs[col].sum() / total_min
+    w = weights.reindex(logs.index).fillna(1.0)
+    total_min = float((logs['MIN'] * w).sum())
+    if total_min <= 0:
+        return 0.0
+    return float((logs[col] * w).sum() / total_min)
 
 
-def calculate_pra_rate(logs: pd.DataFrame) -> float:
-    if logs.empty or logs['MIN'].sum() == 0:
+def calculate_pra_rate(
+    logs: pd.DataFrame,
+    weights: Optional[pd.Series] = None,
+) -> float:
+    if logs.empty:
         return 0.0
-    total = logs['PTS'].sum() + logs['REB'].sum() + logs['AST'].sum()
-    return total / logs['MIN'].sum()
+    if weights is None:
+        total_min = logs['MIN'].sum()
+        if total_min == 0:
+            return 0.0
+        total = logs['PTS'].sum() + logs['REB'].sum() + logs['AST'].sum()
+        return total / total_min
+    w = weights.reindex(logs.index).fillna(1.0)
+    total_min = float((logs['MIN'] * w).sum())
+    if total_min <= 0:
+        return 0.0
+    total = float(((logs['PTS'] + logs['REB'] + logs['AST']) * w).sum())
+    return total / total_min
 
 
 def get_market_variance_calibration(_market: str) -> float:
@@ -222,7 +340,9 @@ def build_player_projection(player_id: str, market: str, line: float,
                              projected_minutes_override: float = 0.0,
                              fatigue_multiplier: float = 1.0,
                              role_shift_rate: float = 0.0,
-                             initiators_out: int = 0) -> Dict[str, Any]:
+                             initiators_out: int = 0,
+                             playoff_mode: bool = False,
+                             opp_abbr: Optional[str] = None) -> Dict[str, Any]:
     """
     projected_minutes_override: when > 0, skips estimate_projected_minutes entirely
     and uses this value directly (e.g. from the RotationModel's slot-based projection).
@@ -244,21 +364,28 @@ def build_player_projection(player_id: str, market: str, line: float,
 
     n_sample_games = min(len(recent_logs), 30) if not recent_logs.empty else 0
 
+    # Per-row playoff weighting (1.0 for RS; 1.75 for playoffs; 2.5 for same-series
+    # once ≥2 head-to-head games exist). No-op when playoff_mode is False.
+    recent_weights = compute_log_weights(recent_logs, playoff_mode=playoff_mode,
+                                         current_opp_abbr=opp_abbr)
+    season_weights = compute_log_weights(season_logs, playoff_mode=playoff_mode,
+                                         current_opp_abbr=opp_abbr)
+
     # ── Rolling averages with exponential decay ────────────────────────────
     if market == "player_points_rebounds_assists":
         # Blend PRA from component rolling rates
-        pts_rates = compute_rolling_rates(recent_logs, 'PTS') if not recent_logs.empty else {}
-        reb_rates = compute_rolling_rates(recent_logs, 'REB') if not recent_logs.empty else {}
-        ast_rates = compute_rolling_rates(recent_logs, 'AST') if not recent_logs.empty else {}
+        pts_rates = compute_rolling_rates(recent_logs, 'PTS', weights=recent_weights) if not recent_logs.empty else {}
+        reb_rates = compute_rolling_rates(recent_logs, 'REB', weights=recent_weights) if not recent_logs.empty else {}
+        ast_rates = compute_rolling_rates(recent_logs, 'AST', weights=recent_weights) if not recent_logs.empty else {}
         recent_rate = sum(blend_rolling_rates(r, n_sample_games) for r in [pts_rates, reb_rates, ast_rates])
-        season_rate = calculate_pra_rate(season_logs)
+        season_rate = calculate_pra_rate(season_logs, weights=season_weights)
     else:
         col = get_market_col(market)
         if not col:
             return {}
-        rolling = compute_rolling_rates(recent_logs, col) if not recent_logs.empty else {}
+        rolling = compute_rolling_rates(recent_logs, col, weights=recent_weights) if not recent_logs.empty else {}
         recent_rate = blend_rolling_rates(rolling, n_sample_games) if rolling else 0.0
-        season_rate = calculate_rate(season_logs, col)
+        season_rate = calculate_rate(season_logs, col, weights=season_weights)
 
     if season_rate == 0: season_rate = recent_rate
     if recent_rate == 0: recent_rate = season_rate
@@ -299,6 +426,16 @@ def build_player_projection(player_id: str, market: str, line: float,
     mean_proj = proj_mins * adj_rate
     variance_scale = get_market_variance_calibration(market)
 
+    must_win = False
+    closeout_opportunity = False
+    series_games = 0
+    if playoff_mode and opp_abbr:
+        _ctx = compute_series_context(recent_logs, opp_abbr)
+        series_games = _ctx['games']
+        _state = classify_series_state(_ctx['wins'], _ctx['losses'])
+        must_win = _state['must_win']
+        closeout_opportunity = _state['closeout_opportunity']
+
     return {
         "player_id":          player_id,
         "market":             market,
@@ -319,4 +456,7 @@ def build_player_projection(player_id: str, market: str, line: float,
         "opp_def_factor":     opponent_multiplier,
         "rest_factor":        rest_factor,
         "home_factor":        get_home_away_factor(home_flag),
+        "series_games":       series_games,
+        "must_win":           must_win,
+        "closeout_opportunity": closeout_opportunity,
     }
