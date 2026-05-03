@@ -22,7 +22,8 @@ def check_breaking_news(monitor, bot: TelegramBotClient) -> bool:
             f"{source_icon} {item['source']} · {item['published_at']}\n"
             f"<i>→ Triggering immediate prop scan...</i>"
         )
-        bot.send_message(msg)
+        from src.data.db import DatabaseClient
+        bot.broadcast(msg, db=DatabaseClient())
         logger.info(f"Breaking news alert sent: {item['title']}")
 
     return True

@@ -186,6 +186,23 @@ def job_scan():
         return
     notify("Scan", scan_props)
 
+    # Subscriber-facing scan summary (admin-only, not broadcast to subscribers).
+    # Individual prop edges are already broadcast immediately in evaluate_and_alert().
+    try:
+        db = DatabaseClient()
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM alerts_sent WHERE date(timestamp) = date('now')"
+            ).fetchone()
+        n_today = int(row['n'] or 0) if row else 0
+        summary_msg = (
+            f"✅ Scan complete — {n_today} edge(s) found today.\n"
+            f"Next scan in ~{SCAN_INTERVAL_MINUTES} min."
+        )
+        bot.send_message(summary_msg)
+    except Exception as e:
+        logger.debug(f"Scan summary message failed: {e}")
+
 
 def job_clv():
     if not _has_games():
@@ -233,6 +250,32 @@ def job_scout_lines():
             notify("Steam [post-scout]", check_steam, bot)
     except Exception as e:
         logger.error(f"Scout lines failed: {e}")
+
+
+def job_morning_briefing():
+    """
+    Broadcast a daily 'bot is live' message to all subscribers.
+    Runs at 09:05 ET after job_sync() has populated _today_game_count.
+    Admin-only when no games today so subscribers don't get noise.
+    """
+    db = DatabaseClient()
+    if _today_game_count > 0:
+        msg = (
+            f"📅 <b>NBA Prop Scanner — Good morning!</b>\n\n"
+            f"{_today_game_count} game(s) on the slate today.\n"
+            f"Scanning props across all books. Edges will be sent instantly when found.\n\n"
+            f"<i>Digests at 12 PM, 3 PM, and 6 PM ET.</i>"
+        )
+        try:
+            bot.broadcast(msg, db=db)
+        except Exception as e:
+            logger.warning(f"Morning briefing broadcast failed: {e}")
+    else:
+        # No games — only notify admin, not subscribers.
+        try:
+            bot.send_message("🏀 No NBA games today. Prop scanner on standby.")
+        except Exception:
+            pass
 
 
 def job_sync_injuries():
@@ -361,6 +404,7 @@ def start_scheduler():
     global _last_tick
     logger.info("Starting NBA Prop Bot scheduler (credit-aware mode)...")
     _start_watchdog()
+    bot.start_listener(db=DatabaseClient())
 
     # --- Daily free jobs (run every day regardless of game schedule) ---
     schedule.every().day.at("01:00").do(job_train_calibration) # Nightly calibration model training
@@ -369,6 +413,7 @@ def start_scheduler():
     schedule.every().day.at("04:30").do(job_execution_summary)  # paper P&L recap
     schedule.every().day.at("05:00").do(job_drift_monitor)  # drift check after settlement
     schedule.every().day.at("09:00").do(job_sync)           # 1 credit; sets game count
+    schedule.every().day.at("09:05").do(job_morning_briefing)  # subscriber daily briefing
     schedule.every().day.at("09:15").do(job_stats)
     schedule.every().day.at("09:30").do(job_calibration)
     schedule.every().day.at("09:45").do(job_tune)

@@ -71,7 +71,9 @@ def flush_pending_alerts(db: DatabaseClient, bot: TelegramBotClient) -> int:
         for r in parlays[:_MAX_PARLAYS_SHOWN]:
             lines.append(f"• {r['title']}")
 
-    bot.send_instant("\n".join(lines))
+    lines.append("\n<i>Disclaimer: All alerts are for informational purposes only. Sports betting involves financial risk. Please bet responsibly.</i>")
+
+    bot.broadcast("\n".join(lines), db=db)
     db.mark_pending_alerts_sent([r['id'] for r in rows])
 
     logger.info(

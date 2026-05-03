@@ -114,7 +114,7 @@ def check_steam(bot: TelegramBotClient = None, db: DatabaseClient = None) -> Non
         )
 
         msg = _format_steam_alert(move)
-        bot.send_message(msg)
+        bot.broadcast(msg, db=db)
         logger.info(
             f"Steam alert: {player} {market} {side} {move['line']} | "
             f"{move['sharp_book']} moved {move['sharp_delta']:+.1%} | "

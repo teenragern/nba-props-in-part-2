@@ -363,3 +363,15 @@ CREATE INDEX IF NOT EXISTS idx_line_history_ts
 
 CREATE INDEX IF NOT EXISTS idx_steam_alerts_dedup
     ON steam_alerts(player_name, market, side, timestamp);
+
+-- Subscriber registry for multi-tenant Telegram delivery.
+-- Each paying subscriber has a row; active=0 suspends delivery without deleting.
+-- tier: 'admin' (owner) | 'basic' | 'premium'
+CREATE TABLE IF NOT EXISTS subscribers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    TEXT    NOT NULL UNIQUE,
+    username   TEXT,
+    tier       TEXT    NOT NULL DEFAULT 'basic',
+    active     INTEGER NOT NULL DEFAULT 1,
+    joined_at  DATETIME DEFAULT (datetime('now'))
+);

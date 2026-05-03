@@ -179,6 +179,12 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         + f"\n<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
     )
 
+    # Send immediately to all subscribers so they get the edge before the line moves.
+    try:
+        _bot.broadcast(msg, db=db)
+    except Exception as _e:
+        logger.warning(f"Telegram broadcast failed (will still queue): {_e}")
+
     # Tier 2: queue for next digest flush (12 PM / 3 PM / 6 PM).
     side_char  = 'O' if side.upper() == 'OVER' else 'U'
     mkt_short  = _MARKET_SHORT.get(market, market[:3].title())
@@ -187,7 +193,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         f"@{book} {_parlay_american(odds)} | {edge:.1%} | ${stake:.0f}"
     )
     db.queue_pending_alert('prop', title, msg, priority=edge, game_date=game_date)
-    logger.info(f"Alert queued: {player} {market} {side} {line} @ {book}")
+    logger.info(f"Alert sent + queued: {player} {market} {side} {line} @ {book}")
 
 
 def send_line_disagreement_alert(
@@ -228,10 +234,16 @@ def send_line_disagreement_alert(
         f"@{soft_book} | {sharp_book} @ {sharp_line} ({line_gap:+.1f})"
     )
 
+    # Send immediately — line disagreements are highest urgency (soft book adjusts fast).
+    try:
+        _bot.broadcast(msg, db=db)
+    except Exception as _e:
+        logger.warning(f"Telegram broadcast failed (will still queue): {_e}")
+
     # Queue as highest-priority alert (priority = line_gap to sort above normal edges)
     db.queue_pending_alert('prop', title, msg, priority=line_gap, game_date=game_date)
     logger.info(
-        f"LINE DISAGREEMENT: {player} {market} — {sharp_book} {sharp_line} vs "
+        f"LINE DISAGREEMENT sent + queued: {player} {market} — {sharp_book} {sharp_line} vs "
         f"{soft_book} {soft_line} ({side})"
     )
 
@@ -447,6 +459,12 @@ def send_game_market_alert(
         f"<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
     )
 
+    # Send immediately so subscribers can act before the line moves.
+    try:
+        _bot.broadcast(msg, db=db)
+    except Exception as _e:
+        logger.warning(f"Telegram broadcast failed (will still queue): {_e}")
+
     # Tier 2: queue for digest.
     side_short = side if len(side) <= 14 else side[:13] + "…"
     title = (
@@ -454,4 +472,4 @@ def send_game_market_alert(
         f"@{book} {_parlay_american(book_odds)} | {edge:+.1%} | ${stake:.0f}"
     )
     db.queue_pending_alert('game_market', title, msg, priority=edge, game_date=game_date)
-    logger.info(f"Game market alert queued: {matchup} {market_label} {side} edge={edge:.2%}")
+    logger.info(f"Game market alert sent + queued: {matchup} {market_label} {side} edge={edge:.2%}")
