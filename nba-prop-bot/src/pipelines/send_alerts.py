@@ -4,6 +4,7 @@ from src.utils.logging_utils import get_logger
 from src.clients.telegram_bot import TelegramBotClient
 from src.data.db import DatabaseClient
 from src.config import BANKROLL, KELLY_FRACTION
+from src.execution.executor import record_execution
 
 logger = get_logger(__name__)
 
@@ -81,20 +82,11 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     home = edge_data.get('home_team', 'Home')
     away = edge_data.get('away_team', 'Away')
 
-    # Fractional Kelly stake sizing
-    # Kelly formula: f* = (b*p - q) / b  =  ev / (odds - 1)
-    # where ev = model_prob*(odds-1) - (1-model_prob) = model_prob*odds - 1.
-    # Using raw `edge` (prob difference) in the numerator was wrong: it
-    # under-stakes high-odds bets and over-stakes low-odds bets.
-    ev    = edge_data.get('ev', 0.0)
-    stake = 0.0
-    if odds > 1 and ev > 0:
-        stake = BANKROLL * (ev / (odds - 1.0)) * KELLY_FRACTION
-        stake = min(stake, BANKROLL * 0.05)  # hard cap: 5% per bet
-    stake = _camouflage_stake(stake)
-
     MAX_DAILY_RISK = BANKROLL * 1.00
     MAX_PER_GAME   = BANKROLL * 0.40
+
+    current_daily_risk = 0.0
+    current_game_risk = 0.0
 
     with db.get_conn() as conn:
         cursor = conn.cursor()
@@ -106,14 +98,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         row = cursor.fetchone()
         current_daily_risk = float(row['total_risk'] or 0.0) if row else 0.0
 
-        if current_daily_risk + stake > MAX_DAILY_RISK:
-            logger.warning(
-                f"Skipping {player} — daily risk limit "
-                f"({current_daily_risk:.2f}/{MAX_DAILY_RISK:.2f})"
-            )
-            return
-
-        # Per-game risk check — group correlated bets within the same 48-minute window
+        # Per-game risk check — group correlated bets within the same event
         if event_id:
             cursor.execute(
                 "SELECT SUM(stake) as game_risk FROM alerts_sent "
@@ -123,19 +108,50 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
             game_row = cursor.fetchone()
             current_game_risk = float(game_row['game_risk'] or 0.0) if game_row else 0.0
 
-            if current_game_risk + stake > MAX_PER_GAME:
-                logger.warning(
-                    f"Skipping {player} — per-game risk limit for event {event_id} "
-                    f"({current_game_risk:.2f}/{MAX_PER_GAME:.2f})"
-                )
-                return
+    # ── Dynamic Kelly Sizing ──────────────────────────────────────────────────
+    # 1. Covariance Multiplier: linearly decays Kelly as game exposure approaches MAX_PER_GAME.
+    # e.g., if exposure is 0%, multiplier is 1.0. If exposure is 50% of cap, multiplier is 0.5.
+    game_exposure_pct = current_game_risk / MAX_PER_GAME
+    covariance_multiplier = max(0.1, 1.0 - game_exposure_pct)
 
-    db.insert_alert(
+    # 2. Isotonic Confidence Multiplier: tightens stakes in the high-variance 45-60% zone
+    model_prob = edge_data.get('model_prob', 0.5)
+    if 0.45 <= model_prob <= 0.60:
+        isotonic_confidence_multiplier = 0.7
+    else:
+        isotonic_confidence_multiplier = 1.0
+
+    dynamic_kelly = KELLY_FRACTION * covariance_multiplier * isotonic_confidence_multiplier
+
+    # Kelly formula: f* = ev / (odds - 1)
+    ev    = edge_data.get('ev', 0.0)
+    stake = 0.0
+    if odds > 1 and ev > 0:
+        stake = BANKROLL * (ev / (odds - 1.0)) * dynamic_kelly
+        stake = min(stake, BANKROLL * 0.05)  # hard cap: 5% per bet
+    stake = _camouflage_stake(stake)
+
+    if current_daily_risk + stake > MAX_DAILY_RISK:
+        logger.warning(
+            f"Skipping {player} — daily risk limit "
+            f"({current_daily_risk:.2f}/{MAX_DAILY_RISK:.2f})"
+        )
+        return
+
+    if event_id and current_game_risk + stake > MAX_PER_GAME:
+        logger.warning(
+            f"Skipping {player} — per-game risk limit for event {event_id} "
+            f"({current_game_risk:.2f}/{MAX_PER_GAME:.2f})"
+        )
+        return
+
+    alert_id = db.insert_alert(
         player_name=player, market=market, line=line, side=side,
         edge=edge, book=book, odds=odds, stake=stake,
         game_date=game_date, event_id=event_id,
         home_away=home_away, rest_days=rest_days,
     )
+    record_execution(alert_id, edge_data, stake, odds, db, _bot)
 
     ml_blend_note = " [ML+Bayesian blend]" if edge_data.get('ml_blend') else ""
     msg = (
@@ -402,11 +418,16 @@ def send_game_market_alert(
                 )
                 return
 
-    db.insert_alert(
+    alert_id = db.insert_alert(
         player_name=matchup, market=market, line=line, side=side,
         edge=edge, book=book, odds=book_odds, stake=stake,
         game_date=game_date, event_id=event_id,
     )
+    game_edge_data = {
+        'player_name': matchup, 'market': market, 'side': side, 'line': line,
+        'book': book, 'game_date': game_date,
+    }
+    record_execution(alert_id, game_edge_data, stake, book_odds, db, _bot)
 
     _h_abbr = home_abbr or home_team.split()[-1][:3].upper()
     _a_abbr = away_abbr or away_team.split()[-1][:3].upper()

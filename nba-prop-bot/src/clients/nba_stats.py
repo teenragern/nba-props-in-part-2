@@ -131,6 +131,11 @@ def _blend_playoff_stats(rs_df: pd.DataFrame, po_df: pd.DataFrame) -> pd.DataFra
     po_indexed['_tn_lower'] = po_indexed['TEAM_NAME'].astype(str).str.lower()
     po_indexed = po_indexed.drop_duplicates(subset=['_tn_lower']).set_index('_tn_lower')
 
+    # Ensure numeric columns are float to avoid FutureWarnings when blending
+    for col in numeric_cols:
+        if col in blended.columns:
+            blended[col] = blended[col].astype(float)
+
     for idx in blended.index:
         team_name_lower = str(blended.at[idx, 'TEAM_NAME']).lower()
         if team_name_lower not in po_indexed.index:

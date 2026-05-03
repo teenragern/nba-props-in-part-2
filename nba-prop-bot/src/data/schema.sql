@@ -26,8 +26,16 @@ CREATE TABLE IF NOT EXISTS injury_reports (
     player_name TEXT,
     team TEXT,
     status TEXT,
+    description TEXT,
+    return_date TEXT,
+    severity INTEGER DEFAULT 0,   -- 0 unknown .. 4 out (matches _STATUS_RANK)
+    source TEXT,                  -- comma-joined list of contributing sources
+    updated_at DATETIME,
     PRIMARY KEY (game_date, player_name)
 );
+
+CREATE INDEX IF NOT EXISTS idx_injury_reports_date_status
+    ON injury_reports(game_date, status);
 
 CREATE TABLE IF NOT EXISTS player_game_logs (
     player_id INTEGER,
@@ -310,6 +318,44 @@ CREATE TABLE IF NOT EXISTS bdl_game_log_cache (
     cached_at   TEXT    NOT NULL,
     PRIMARY KEY (player_id, season, game_date)
 );
+
+-- Execution log: every bet processed by the executor (paper or live).
+-- fill_odds = best odds available at execution time (from line_history lookup).
+-- slippage  = fill_odds - alerted_odds  (negative = filled worse than alerted).
+CREATE TABLE IF NOT EXISTS placed_bets (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id      INTEGER NOT NULL REFERENCES alerts_sent(id),
+    mode          TEXT    NOT NULL DEFAULT 'paper',   -- 'paper' | 'live'
+    player_name   TEXT    NOT NULL,
+    market        TEXT    NOT NULL,
+    side          TEXT    NOT NULL,
+    line          REAL    NOT NULL,
+    book          TEXT,
+    alerted_odds  REAL    NOT NULL,
+    fill_odds     REAL,             -- NULL in live mode until confirmed
+    slippage      REAL,             -- fill_odds - alerted_odds
+    stake         REAL    NOT NULL,
+    game_date     TEXT,
+    executed_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    session_id    TEXT                                -- ISO date of the trading session
+);
+
+CREATE INDEX IF NOT EXISTS idx_placed_bets_session
+    ON placed_bets(session_id, executed_at);
+
+-- Daily model health snapshots for drift detection.
+CREATE TABLE IF NOT EXISTS model_health (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date DATE    NOT NULL,
+    window       TEXT    NOT NULL,  -- 'last_100', 'last_500', 'all_time'
+    market       TEXT    NOT NULL DEFAULT 'all',
+    brier        REAL    NOT NULL,
+    n_samples    INTEGER NOT NULL,
+    recorded_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_health_unique
+    ON model_health(snapshot_date, window, market);
 
 -- Indexes to accelerate the steam detection query (scans last 120 min)
 CREATE INDEX IF NOT EXISTS idx_line_history_ts

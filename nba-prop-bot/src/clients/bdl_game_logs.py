@@ -51,13 +51,13 @@ class BDLGameLogs:
         self._log_cache: Dict[tuple, pd.DataFrame] = {}
         self._game_id_cache: Dict[tuple, List[int]] = {}  # (pid, season) → BDL game IDs
 
-    def get_player_game_logs(self, bdl_player_id: int, season: int) -> pd.DataFrame:
+    def get_player_game_logs(self, bdl_player_id: int, season: int, ignore_ttl: bool = False) -> pd.DataFrame:
         """
         Return game logs for a player/season as a nba_api-compatible DataFrame.
 
         Lookup order:
           1. In-memory cache (instant)
-          2. SQLite cache (12h TTL)
+          2. SQLite cache (12h TTL, or permanent if ignore_ttl=True)
           3. BDL API (no sleep needed)
         Returns empty DataFrame on failure or if player has no recorded stats.
         """
@@ -67,7 +67,7 @@ class BDLGameLogs:
 
         # Try SQLite cache
         if self.db:
-            cached = self.db.get_cached_bdl_game_logs(bdl_player_id, season)
+            cached = self.db.get_cached_bdl_game_logs(bdl_player_id, season, ignore_ttl=ignore_ttl)
             if cached:
                 df = self._sqlite_rows_to_df(cached)
                 if not df.empty:

@@ -443,23 +443,51 @@ class PropMLModel:
         return X, y
 
     def train(self, X: List, y: List, sample_weight: Optional[List] = None) -> bool:
-        """Train XGBoost. Returns True on success."""
+        """Train XGBoost with regression guard. Returns True on success."""
         if len(X) < MIN_TRAIN_SAMPLES:
             return False
         try:
             import xgboost as xgb
             import joblib
-            self.model = xgb.XGBRegressor(
-                n_estimators=200,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                verbosity=0,
-            )
-            sw = np.array(sample_weight) if sample_weight else None
-            self.model.fit(np.array(X), np.array(y), sample_weight=sw)
+            import shutil
+            _log = __import__('src.utils.logging_utils', fromlist=['get_logger']).get_logger(__name__)
+
+            X_arr = np.array(X)
+            y_arr = np.array(y)
+            sw    = np.array(sample_weight) if sample_weight else None
+
+            # Hold out last 20% for regression guard evaluation only.
+            split  = max(MIN_TRAIN_SAMPLES, int(len(X_arr) * 0.80))
+            X_tr, X_te = X_arr[:split], X_arr[split:]
+            y_tr, y_te = y_arr[:split], y_arr[split:]
+            sw_tr  = sw[:split] if sw is not None else None
+
+            _params = dict(n_estimators=200, max_depth=4, learning_rate=0.05,
+                           subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0)
+            candidate = xgb.XGBRegressor(**_params)
+            candidate.fit(X_tr, y_tr, sample_weight=sw_tr)
+
+            # Regression guard: only overwrite if candidate is at least as good.
+            if os.path.exists(self.model_path) and len(X_te) >= 20:
+                try:
+                    incumbent = joblib.load(self.model_path)
+                    inc_mse = float(np.mean((incumbent.predict(X_te) - y_te) ** 2))
+                    cand_mse = float(np.mean((candidate.predict(X_te) - y_te) ** 2))
+                    if cand_mse > inc_mse * 1.02:
+                        _log.warning(
+                            f"XGB [{self.market}] regression guard: candidate MSE {cand_mse:.4f} "
+                            f"> incumbent {inc_mse:.4f} (>2% worse) — keeping old model."
+                        )
+                        return False
+                    _log.info(f"XGB [{self.market}] guard passed: cand={cand_mse:.4f} inc={inc_mse:.4f}")
+                except Exception as _ge:
+                    _log.warning(f"XGB [{self.market}] regression guard skipped: {_ge}")
+
+            # Guard passed (or no incumbent) — retrain on full data then save.
+            self.model = xgb.XGBRegressor(**_params)
+            self.model.fit(X_arr, y_arr, sample_weight=sw)
+            if os.path.exists(self.model_path):
+                shutil.copy2(self.model_path, self.model_path + '.bak')
             joblib.dump(self.model, self.model_path)
             return True
         except Exception as _e:
@@ -575,7 +603,43 @@ class EnsembleModel:
             meta = Ridge(alpha=0.5)
             meta.fit(oof_preds, y_arr)
 
-            # Retrain base learners on full data
+            # Compute OOF RMSE and apply regression guard vs. stored baseline.
+            oof_rmse: float = float('nan')
+            try:
+                oof_meta_preds = meta.predict(oof_preds)
+                oof_rmse = float(np.sqrt(np.mean((oof_meta_preds - y_arr) ** 2)))
+                _gl(__name__).info(f"Ensemble [{self.market}] OOF RMSE={oof_rmse:.4f} ({len(y_arr)} samples)")
+
+                # Regression guard: compare against most-recent stored OOF RMSE.
+                from src.data.db import DatabaseClient as _DB
+                from datetime import datetime as _dt
+                _db = _DB()
+                with _db.get_conn() as _conn:
+                    prev_row = _conn.execute(
+                        """SELECT brier FROM model_health
+                           WHERE window = 'oof_rmse' AND market = ?
+                           ORDER BY snapshot_date DESC LIMIT 1""",
+                        (self.market,),
+                    ).fetchone()
+                    if prev_row:
+                        prev_rmse = float(prev_row['brier'])
+                        if oof_rmse > prev_rmse * 1.02:
+                            _gl(__name__).warning(
+                                f"Ensemble [{self.market}] regression guard: OOF RMSE "
+                                f"{oof_rmse:.4f} > stored {prev_rmse:.4f} (>2% worse) — keeping old model."
+                            )
+                            return False
+                    # Guard passed — record new baseline.
+                    _conn.execute(
+                        """INSERT OR REPLACE INTO model_health
+                               (snapshot_date, window, market, brier, n_samples)
+                           VALUES (?, 'oof_rmse', ?, ?, ?)""",
+                        (_dt.now().strftime('%Y-%m-%d'), self.market, oof_rmse, len(y_arr)),
+                    )
+            except Exception:
+                pass  # non-critical — don't abort training on DB write failure
+
+            # Regression guard passed (or no baseline yet) — retrain base learners on full data.
             trained_bases = []
             for name, model in base_learners:
                 if name in ('xgb', 'rf') and sw is not None:
@@ -589,6 +653,9 @@ class EnsembleModel:
                 'meta': meta,
                 'feature_names': FEATURE_NAMES,
             }
+            import shutil as _sh
+            if os.path.exists(self.ensemble_path):
+                _sh.copy2(self.ensemble_path, self.ensemble_path + '.bak')
             joblib.dump(self.ensemble, self.ensemble_path)
             return True
         except Exception as _e:

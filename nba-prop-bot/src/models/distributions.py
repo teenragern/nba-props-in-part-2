@@ -253,10 +253,12 @@ def monte_carlo_over_under(
         blowout_minute_cap = max(blowout_minute_cap, 34.0)
 
     # Must-win (elimination) games: stars and starters play longer and
-    # more consistently. Small minutes bump (capped at 43, matching the
-    # scan_props playoff starter cap) + reduced variance downstream.
+    # more consistently. Cap matches the scan_props elimination cap (47.0).
+    # Game 7s see stars at 45-48 minutes, so the bump is +3.0 not +1.5.
     if must_win and bench_tier <= 1 and proj_minutes > 0:
-        proj_minutes = min(proj_minutes + 1.5, 43.0)
+        proj_minutes = min(proj_minutes + 3.0, 47.0)
+    elif closeout_game and bench_tier <= 1 and proj_minutes > 0:
+        proj_minutes = min(proj_minutes + 1.5, 47.0)
 
     # ── 0. Pre-game blowout cap ───────────────────────────────────────────
     # When the book spread signals a likely blowout (|spread| >= 11),
@@ -659,6 +661,77 @@ def project_q1_markets(
     else:
         prob_over  = 1.0 - float(norm.cdf(book_q1_total, loc=expected_total, scale=_Q1_TOTAL_STD))
         prob_under = float(norm.cdf(book_q1_total, loc=expected_total, scale=_Q1_TOTAL_STD))
+
+    return {
+        'home_win':   home_win,
+        'away_win':   away_win,
+        'home_cover': float(np.clip(home_cover, 0.0, 1.0)),
+        'away_cover': float(np.clip(away_cover, 0.0, 1.0)),
+        'over':       float(np.clip(prob_over,  0.0, 1.0)),
+        'under':      float(np.clip(prob_under, 0.0, 1.0)),
+    }
+
+
+# 1H margins accumulate two quarters of variance: empirical NBA H1 σ ≈ 8 pts
+# margin, 5 pts combined total.  Using Q1 sigmas here would overstate edge.
+_H1_MARGIN_STD = 8.0
+_H1_TOTAL_STD  = 5.0
+
+
+def project_h1_markets(
+    home_h1_expected: float,
+    away_h1_expected: float,
+    book_h1_spread: float,
+    book_h1_total: float,
+) -> Dict[str, float]:
+    """
+    Project true probabilities for 1H Moneyline, Spread, and Total markets.
+
+    Identical structure to project_q1_markets() but uses wider empirical σ
+    values calibrated to NBA first-half distributions rather than Q1.
+
+    Parameters
+    ----------
+    home_h1_expected : Pace-adjusted 1H projected score (≈ full_game * 0.50).
+    away_h1_expected : Same for away team.
+    book_h1_spread   : 1H home-team spread (negative = home favored).
+    book_h1_total    : 1H combined over/under total.
+    """
+    expected_margin = away_h1_expected - home_h1_expected
+    expected_total  = home_h1_expected + away_h1_expected
+
+    home_win = float(norm.cdf(0.0, loc=expected_margin, scale=_H1_MARGIN_STD))
+    away_win = 1.0 - home_win
+
+    is_whole_spread = book_h1_spread != 0.0 and abs(book_h1_spread - round(book_h1_spread)) < 0.01
+    if is_whole_spread:
+        push_prob  = float(
+            norm.cdf(book_h1_spread + 0.5, loc=expected_margin, scale=_H1_MARGIN_STD)
+            - norm.cdf(book_h1_spread - 0.5, loc=expected_margin, scale=_H1_MARGIN_STD)
+        )
+        raw_home   = float(norm.cdf(book_h1_spread - 0.5, loc=expected_margin, scale=_H1_MARGIN_STD))
+        raw_away   = 1.0 - float(norm.cdf(book_h1_spread + 0.5, loc=expected_margin, scale=_H1_MARGIN_STD))
+        denom      = max(1.0 - push_prob, 1e-6)
+        home_cover = raw_home / denom
+        away_cover = raw_away / denom
+    else:
+        home_cover = float(norm.cdf(book_h1_spread, loc=expected_margin, scale=_H1_MARGIN_STD))
+        away_cover = 1.0 - home_cover
+
+    is_whole_total = book_h1_total > 0.0 and abs(book_h1_total - round(book_h1_total)) < 0.01
+    if is_whole_total:
+        push_prob  = float(
+            norm.cdf(book_h1_total + 0.5, loc=expected_total, scale=_H1_TOTAL_STD)
+            - norm.cdf(book_h1_total - 0.5, loc=expected_total, scale=_H1_TOTAL_STD)
+        )
+        raw_over   = 1.0 - float(norm.cdf(book_h1_total + 0.5, loc=expected_total, scale=_H1_TOTAL_STD))
+        raw_under  = float(norm.cdf(book_h1_total - 0.5, loc=expected_total, scale=_H1_TOTAL_STD))
+        denom      = max(1.0 - push_prob, 1e-6)
+        prob_over  = raw_over  / denom
+        prob_under = raw_under / denom
+    else:
+        prob_over  = 1.0 - float(norm.cdf(book_h1_total, loc=expected_total, scale=_H1_TOTAL_STD))
+        prob_under = float(norm.cdf(book_h1_total, loc=expected_total, scale=_H1_TOTAL_STD))
 
     return {
         'home_win':   home_win,

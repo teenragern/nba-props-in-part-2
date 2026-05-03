@@ -341,6 +341,115 @@ class OddsApiClient:
                 return candidates[sharp]
         return next(iter(candidates.values()))
 
+    # ── 1H / First-half market extractors ────────────────────────────────────
+    # Mirror the Q1 extractors but target h2h_h1, spreads_h1, totals_h1.
+
+    @staticmethod
+    def extract_h1_h2h_odds(
+        bookmakers: List[Dict], home_team: str, away_team: str
+    ) -> Optional[Tuple[float, float, str]]:
+        """Return (home_price, away_price, book_title) for the h2h_h1 market."""
+        home_lower = home_team.lower()
+        home_last  = home_lower.split()[-1]
+        away_lower = away_team.lower()
+        away_last  = away_lower.split()[-1]
+
+        candidates: Dict[str, Tuple[float, float, str]] = {}
+        for book in bookmakers:
+            title_lower = book.get('title', '').lower()
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'h2h_h1':
+                    continue
+                hp = ap = None
+                for outcome in mkt.get('outcomes', []):
+                    name  = outcome.get('name', '').lower()
+                    price = float(outcome.get('price', 0.0))
+                    if price <= 1.0:
+                        continue
+                    if name == home_lower or home_last in name:
+                        hp = price
+                    elif name == away_lower or away_last in name:
+                        ap = price
+                if hp and ap:
+                    candidates[title_lower] = (hp, ap, book.get('title', ''))
+
+        if not candidates:
+            return None
+        for sharp in OddsApiClient._SHARP_PRIORITY:
+            if sharp in candidates:
+                return candidates[sharp]
+        return next(iter(candidates.values()))
+
+    @staticmethod
+    def extract_h1_spread_odds_at_line(
+        bookmakers: List[Dict], home_team: str, home_h1_spread: float
+    ) -> Optional[Tuple[float, float, str]]:
+        """Return (home_price, away_price, book_title) for spreads_h1 at `home_h1_spread`."""
+        home_lower = home_team.lower()
+        home_last  = home_lower.split()[-1]
+
+        candidates: Dict[str, Tuple[float, float, str]] = {}
+        for book in bookmakers:
+            title_lower = book.get('title', '').lower()
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'spreads_h1':
+                    continue
+                hp = ap = None
+                for outcome in mkt.get('outcomes', []):
+                    point = outcome.get('point')
+                    price = float(outcome.get('price', 0.0))
+                    if point is None or price <= 1.0:
+                        continue
+                    name    = outcome.get('name', '').lower()
+                    is_home = (name == home_lower or home_last in name)
+                    if is_home and abs(float(point) - home_h1_spread) < 0.1:
+                        hp = price
+                    elif not is_home and abs(float(point) + home_h1_spread) < 0.1:
+                        ap = price
+                if hp and ap:
+                    candidates[title_lower] = (hp, ap, book.get('title', ''))
+
+        if not candidates:
+            return None
+        for sharp in OddsApiClient._SHARP_PRIORITY:
+            if sharp in candidates:
+                return candidates[sharp]
+        return next(iter(candidates.values()))
+
+    @staticmethod
+    def extract_h1_total_odds_at_line(
+        bookmakers: List[Dict], h1_total_line: float
+    ) -> Optional[Tuple[float, float, str]]:
+        """Return (over_price, under_price, book_title) for totals_h1 at `h1_total_line`."""
+        candidates: Dict[str, Tuple[float, float, str]] = {}
+        for book in bookmakers:
+            title_lower = book.get('title', '').lower()
+            for mkt in book.get('markets', []):
+                if mkt.get('key') != 'totals_h1':
+                    continue
+                op = up = None
+                for outcome in mkt.get('outcomes', []):
+                    point = outcome.get('point')
+                    price = float(outcome.get('price', 0.0))
+                    if point is None or price <= 1.0:
+                        continue
+                    if abs(float(point) - h1_total_line) > 0.1:
+                        continue
+                    name = outcome.get('name', '').lower()
+                    if name == 'over':
+                        op = price
+                    elif name == 'under':
+                        up = price
+                if op and up:
+                    candidates[title_lower] = (op, up, book.get('title', ''))
+
+        if not candidates:
+            return None
+        for sharp in OddsApiClient._SHARP_PRIORITY:
+            if sharp in candidates:
+                return candidates[sharp]
+        return next(iter(candidates.values()))
+
     # ── Team totals extractors ─────────────────────────────────────────────────
     # The team_totals market has outcomes with name="Over"/"Under" and
     # description=team_name.  Each team gets its own Over/Under pair.

@@ -50,6 +50,7 @@ from src.models.distributions import (
     classify_bench_tier,
     project_game_markets,
     project_q1_markets,
+    project_h1_markets,
     project_team_totals,
 )
 from src.models.devig import (
@@ -261,6 +262,30 @@ def compute_rest_asymmetry(
     #   |delta| == 2  →  ±1.5% each → ~3.3 pt swing per team, ~6.6 net
     #   |delta| == 1  →  ±0.7% each → ~1.5 pt swing per team, ~3.1 net
     abs_delta = abs(delta)
+
+    # Playoff series-transition trap: a |delta| of 4+ days in the playoffs
+    # almost always means one team swept and the other played 6-7 games.
+    # NBA history shows the well-rested team comes out RUSTY in Game 1 of
+    # the next series while the in-rhythm team starts sharp — the opposite
+    # of regular-season fatigue logic. Invert the multipliers with reduced
+    # magnitude so the trap doesn't double-count once both teams settle in.
+    if PLAYOFF_MODE and abs_delta >= 4:
+        # Tired team plays sharper; rested team is rusty.
+        rust_off, rust_def = 0.985, 1.015
+        sharp_off, sharp_def = 1.015, 0.985
+        if delta > 0:
+            # Home more rested → home is rusty, away is sharp
+            h_off, h_def = rust_off, rust_def
+            a_off, a_def = sharp_off, sharp_def
+        else:
+            a_off, a_def = rust_off, rust_def
+            h_off, h_def = sharp_off, sharp_def
+        return {
+            'home_rest': home_rest, 'away_rest': away_rest,
+            'rest_delta': delta,
+            'home_off_mult': round(h_off, 4), 'home_def_mult': round(h_def, 4),
+            'away_off_mult': round(a_off, 4), 'away_def_mult': round(a_def, 4),
+        }
 
     if abs_delta >= 3:
         off_boost, def_degrade = 1.025, 1.025
@@ -797,6 +822,11 @@ def scan_props():
             bdl_best_odds    = bdl_data["best_odds"]
             bdl_player_map   = bdl_data["player_id_map"]
 
+            # Batch-prefetch BDL profiles for all players in this game.
+            # Reduces API calls from ~9 per player to ~9 per game.
+            if bdl_player_map:
+                _bdl_bridge.prefetch_player_profiles(list(bdl_player_map.values()), season=_season_int)
+
             # Insert line history
             _all_line_records = bdl_data["line_records"]
             if _all_line_records:
@@ -820,7 +850,12 @@ def scan_props():
                 try:
                     sharp_odds = odds_client.get_event_odds(
                         event_id=event_id,
-                        markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals', 'team_totals']
+                        markets=[
+                            *PROP_MARKETS, *ALT_PROP_MARKETS,
+                            'h2h', 'spreads', 'totals', 'team_totals',
+                            'h2h_q1', 'spreads_q1', 'totals_q1',
+                            'h2h_h1', 'spreads_h1', 'totals_h1',
+                        ]
                     )
                     sharp_bookmakers = sharp_odds.get('bookmakers', [])
                 except Exception as _se:
@@ -855,7 +890,12 @@ def scan_props():
             try:
                 odds_data = odds_client.get_event_odds(
                     event_id=event_id,
-                    markets=[*PROP_MARKETS, 'h2h', 'spreads', 'totals', 'team_totals']
+                    markets=[
+                        *PROP_MARKETS, *ALT_PROP_MARKETS,
+                        'h2h', 'spreads', 'totals', 'team_totals',
+                        'h2h_q1', 'spreads_q1', 'totals_q1',
+                        'h2h_h1', 'spreads_h1', 'totals_h1',
+                    ]
                 )
             except Exception:
                 continue
@@ -896,9 +936,10 @@ def scan_props():
                 db.insert_line_history_batch(_all_line_records)
 
         # ── Collect alt-lines from sharp bookmakers ───────────────────
-        # Alt-lines are sourced from Pinnacle (already fetched above at 0 extra
-        # credits).  We only process alt-lines for players already known to be
-        # in the event — avoids pulling game-logs for players with no main-line prop.
+        # Alt-lines are sourced from Pinnacle (now fetched in the same
+        # get_event_odds call, 0 extra credits).  Only process alt-lines
+        # for players already known to be in the event.
+        _alt_line_records: List[tuple] = []
         if sharp_bookmakers:
             for _alt_mkt in ALT_PROP_MARKETS:
                 if _alt_mkt not in prices_by_market:
@@ -908,14 +949,22 @@ def scan_props():
                         if _bk_mkt.get('key') != _alt_mkt:
                             continue
                         for _oc in _bk_mkt.get('outcomes', []):
-                            _p   = _oc.get('description')
-                            _ln  = _oc.get('point')
+                            _p    = _oc.get('description')
+                            _ln   = _oc.get('point')
+                            _side = _oc.get('name', '').upper()
+                            _pr   = float(_oc.get('price', 0.0))
                             if not _p or _ln is None:
                                 continue
-                            # Only attach alt-lines for players already in event
                             if _p not in players_in_event:
                                 continue
                             prices_by_market[_alt_mkt].setdefault(_p, set()).add(float(_ln))
+                            if _pr > 0:
+                                _alt_line_records.append(
+                                    (_p, _alt_mkt, _bk.get('title'), float(_ln),
+                                     _side, _pr, 1.0 / _pr)
+                                )
+        if _alt_line_records:
+            db.insert_line_history_batch(_alt_line_records)
 
         # ── Sharp line disagreement scan ──────────────────────────────
         # Detect when Pinnacle/Circa have moved to a different line than
@@ -1324,6 +1373,126 @@ def scan_props():
             except Exception as _q1_err:
                 logger.warning(f"Q1 markets scan failed for {_gm_matchup}: {_q1_err}")
 
+        # ── 1H Markets Scan ───────────────────────────────────────────
+        # Same math as Q1 but scaled to 24 minutes (×0.50).  First-half
+        # markets are more liquid than Q1 on most books and offer tighter
+        # holds — making edges here more exploitable.
+        if sharp_bookmakers and _home_exp > 0:
+            try:
+                _h1_home_exp = _home_exp * 0.50
+                _h1_away_exp = _away_exp * 0.50
+
+                _h1_spread = OddsApiClient.extract_consensus_spread(
+                    [b for b in sharp_bookmakers
+                     if any(m.get('key') == 'spreads_h1'
+                            for m in b.get('markets', []))],
+                    home_team
+                ) or 0.0
+                _h1_total = OddsApiClient.extract_consensus_total(
+                    [b for b in sharp_bookmakers
+                     if any(m.get('key') == 'totals_h1'
+                            for m in b.get('markets', []))]
+                ) or 0.0
+
+                if _h1_home_exp > 0 and _h1_away_exp > 0:
+                    _h1_probs = project_h1_markets(
+                        _h1_home_exp, _h1_away_exp, _h1_spread, _h1_total
+                    )
+
+                    # ── 1H Moneyline ──────────────────────────────────
+                    _h1_h2h = OddsApiClient.extract_h1_h2h_odds(
+                        sharp_bookmakers, home_team, away_team
+                    )
+                    if _h1_h2h:
+                        _h1_hp, _h1_ap, _h1_book = _h1_h2h
+                        _h1_true_h, _h1_true_a = devig_shin(
+                            decimal_to_implied_prob(_h1_hp),
+                            decimal_to_implied_prob(_h1_ap),
+                        )
+                        for _h1_model_p, _h1_book_p, _h1_odds, _h1_side in [
+                            (_h1_probs['home_win'], _h1_true_h, _h1_hp, home_team),
+                            (_h1_probs['away_win'], _h1_true_a, _h1_ap, away_team),
+                        ]:
+                            _h1_edge = _h1_model_p - _h1_book_p
+                            if _h1_edge >= _GAME_MARKET_EDGE_MIN:
+                                _h1_ev = _h1_model_p * (_h1_odds - 1) - (1 - _h1_model_p)
+                                send_game_market_alert(
+                                    home_team=home_team, away_team=away_team,
+                                    home_score=_h1_home_exp, away_score=_h1_away_exp,
+                                    market='h2h_h1', side=_h1_side,
+                                    edge=_h1_edge, ev=_h1_ev,
+                                    model_prob=_h1_model_p, book_prob=_h1_book_p,
+                                    book_odds=_h1_odds, book=_h1_book,
+                                    game_date=game_date, event_id=event_id,
+                                    line=0.0, db=db, _bot=bot,
+                                    home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                )
+
+                    # ── 1H Spread ─────────────────────────────────────
+                    if _h1_spread != 0.0:
+                        _h1_sp = OddsApiClient.extract_h1_spread_odds_at_line(
+                            sharp_bookmakers, home_team, _h1_spread
+                        )
+                        if _h1_sp:
+                            _h1_sp_hp, _h1_sp_ap, _h1_sp_book = _h1_sp
+                            _h1_true_h, _h1_true_a = devig_shin(
+                                decimal_to_implied_prob(_h1_sp_hp),
+                                decimal_to_implied_prob(_h1_sp_ap),
+                            )
+                            for _h1_model_p, _h1_book_p, _h1_odds, _h1_side in [
+                                (_h1_probs['home_cover'], _h1_true_h, _h1_sp_hp,
+                                 f"{home_team} 1H {_h1_spread:+.1f}"),
+                                (_h1_probs['away_cover'], _h1_true_a, _h1_sp_ap,
+                                 f"{away_team} 1H {-_h1_spread:+.1f}"),
+                            ]:
+                                _h1_edge = _h1_model_p - _h1_book_p
+                                if _h1_edge >= _GAME_MARKET_EDGE_MIN:
+                                    _h1_ev = _h1_model_p * (_h1_odds - 1) - (1 - _h1_model_p)
+                                    send_game_market_alert(
+                                        home_team=home_team, away_team=away_team,
+                                        home_score=_h1_home_exp, away_score=_h1_away_exp,
+                                        market='spreads_h1', side=_h1_side,
+                                        edge=_h1_edge, ev=_h1_ev,
+                                        model_prob=_h1_model_p, book_prob=_h1_book_p,
+                                        book_odds=_h1_odds, book=_h1_sp_book,
+                                        game_date=game_date, event_id=event_id,
+                                        line=_h1_spread, db=db, _bot=bot,
+                                        home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                    )
+
+                    # ── 1H Total ──────────────────────────────────────
+                    if _h1_total > 0.0:
+                        _h1_tot = OddsApiClient.extract_h1_total_odds_at_line(
+                            sharp_bookmakers, _h1_total
+                        )
+                        if _h1_tot:
+                            _h1_tot_op, _h1_tot_up, _h1_tot_book = _h1_tot
+                            _h1_true_o, _h1_true_u = devig_shin(
+                                decimal_to_implied_prob(_h1_tot_op),
+                                decimal_to_implied_prob(_h1_tot_up),
+                            )
+                            for _h1_model_p, _h1_book_p, _h1_odds, _h1_side in [
+                                (_h1_probs['over'],  _h1_true_o, _h1_tot_op, '1H Over'),
+                                (_h1_probs['under'], _h1_true_u, _h1_tot_up, '1H Under'),
+                            ]:
+                                _h1_edge = _h1_model_p - _h1_book_p
+                                if _h1_edge >= _GAME_MARKET_EDGE_MIN:
+                                    _h1_ev = _h1_model_p * (_h1_odds - 1) - (1 - _h1_model_p)
+                                    send_game_market_alert(
+                                        home_team=home_team, away_team=away_team,
+                                        home_score=_h1_home_exp, away_score=_h1_away_exp,
+                                        market='totals_h1', side=_h1_side,
+                                        edge=_h1_edge, ev=_h1_ev,
+                                        model_prob=_h1_model_p, book_prob=_h1_book_p,
+                                        book_odds=_h1_odds, book=_h1_tot_book,
+                                        game_date=game_date, event_id=event_id,
+                                        line=_h1_total, db=db, _bot=bot,
+                                        home_abbr=_gm_home_abbr, away_abbr=_gm_away_abbr,
+                                    )
+
+            except Exception as _h1_err:
+                logger.warning(f"1H markets scan failed for {_gm_matchup}: {_h1_err}")
+
         # ── Team Totals Scan ──────────────────────────────────────────
         # Isolates each team's expected score independently — removes the
         # opponent's offensive variance that contaminates game total bets.
@@ -1378,6 +1547,7 @@ def scan_props():
         # ── Per-player loop ───────────────────────────────────────────
         team_player_logs: Dict[str, Dict[str, pd.DataFrame]] = {}
         for player_name in players_in_event:
+            pra_components = {}
             # Injury status
             injury_status = "Healthy"
             if player_name in out_players:
@@ -1610,8 +1780,12 @@ def scan_props():
                     # ── Playoff Rotation Adjustments ──────────────────────────
                     if PLAYOFF_MODE:
                         if starter_flag:
-                            # Starters play heavier minutes in the playoffs (boost by ~10%, cap at 43)
-                            proj['projected_minutes'] = min(43.0, proj['projected_minutes'] * 1.10)
+                            # Starters play heavier minutes in the playoffs (boost by ~10%).
+                            # Cap at 43 normally, lift to 47 in elimination/closeout games
+                            # where stars routinely play 45-48 (Game 7 territory).
+                            _elim = bool(proj.get('must_win') or proj.get('closeout_opportunity'))
+                            _cap  = 47.0 if _elim else 43.0
+                            proj['projected_minutes'] = min(_cap, proj['projected_minutes'] * 1.10)
                             proj['mean'] *= 1.10
                             # Minutes are more predictable for starters, reducing variance
                             proj['variance_scale'] = proj.get('variance_scale', 1.0) * 0.85
@@ -1624,6 +1798,13 @@ def scan_props():
                         else:
                             # Regular bench rotation also sees increased volatility in playoffs
                             proj['variance_scale'] = proj.get('variance_scale', 1.0) * 1.15
+
+                        # Usage consolidation: stars eat usage when on the floor in
+                        # heavy-minute playoff games; non-starters get frozen out.
+                        if starter_flag and proj['projected_minutes'] > 36.0:
+                            proj['mean'] *= 1.03
+                        elif not starter_flag:
+                            proj['mean'] *= 0.88
 
                     # XGBoost blend
                     _league_avg_pace = pace_info.get('league_avg', 99.0)
@@ -1752,8 +1933,24 @@ def scan_props():
                             f"mins {_old_mins:.1f} → {proj['projected_minutes']:.1f}"
                         )
 
-                    _bench_tier = classify_bench_tier(proj['projected_minutes'])
+                    # ── PRA Arbitrage Consistency Check ───────────────────
+                    # Enforce that PRA rigidly equals E[P] + E[R] + E[A].
+                    # Because PROP_MARKETS evaluates P, R, A before PRA, they are cached here.
+                    if base_mkt in ['player_points', 'player_rebounds', 'player_assists']:
+                        pra_components[base_mkt] = proj['mean']
+                    elif base_mkt == 'player_points_rebounds_assists':
+                        _req = ['player_points', 'player_rebounds', 'player_assists']
+                        if all(k in pra_components for k in _req):
+                            _sum_pra = sum(pra_components[k] for k in _req)
+                            if abs(proj['mean'] - _sum_pra) > 0.01:
+                                logger.debug(
+                                    f"PRA Consistency: {player_name} raw_PRA={proj['mean']:.2f} "
+                                    f"→ locked to P+R+A={_sum_pra:.2f}"
+                                )
+                                proj['mean'] = _sum_pra
 
+                    _bench_tier = classify_bench_tier(proj['projected_minutes'])
+                    
                     dists = get_probability_distribution(
                         base_mkt, proj['mean'], line, logs=logs,
                         variance_scale=proj.get('variance_scale', 1.0),

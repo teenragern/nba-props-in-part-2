@@ -17,6 +17,7 @@ Usage:
     starters = bridge.get_confirmed_starters(bdl_game_id)
 """
 
+import time
 from typing import Dict, List, Optional, Set, Any
 from src.clients.bdl_client import BDLClient
 from src.utils.logging_utils import get_logger
@@ -30,10 +31,14 @@ _TEAM_LOOKUP: Dict[str, dict] = {}
 class BDLBridge:
     """Bridge between BDL API and the existing scan_props pipeline."""
 
+    _ODDS_CACHE_TTL = 86400  # 24 h — spreads/totals don't move enough to re-fetch intraday
+
     def __init__(self, bdl: BDLClient = None):
         self.bdl = bdl or BDLClient()
         self._player_cache: Dict[int, dict] = {}  # bdl_player_id → player info
         self._team_cache: Dict[int, dict] = {}     # bdl_team_id → team info
+        self._odds_cache: Dict[str, tuple] = {}    # date -> (result, monotonic_time)
+        self._profile_cache: Dict[int, dict] = {}  # bdl_player_id -> profile
 
     # ── Team resolution ──────────────────────────────────────────────────
 
@@ -264,6 +269,10 @@ class BDLBridge:
 
         Computes median across all vendors for robustness.
         """
+        cached = self._odds_cache.get(date)
+        if cached and (time.monotonic() - cached[1]) < self._ODDS_CACHE_TTL:
+            return cached[0]
+
         raw_odds = self.bdl.get_betting_odds(dates=[date])
 
         # Group by game_id
@@ -312,6 +321,7 @@ class BDLBridge:
             if ctx:
                 result[gid] = ctx
 
+        self._odds_cache[date] = (result, time.monotonic())
         return result
 
     # ── Comprehensive season profile (advanced V2 + playtype + general/advanced) ──
@@ -366,77 +376,221 @@ class BDLBridge:
         }
         result = dict(defaults)
 
+        if bdl_player_id in self._profile_cache:
+            return self._profile_cache[bdl_player_id]
+
         # ── Layer 1: V2 per-game advanced stats ──────────────────────────
         adv = self.get_player_advanced_features(bdl_player_id, season, n_games=10)
-        result["avg_distance"]         = adv.get("avg_distance",        0.0)
-        result["real_usage_pct"]       = adv.get("avg_usage_pct",       0.0)
-        result["avg_touches"]          = adv.get("avg_touches",         0.0)
-        result["pct_pts_3pt"]          = adv.get("avg_pct_pts_3pt",     0.0)
-        result["avg_speed"]            = adv.get("avg_speed",           0.0)
-        result["avg_contested_fg_pct"] = adv.get("avg_contested_fg_pct", 0.0)
-        result["avg_deflections"]      = adv.get("avg_deflections",     0.0)
-        result["avg_points_paint"]     = adv.get("avg_points_paint",    0.0)
-        result["avg_pct_pts_paint"]    = adv.get("avg_pct_pts_paint",   0.0)
-
+        
         # ── Layer 2: Season averages general/advanced → ts_pct ───────────
+        gen_adv = None
         try:
-            gen_adv = self.bdl.get_season_averages(
+            rows = self.bdl.get_season_averages(
                 season=season,
                 player_ids=[bdl_player_id],
                 category="general",
                 stat_type="advanced",
             )
-            if gen_adv:
-                result["ts_pct"] = float(gen_adv[0].get("ts_pct", 0.0) or 0.0)
-        except Exception as e:
-            logger.debug(f"BDL general/advanced failed for {bdl_player_id}: {e}")
+            if rows:
+                gen_adv = rows[0]
+        except Exception:
+            pass
 
         # ── Layer 3: Playtype season averages ────────────────────────────
-        _playtype_targets = {
-            "prballhandler": "pnr_bh_freq",
-            "prrollman":     "pnr_roll_freq",
-            "isolation":     "iso_freq",
-            "spotup":        "spotup_freq",
-            "transition":    "transition_freq",
-            "postup":        "postup_freq",
-        }
-        for stat_type, feature_key in _playtype_targets.items():
+        playtypes = ["prballhandler", "prrollman", "isolation", "spotup", "transition", "postup"]
+        pt_data = {}
+        for pt in playtypes:
             try:
                 rows = self.bdl.get_season_averages(
                     season=season,
                     player_ids=[bdl_player_id],
                     category="playtype",
-                    stat_type=stat_type,
+                    stat_type=pt,
                 )
                 if rows:
-                    freq = rows[0].get("percent_of_plays") or rows[0].get("frequency") or 0.0
-                    result[feature_key] = float(freq or 0.0)
-            except Exception as e:
-                logger.debug(f"BDL playtype/{stat_type} failed for {bdl_player_id}: {e}")
+                    pt_data[pt] = rows[0]
+            except Exception:
+                pass
 
         # ── Layer 4: Tracking drives ──────────────────────────────────────
+        drives = None
         try:
-            drives_rows = self.bdl.get_season_averages(
+            rows = self.bdl.get_season_averages(
                 season=season,
                 player_ids=[bdl_player_id],
                 category="tracking",
                 stat_type="drives",
             )
-            if drives_rows:
-                result["drives_per_game"] = float(drives_rows[0].get("drives", 0.0) or 0.0)
-        except Exception as e:
-            logger.debug(f"BDL tracking/drives failed for {bdl_player_id}: {e}")
+            if rows:
+                drives = rows[0]
+        except Exception:
+            pass
 
-        logger.debug(
-            f"BDL season profile for {bdl_player_id}: "
-            f"usage={result['real_usage_pct']:.1%} ts={result['ts_pct']:.3f} "
-            f"pnr={result['pnr_bh_freq']:.2f} roll={result['pnr_roll_freq']:.2f} "
-            f"iso={result['iso_freq']:.2f} post={result['postup_freq']:.2f} "
-            f"spotup={result['spotup_freq']:.2f} trans={result['transition_freq']:.2f} "
-            f"drives={result['drives_per_game']:.1f} "
-            f"speed={result['avg_speed']:.2f} paint_pts={result['avg_points_paint']:.1f} "
-            f"deflections={result['avg_deflections']:.2f}"
+        profile = self._build_profile_from_data(
+            bdl_player_id, 
+            adv_rows_recent=[adv], # Wrap in list to match expected format
+            gen_adv_row=gen_adv,
+            pt_rows=pt_data,
+            drives_row=drives
         )
+        self._profile_cache[bdl_player_id] = profile
+        return profile
+
+    def prefetch_player_profiles(self, player_ids: List[int], season: int):
+        """
+        Batch-fetch season profiles for multiple players and store in cache.
+        Reduces API calls from O(N) to O(1) per scan.
+        """
+        if not player_ids:
+            return
+        
+        # Filter out already cached players
+        needed = [pid for pid in player_ids if pid not in self._profile_cache]
+        if not needed:
+            return
+
+        logger.info(f"BDL: Prefetching profiles for {len(needed)} players (season {season})")
+        import requests
+
+        # Helper to check for 429 and abort prefetch
+        def _is_rate_limited(e):
+            return "429" in str(e) or isinstance(e, requests.exceptions.RetryError)
+
+        # 1. Advanced stats V2
+        adv_by_p = {}
+        try:
+            adv_rows = self.bdl.get_advanced_stats(player_ids=needed, seasons=[season], period=0)
+            for row in adv_rows:
+                pid = row.get("player_id")
+                if pid:
+                    adv_by_p.setdefault(pid, []).append(row)
+        except Exception as e:
+            logger.warning(f"BDL prefetch: advanced stats failed: {e}")
+            if _is_rate_limited(e): return # Abort prefetch if rate limited
+
+        time.sleep(1.0) # Grace period
+
+        # 2. General/Advanced
+        gen_adv_by_p = {}
+        try:
+            gen_adv_rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="general", stat_type="advanced")
+            gen_adv_by_p = {row.get("player_id"): row for row in gen_adv_rows if row.get("player_id")}
+        except Exception as e:
+            if _is_rate_limited(e): return
+
+        time.sleep(1.0)
+
+        # 3. Playtypes
+        playtypes = ["prballhandler", "prrollman", "isolation", "spotup", "transition", "postup"]
+        pt_data_by_p = {pid: {} for pid in needed}
+        for pt in playtypes:
+            try:
+                rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="playtype", stat_type=pt)
+                for row in rows:
+                    pid = row.get("player_id")
+                    if pid in pt_data_by_p:
+                        pt_data_by_p[pid][pt] = row
+                time.sleep(0.5) # Breath between playtypes
+            except Exception as e:
+                if _is_rate_limited(e): return
+                continue
+
+        # 4. Tracking/Drives
+        drives_by_p = {}
+        try:
+            drives_rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="tracking", stat_type="drives")
+            drives_by_p = {row.get("player_id"): row for row in drives_rows if row.get("player_id")}
+        except Exception as e:
+            if _is_rate_limited(e): return
+
+        # Build and cache
+        for pid in needed:
+            profile = self._build_profile_from_data(
+                pid,
+                adv_rows_recent=adv_by_p.get(pid, [])[:10],
+                gen_adv_row=gen_adv_by_p.get(pid),
+                pt_rows=pt_data_by_p.get(pid, {}),
+                drives_row=drives_by_p.get(pid)
+            )
+            self._profile_cache[pid] = profile
+
+    def _build_profile_from_data(
+        self, bdl_player_id: int, 
+        adv_rows_recent: List[dict],
+        gen_adv_row: Optional[dict],
+        pt_rows: Dict[str, dict],
+        drives_row: Optional[dict]
+    ) -> Dict[str, float]:
+        """Helper to assemble a profile dict from raw BDL components."""
+        defaults: Dict[str, float] = {
+            "avg_distance":         0.0, "real_usage_pct":       0.0,
+            "avg_touches":          0.0, "pct_pts_3pt":          0.0,
+            "ts_pct":               0.0, "pnr_bh_freq":          0.0,
+            "pnr_roll_freq":        0.0, "iso_freq":             0.0,
+            "spotup_freq":          0.0, "transition_freq":      0.0,
+            "postup_freq":          0.0, "drives_per_game":      0.0,
+            "avg_speed":            0.0, "avg_contested_fg_pct": 0.0,
+            "avg_deflections":      0.0, "avg_points_paint":     0.0,
+            "avg_pct_pts_paint":    0.0,
+        }
+        result = dict(defaults)
+
+        # Layer 1: Advanced (recent)
+        if adv_rows_recent:
+            n = len(adv_rows_recent)
+            def _avg(key: str) -> float:
+                return sum(float(s.get(key, 0) or 0) for s in adv_rows_recent) / n
+            
+            # Note: get_player_advanced_features uses specific keys.
+            # BDL V2 stats use 'usage_percentage', 'touches', etc.
+            # If adv_rows_recent came from get_player_advanced_features, it's already a single dict.
+            # If it's a list from prefetch, we need to average them.
+            if isinstance(adv_rows_recent[0], dict) and "avg_usage_pct" in adv_rows_recent[0]:
+                # It's already the averaged dict from get_player_advanced_features
+                r = adv_rows_recent[0]
+                result.update({
+                    "avg_distance": r.get("avg_distance", 0.0),
+                    "real_usage_pct": r.get("avg_usage_pct", 0.0),
+                    "avg_touches": r.get("avg_touches", 0.0),
+                    "pct_pts_3pt": r.get("avg_pct_pts_3pt", 0.0),
+                    "avg_speed": r.get("avg_speed", 0.0),
+                    "avg_contested_fg_pct": r.get("avg_contested_fg_pct", 0.0),
+                    "avg_deflections": r.get("avg_deflections", 0.0),
+                    "avg_points_paint": r.get("avg_points_paint", 0.0),
+                    "avg_pct_pts_paint": r.get("avg_pct_pts_paint", 0.0),
+                })
+            else:
+                # It's raw rows from prefetch
+                result["avg_distance"]         = _avg("distance")
+                result["real_usage_pct"]       = _avg("usage_percentage")
+                result["avg_touches"]          = _avg("touches")
+                result["pct_pts_3pt"]          = _avg("pct_pts_3pt")
+                result["avg_speed"]            = _avg("speed")
+                result["avg_contested_fg_pct"] = _avg("contested_fg_pct")
+                result["avg_deflections"]      = _avg("deflections")
+                result["avg_points_paint"]     = _avg("points_paint")
+                result["avg_pct_pts_paint"]    = _avg("pct_pts_paint")
+
+        # Layer 2: General/Advanced
+        if gen_adv_row:
+            result["ts_pct"] = float(gen_adv_row.get("ts_pct", 0.0) or 0.0)
+
+        # Layer 3: Playtype
+        _pt_map = {
+            "prballhandler": "pnr_bh_freq", "prrollman": "pnr_roll_freq",
+            "isolation": "iso_freq", "spotup": "spotup_freq",
+            "transition": "transition_freq", "postup": "postup_freq",
+        }
+        for bdl_key, res_key in _pt_map.items():
+            row = pt_rows.get(bdl_key)
+            if row:
+                freq = row.get("percent_of_plays") or row.get("frequency") or 0.0
+                result[res_key] = float(freq or 0.0)
+
+        # Layer 4: Tracking
+        if drives_row:
+            result["drives_per_game"] = float(drives_row.get("drives", 0.0) or 0.0)
+
         return result
 
     # ── Advanced Stats for XGBoost features ──────────────────────────────

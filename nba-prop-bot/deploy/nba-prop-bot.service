@@ -1,0 +1,40 @@
+[Unit]
+Description=NBA Prop Bot — credit-aware prop scanner and alert system
+Documentation=https://github.com/teenragern/nba-props-in
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=propbot
+Group=propbot
+WorkingDirectory=/opt/nba-prop-bot
+
+# Activate the virtualenv explicitly so all dependencies are on PATH.
+ExecStart=/opt/nba-prop-bot/venv/bin/python main.py run
+
+# Load secrets from .env without exposing them in the unit file.
+EnvironmentFile=/opt/nba-prop-bot/.env
+
+# Restart on any non-zero exit.  RestartSec gives Railway-style 10 s cooldown
+# before retry so a hard crash doesn't spin CPU.
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Hard-kill after 30 s if the process doesn't exit cleanly on SIGTERM.
+TimeoutStopSec=30
+
+# Journal integration — use `journalctl -u nba-prop-bot -f` to follow logs.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nba-prop-bot
+
+# Security hardening.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -412,8 +412,22 @@ def build_player_projection(player_id: str, market: str, line: float,
     # Priority 2: Opponent defensive adjustment
     adj_rate *= opponent_multiplier
 
-    # Priority 4: Home/away factor
-    adj_rate *= get_home_away_factor(home_flag)
+    # Priority 4: Home/away factor.
+    # Playoff road games hit role players harder than stars — stars travel,
+    # bench shrinks in hostile environments. Decouple by projected minutes
+    # when away + playoff_mode; otherwise use the flat regular-season factor.
+    if playoff_mode and not home_flag:
+        if proj_mins >= 28:
+            _road_factor = 0.99
+        elif proj_mins >= 20:
+            _road_factor = 0.97
+        elif proj_mins >= 12:
+            _road_factor = 0.94
+        else:
+            _road_factor = 0.92
+        adj_rate *= _road_factor
+    else:
+        adj_rate *= get_home_away_factor(home_flag)
 
     # Priority 4: Rest days factor
     rest_factor = get_rest_days_factor(rest_days, b2b_flag)

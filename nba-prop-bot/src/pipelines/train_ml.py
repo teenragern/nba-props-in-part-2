@@ -21,6 +21,9 @@ from typing import List, Optional
 
 from src.utils.logging_utils import get_logger
 from src.clients.nba_stats import NbaStatsClient
+from src.clients.bdl_client import BDLClient
+from src.clients.bdl_game_logs import BDLGameLogs
+from src.data.db import DatabaseClient
 from src.clients.telegram_bot import TelegramBotClient
 from src.models.ml_model import train_models_from_logs, train_models_with_clv_feedback
 
@@ -41,6 +44,7 @@ def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
 
     stats = NbaStatsClient()
     bot   = TelegramBotClient()
+    bdl_logs = BDLGameLogs(BDLClient(), db=DatabaseClient())
 
     logger.info(f"ML training started: seasons={seasons}")
     bot.send_message(
@@ -70,10 +74,10 @@ def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
     for idx, pid in enumerate(player_ids):
         season_dfs = []
         for season in seasons:
-            df = stats.get_player_game_logs_season(pid, season)
+            szn_int = int(season.split('-')[0])
+            df = bdl_logs.get_player_game_logs(pid, szn_int, ignore_ttl=True)
             if not df.empty:
                 season_dfs.append(df)
-            time.sleep(0.15)
 
         if not season_dfs:
             continue
@@ -133,6 +137,7 @@ def train_ml_models_clv_feedback(seasons: Optional[List[str]] = None) -> dict:
     stats = NbaStatsClient()
     bot   = TelegramBotClient()
     db    = DatabaseClient()
+    bdl_logs = BDLGameLogs(BDLClient(), db=db)
 
     logger.info(f"CLV feedback training: seasons={seasons}")
     bot.send_message(
@@ -166,10 +171,10 @@ def train_ml_models_clv_feedback(seasons: Optional[List[str]] = None) -> dict:
 
         season_dfs = []
         for season in seasons:
-            df = stats.get_player_game_logs_season(pid, season)
+            szn_int = int(season.split('-')[0])
+            df = bdl_logs.get_player_game_logs(pid, szn_int, ignore_ttl=True)
             if not df.empty:
                 season_dfs.append(df)
-            time.sleep(0.15)
 
         if not season_dfs:
             continue

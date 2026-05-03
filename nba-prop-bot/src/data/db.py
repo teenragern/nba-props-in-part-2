@@ -51,26 +51,51 @@ class DatabaseClient:
             self._migrate_schema(conn)
             logger.info("Database schema initialized.")
 
-    def _migrate_schema(self, conn):
-        """Add new columns to existing tables without breaking existing data."""
-        migrations = [
-            # alerts_sent columns
-            "ALTER TABLE alerts_sent ADD COLUMN game_date TEXT",
-            "ALTER TABLE alerts_sent ADD COLUMN event_id TEXT",
-            "ALTER TABLE alerts_sent ADD COLUMN home_away TEXT",
-            "ALTER TABLE alerts_sent ADD COLUMN rest_days INTEGER DEFAULT 2",
-            # clv_tracking columns — fix "no such column: implied_closing"
-            "ALTER TABLE clv_tracking ADD COLUMN implied_closing REAL",
-            "ALTER TABLE clv_tracking ADD COLUMN implied_alert REAL",
-            "ALTER TABLE clv_tracking ADD COLUMN clv REAL",
-            # bet_results — push detection (settlement v2)
-            "ALTER TABLE bet_results ADD COLUMN push BOOLEAN NOT NULL DEFAULT 0",
-            # players — role shift: primary ball-handler tag
-            "ALTER TABLE players ADD COLUMN is_primary_initiator BOOLEAN NOT NULL DEFAULT 0",
-            # pending_alerts — two-tier alert batching (flush v1)
-            # (table created by schema; migration ensures forward-compat if
-            #  an older DB predates the CREATE TABLE statement above)
-            """CREATE TABLE IF NOT EXISTS pending_alerts (
+    # Versioned migration list — each entry is (version, description, sql_or_list).
+    # Append new entries at the end.  Never renumber existing ones.
+    _VERSIONED_MIGRATIONS = [
+        (1,  "alerts_sent: game_date",          "ALTER TABLE alerts_sent ADD COLUMN game_date TEXT"),
+        (2,  "alerts_sent: event_id",            "ALTER TABLE alerts_sent ADD COLUMN event_id TEXT"),
+        (3,  "alerts_sent: home_away",           "ALTER TABLE alerts_sent ADD COLUMN home_away TEXT"),
+        (4,  "alerts_sent: rest_days",           "ALTER TABLE alerts_sent ADD COLUMN rest_days INTEGER DEFAULT 2"),
+        (5,  "clv_tracking: implied_closing",    "ALTER TABLE clv_tracking ADD COLUMN implied_closing REAL"),
+        (6,  "clv_tracking: implied_alert",      "ALTER TABLE clv_tracking ADD COLUMN implied_alert REAL"),
+        (7,  "clv_tracking: clv",               "ALTER TABLE clv_tracking ADD COLUMN clv REAL"),
+        (8,  "bet_results: push",               "ALTER TABLE bet_results ADD COLUMN push BOOLEAN NOT NULL DEFAULT 0"),
+        (9,  "players: is_primary_initiator",   "ALTER TABLE players ADD COLUMN is_primary_initiator BOOLEAN NOT NULL DEFAULT 0"),
+        (10, "bet_results: settled_at",         "ALTER TABLE bet_results ADD COLUMN settled_at DATETIME"),
+        (11, "placed_bets table", """CREATE TABLE IF NOT EXISTS placed_bets (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id     INTEGER NOT NULL,
+                mode         TEXT    NOT NULL DEFAULT 'paper',
+                player_name  TEXT    NOT NULL,
+                market       TEXT    NOT NULL,
+                side         TEXT    NOT NULL,
+                line         REAL    NOT NULL,
+                book         TEXT,
+                alerted_odds REAL    NOT NULL,
+                fill_odds    REAL,
+                slippage     REAL,
+                stake        REAL    NOT NULL,
+                game_date    TEXT,
+                executed_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                session_id   TEXT
+            )"""),
+        (12, "model_health table", """CREATE TABLE IF NOT EXISTS model_health (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_date DATE    NOT NULL,
+                window       TEXT    NOT NULL,
+                market       TEXT    NOT NULL DEFAULT 'all',
+                brier        REAL    NOT NULL,
+                n_samples    INTEGER NOT NULL,
+                recorded_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+            )"""),
+        (13, "injury_reports: description",    "ALTER TABLE injury_reports ADD COLUMN description TEXT"),
+        (14, "injury_reports: return_date",    "ALTER TABLE injury_reports ADD COLUMN return_date TEXT"),
+        (15, "injury_reports: severity",       "ALTER TABLE injury_reports ADD COLUMN severity INTEGER DEFAULT 0"),
+        (16, "injury_reports: source",         "ALTER TABLE injury_reports ADD COLUMN source TEXT"),
+        (17, "injury_reports: updated_at",     "ALTER TABLE injury_reports ADD COLUMN updated_at DATETIME"),
+        (18, "pending_alerts table", """CREATE TABLE IF NOT EXISTS pending_alerts (
                 id         INTEGER  PRIMARY KEY AUTOINCREMENT,
                 alert_type TEXT     NOT NULL,
                 title      TEXT     NOT NULL,
@@ -79,9 +104,8 @@ class DatabaseClient:
                 game_date  TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 sent_at    DATETIME
-            )""",
-            # BDL defense profiles cache
-            """CREATE TABLE IF NOT EXISTS bdl_defense_profiles (
+            )"""),
+        (19, "bdl_defense_profiles table", """CREATE TABLE IF NOT EXISTS bdl_defense_profiles (
                 team_key    TEXT    NOT NULL,
                 season      INTEGER NOT NULL,
                 opp_pts     REAL NOT NULL DEFAULT 1.0,
@@ -96,9 +120,8 @@ class DatabaseClient:
                 stl         REAL NOT NULL DEFAULT 1.0,
                 fetched_at  TEXT NOT NULL,
                 PRIMARY KEY (team_key, season)
-            )""",
-            # BDL game log cache
-            """CREATE TABLE IF NOT EXISTS bdl_game_log_cache (
+            )"""),
+        (20, "bdl_game_log_cache table", """CREATE TABLE IF NOT EXISTS bdl_game_log_cache (
                 player_id   INTEGER NOT NULL,
                 season      INTEGER NOT NULL,
                 game_date   TEXT    NOT NULL,
@@ -118,13 +141,39 @@ class DatabaseClient:
                 wl          TEXT,
                 cached_at   TEXT NOT NULL,
                 PRIMARY KEY (player_id, season, game_date)
-            )""",
-        ]
-        for sql in migrations:
+            )"""),
+    ]
+
+    def _migrate_schema(self, conn):
+        """
+        Apply versioned schema migrations that have not yet been recorded
+        in schema_migrations.  Safe to re-run: already-applied statements
+        are skipped; SQLite errors (column already exists, table already
+        exists) are swallowed so that existing DBs upgrade gracefully.
+        """
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                description TEXT,
+                applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        applied = {
+            row[0]
+            for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        for version, description, sql in self._VERSIONED_MIGRATIONS:
+            if version in applied:
+                continue
             try:
                 conn.execute(sql)
             except Exception:
-                pass  # Column already exists
+                pass  # Column/table already exists — harmless
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, description) VALUES (?, ?)",
+                (version, description),
+            )
+        logger.debug(f"Migrations applied up to v{max((v for v,*_ in self._VERSIONED_MIGRATIONS), default=0)}")
 
     def insert_alert(self, player_name: str, market: str, line: float, side: str,
                      edge: float, book: str, odds: float, stake: float = 0.0,
@@ -385,6 +434,34 @@ class DatabaseClient:
         except Exception:
             pass
         return 1.0
+
+    def get_per_market_clv(self, days_back: int = 30, min_samples: int = 10) -> Dict[str, float]:
+        """
+        Return {market: avg_clv} for markets with >= min_samples settled CLV records
+        in the last days_back days.  Used by edge_ranker to adaptively raise or lower
+        per-market edge floors based on whether we are beating the closing line.
+        """
+        try:
+            with self.get_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT market,
+                           AVG(clv)  AS avg_clv,
+                           COUNT(*)  AS n
+                    FROM clv_tracking
+                    WHERE clv IS NOT NULL
+                      AND alert_time >= datetime('now', ?)
+                    GROUP BY market
+                    """,
+                    (f'-{days_back} days',),
+                ).fetchall()
+            return {
+                r['market']: float(r['avg_clv'])
+                for r in rows
+                if r['n'] and int(r['n']) >= min_samples
+            }
+        except Exception:
+            return {}
 
     def get_clv_beat_rate(self, days_back: int = 30, min_samples: int = 10) -> Optional[float]:
         """
@@ -734,6 +811,98 @@ class DatabaseClient:
                 (matchup, player_a, player_b, market_a, market_b),
             ).fetchone()
         return float(row['correlation']) if row else None
+
+    # ------------------------------------------------------------------ #
+    #  Empirical correlation from bet outcomes                            #
+    # ------------------------------------------------------------------ #
+
+    def get_outcome_correlation(
+        self, player_name: str, market_a: str, market_b: str,
+        min_samples: int = 30,
+    ) -> tuple:
+        """
+        Compute the phi (Matthews) correlation coefficient between two prop
+        outcomes for the same player from settled bet history.
+
+        For each game where we have non-push settled alerts on both market_a
+        and market_b for this player, record whether each won (1) or lost (0).
+        The phi coefficient is the Pearson correlation of two binary vectors —
+        exactly what we need to calibrate the copula.
+
+        Returns (phi, n_games).  Returns (None, 0) when fewer than
+        min_samples aligned games exist.
+        """
+        try:
+            with self.get_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        CAST(br1.won AS INTEGER) AS won_a,
+                        CAST(br2.won AS INTEGER) AS won_b
+                    FROM alerts_sent s1
+                    JOIN bet_results br1
+                        ON br1.alert_id = s1.id AND br1.push = 0 AND br1.won IS NOT NULL
+                    JOIN alerts_sent s2
+                        ON  s2.player_name = s1.player_name
+                        AND s2.game_date   = s1.game_date
+                        AND s2.market      = ?
+                        AND s2.id          > s1.id
+                    JOIN bet_results br2
+                        ON br2.alert_id = s2.id AND br2.push = 0 AND br2.won IS NOT NULL
+                    WHERE s1.player_name = ?
+                      AND s1.market      = ?
+                    """,
+                    (market_b, player_name, market_a),
+                ).fetchall()
+        except Exception:
+            return (None, 0)
+
+        n = len(rows)
+        if n < min_samples:
+            return (None, 0)
+
+        import math
+        hits_a  = [r[0] for r in rows]
+        hits_b  = [r[1] for r in rows]
+        p_a     = sum(hits_a) / n
+        p_b     = sum(hits_b) / n
+        p_ab    = sum(a * b for a, b in zip(hits_a, hits_b)) / n
+        denom   = math.sqrt(p_a * (1 - p_a) * p_b * (1 - p_b))
+        if denom < 1e-9:
+            return (None, 0)
+        phi = (p_ab - p_a * p_b) / denom
+        return (float(phi), n)
+
+    def get_player_sgp_correlation(
+        self, player_name: str, market_a: str, market_b: str,
+        min_samples: int = 15,
+    ) -> tuple:
+        """
+        Return (correlation, sample_size) from the sgp_correlations table for
+        this player's market pair.  Returns (None, 0) when insufficient data.
+        Both orderings of (market_a, market_b) are tried.
+        """
+        key_pairs = [
+            (market_a, market_b),
+            (market_b, market_a),
+        ]
+        try:
+            with self.get_conn() as conn:
+                for ma, mb in key_pairs:
+                    row = conn.execute(
+                        """
+                        SELECT correlation, sample_size
+                        FROM sgp_correlations
+                        WHERE player_name = ? AND market_a = ? AND market_b = ?
+                          AND sample_size >= ?
+                        """,
+                        (player_name, ma, mb, min_samples),
+                    ).fetchone()
+                    if row:
+                        return (float(row['correlation']), int(row['sample_size']))
+        except Exception:
+            pass
+        return (None, 0)
 
     # ------------------------------------------------------------------ #
     #  Steam detection                                                     #
@@ -1137,22 +1306,32 @@ class DatabaseClient:
                     )
                 except Exception:
                     pass
-
-    def get_cached_bdl_game_logs(self, player_id: int, season: int) -> list:
+    def get_cached_bdl_game_logs(self, player_id: int, season: int, ignore_ttl: bool = False) -> list:
         """
         Retrieve cached game logs for a player/season.
         Returns list of dicts sorted newest-first, or [] if stale/missing.
-        Uses a 12-hour TTL.
+        Uses a 12-hour TTL unless ignore_ttl is True.
         """
         from datetime import datetime, timedelta
-        cutoff = (datetime.utcnow() - timedelta(hours=12)).isoformat()
+        
         with self.get_conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM bdl_game_log_cache
-                WHERE player_id = ? AND season = ? AND cached_at > ?
-                ORDER BY game_date DESC
-                """,
-                (player_id, season, cutoff)
-            ).fetchall()
+            if ignore_ttl:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM bdl_game_log_cache
+                    WHERE player_id = ? AND season = ?
+                    ORDER BY game_date DESC
+                    """,
+                    (player_id, season)
+                ).fetchall()
+            else:
+                cutoff = (datetime.utcnow() - timedelta(hours=12)).isoformat()
+                rows = conn.execute(
+                    """
+                    SELECT * FROM bdl_game_log_cache
+                    WHERE player_id = ? AND season = ? AND cached_at > ?
+                    ORDER BY game_date DESC
+                    """,
+                    (player_id, season, cutoff)
+                ).fetchall()
         return [dict(r) for r in rows] if rows else []

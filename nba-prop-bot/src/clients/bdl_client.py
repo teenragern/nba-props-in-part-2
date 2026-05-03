@@ -49,16 +49,17 @@ class BDLClient:
 
     # ── HTTP helpers ─────────────────────────────────────────────────────
 
-    @retry_with_backoff(retries=3, backoff_in_seconds=1)
+    @retry_with_backoff(retries=4, backoff_in_seconds=15)
     def _get(self, url: str, params: dict = None, timeout: int = 15) -> dict:
         """Execute GET request with retry and rate-limit awareness."""
         resp = self._session.get(url, params=params, timeout=timeout)
         self._request_count += 1
 
         if resp.status_code == 429:
-            logger.warning("BDL rate limit hit — backing off 5s")
-            time.sleep(5)
-            resp = self._session.get(url, params=params, timeout=timeout)
+            wait = max(int(resp.headers.get('Retry-After', 60)), 10)
+            logger.warning("BDL rate-limited; sleeping %ss (Retry-After)", wait)
+            time.sleep(wait)
+            raise requests.exceptions.RetryError("429 rate limit — retry via backoff")
 
         resp.raise_for_status()
         return resp.json()

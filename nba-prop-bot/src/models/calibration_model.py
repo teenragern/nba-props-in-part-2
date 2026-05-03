@@ -26,6 +26,38 @@ Usage:
 """
 
 from typing import List, Dict, Any
+import os
+import joblib
+
+_ISO_MODEL = None
+_ISO_MODEL_LOADED = False
+_ISO_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'calibration_iso.pkl')
+
+
+def _get_iso_model():
+    global _ISO_MODEL, _ISO_MODEL_LOADED
+    if not _ISO_MODEL_LOADED:
+        if os.path.exists(_ISO_MODEL_PATH):
+            try:
+                _ISO_MODEL = joblib.load(_ISO_MODEL_PATH)
+            except Exception:
+                _ISO_MODEL = None
+        _ISO_MODEL_LOADED = True
+    return _ISO_MODEL
+
+
+def reload_calibration_model() -> bool:
+    """Force re-read of the calibration .pkl from disk.
+
+    Call this after train_calibration writes a new model so the running
+    process picks it up without a restart.
+    Returns True if the model loaded successfully.
+    """
+    global _ISO_MODEL, _ISO_MODEL_LOADED
+    _ISO_MODEL_LOADED = False
+    _ISO_MODEL = None
+    model = _get_iso_model()
+    return model is not None
 
 
 # ── Piecewise calibration knots ────────────────────────────────────────────
@@ -67,22 +99,16 @@ def calibrate_prob(raw_prob: float, playoff_mode: bool = False) -> float:
     Returns:
         Calibrated probability, clamped to [0.01, 0.99].
     """
-    if raw_prob <= _KNOTS[0][0]:
-        calibrated = _KNOTS[0][1]
-    elif raw_prob >= _KNOTS[-1][0]:
-        calibrated = _KNOTS[-1][1]
+    iso_model = _get_iso_model()
+    if iso_model is not None:
+        try:
+            # Predict expects a 1D array-like input
+            calibrated = float(iso_model.predict([raw_prob])[0])
+        except Exception:
+            # Fallback to knots on unexpected error
+            calibrated = _fallback_knots_calibration(raw_prob)
     else:
-        calibrated = raw_prob
-        for i in range(len(_KNOTS) - 1):
-            x0, y0 = _KNOTS[i]
-            x1, y1 = _KNOTS[i + 1]
-            if x0 <= raw_prob <= x1:
-                if x1 == x0:
-                    calibrated = y0
-                else:
-                    t = (raw_prob - x0) / (x1 - x0)
-                    calibrated = y0 + t * (y1 - y0)
-                break
+        calibrated = _fallback_knots_calibration(raw_prob)
 
     if playoff_mode:
         calibrated = (
@@ -91,6 +117,25 @@ def calibrate_prob(raw_prob: float, playoff_mode: bool = False) -> float:
         )
 
     return float(max(0.01, min(0.99, calibrated)))
+
+
+def _fallback_knots_calibration(raw_prob: float) -> float:
+    """Original piecewise-linear interpolation through empirical knots."""
+    if raw_prob <= _KNOTS[0][0]:
+        return _KNOTS[0][1]
+    elif raw_prob >= _KNOTS[-1][0]:
+        return _KNOTS[-1][1]
+        
+    for i in range(len(_KNOTS) - 1):
+        x0, y0 = _KNOTS[i]
+        x1, y1 = _KNOTS[i + 1]
+        if x0 <= raw_prob <= x1:
+            if x1 == x0:
+                return y0
+            else:
+                t = (raw_prob - x0) / (x1 - x0)
+                return y0 + t * (y1 - y0)
+    return raw_prob
 
 
 def calibrate_edge_candidate(candidate: Dict[str, Any],

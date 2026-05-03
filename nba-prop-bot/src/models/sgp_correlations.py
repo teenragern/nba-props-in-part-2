@@ -238,7 +238,13 @@ def adjust_joint_probability(
     sigma_a = np.sqrt(prob_a * (1 - prob_a))
     sigma_b = np.sqrt(prob_b * (1 - prob_b))
     joint = prob_a * prob_b + effective_corr * sigma_a * sigma_b
-    return float(np.clip(joint, 0.001, 0.999))
+    # Fréchet bounds: P(A∩B) cannot exceed min(P(A), P(B)) and cannot fall
+    # below max(0, P(A)+P(B)-1). The bivariate-normal approximation does
+    # not enforce these — without the clamp, a 90%×40% leg pair with high
+    # correlation can produce a joint > 40%, which is mathematically illegal.
+    lower = max(0.001, prob_a + prob_b - 1.0)
+    upper = min(0.999, prob_a, prob_b)
+    return float(np.clip(joint, lower, upper))
 
 
 def get_sgp_edge(legs: List[Dict], player_logs: Optional[pd.DataFrame] = None,
@@ -539,6 +545,67 @@ _CROSS_TEAM_PAIRS: List[Tuple[str, str]] = [
     ('player_rebounds', 'player_rebounds'),
     ('player_points',   'player_points'),
 ]
+
+
+def get_tiered_correlation(
+    market_a: str,
+    market_b: str,
+    player_name: Optional[str] = None,
+    db=None,
+    outcome_min_samples: int = 30,
+    gamelog_min_samples: int = 15,
+    playoff_mode: bool = False,
+) -> Tuple[float, str]:
+    """
+    3-tier correlation lookup for same-player market pairs, returning
+    (correlation, source_label).
+
+    Tier 1 — Empirical outcome phi (≥ outcome_min_samples settled bet pairs):
+      Computed from our actual bet history.  The gold standard: the outcomes
+      we observe are the exact random variables the copula is modelling.
+
+    Tier 2 — Game-log Pearson from sgp_correlations DB (≥ gamelog_min_samples):
+      Pre-computed from the player's historical box scores.  Player-specific
+      and more stable than league averages, but measures stat correlation
+      rather than outcome correlation directly.
+
+    Tier 3 — League-wide defaults (LEAGUE_AVG_CORRELATIONS / playoff variant):
+      Always available.  Used when the player has little history.
+
+    Source labels: 'outcome_phi' | 'gamelog' | 'league_default'
+    """
+    key = tuple(sorted([market_a, market_b]))
+    if key[0] == key[1]:
+        return (1.0, 'identity')
+
+    # Tier 1: empirical outcome phi from settled bets
+    if player_name and db is not None:
+        phi, n = db.get_outcome_correlation(
+            player_name, market_a, market_b, min_samples=outcome_min_samples
+        )
+        if phi is not None:
+            logger.debug(
+                f"Corr tier-1 ({player_name} {market_a}/{market_b}): "
+                f"phi={phi:.3f} n={n}"
+            )
+            return (float(np.clip(phi, -0.999, 0.999)), 'outcome_phi')
+
+    # Tier 2: game-log Pearson from sgp_correlations table
+    if player_name and db is not None:
+        corr, n = db.get_player_sgp_correlation(
+            player_name, market_a, market_b, min_samples=gamelog_min_samples
+        )
+        if corr is not None:
+            logger.debug(
+                f"Corr tier-2 ({player_name} {market_a}/{market_b}): "
+                f"Pearson={corr:.3f} n={n}"
+            )
+            return (float(np.clip(corr, -0.999, 0.999)), 'gamelog')
+
+    # Tier 3: league defaults
+    defaults = LEAGUE_AVG_CORRELATIONS_PLAYOFF if playoff_mode else LEAGUE_AVG_CORRELATIONS
+    corr = defaults.get(key, 0.0)
+    return (corr, 'league_default')
 
 
 def get_cross_team_default_corr(market_a: str, market_b: str) -> float:

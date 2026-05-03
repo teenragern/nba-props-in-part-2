@@ -33,13 +33,14 @@ from datetime import datetime
 
 from src.models.sgp_correlations import (
     adjust_joint_probability,
-    get_pairwise_correlation,
-    get_cross_team_default_corr
+    get_tiered_correlation,
+    get_cross_team_default_corr,
 )
 from src.models.calibration_model import calibrate_prob
 from src.clients.telegram_bot import TelegramBotClient
 from src.pipelines.send_alerts import _parlay_kelly_stake
 from src.utils.logging_utils import get_logger
+from src.config import ALT_TO_BASE_MARKET
 
 logger = get_logger(__name__)
 
@@ -48,6 +49,7 @@ logger = get_logger(__name__)
 MAX_LEGS        = 3      # hard cap: no 4+ leggers until calibration improves
 MAX_INPUT_EDGES = 12     # top-N edges per game considered as candidates
 COMBO_EDGE_MIN  = 0.04   # minimum joint edge to alert (was 0.04)
+SGP_LEG_MIN_EDGE = 0.06  # each SGP leg must clear this raw edge on its own
 
 # ── 4-Leg Diversified Parlays (max 2 non-overlapping tickets per day) ─────────
 FOUR_LEG_MAX_TICKETS  = 5      # at most 5 tickets per scan/day
@@ -160,7 +162,9 @@ def _compatible(legs: List[Dict]) -> bool:
 
     for leg in legs:
         pid = leg['player_id']
-        family = _MARKET_FAMILY.get(leg.get('market', ''), leg.get('market', ''))
+        raw_mkt = leg.get('market', '')
+        base_mkt = ALT_TO_BASE_MARKET.get(raw_mkt, raw_mkt)
+        family = _MARKET_FAMILY.get(base_mkt, base_mkt)
         
         # Disallow the same player stacking correlated markets (e.g. LeBron PTS and PRA)
         key = (pid, family)
@@ -174,6 +178,22 @@ def _compatible(legs: List[Dict]) -> bool:
         eid = leg.get('event_id', '')
         if eid:
             event_legs.setdefault(eid, []).append(leg)
+
+    # Cap SGPs at 2 legs. The bivariate-normal copula chain in _combo_edge
+    # silently breaks at 3+ correlated legs (you cannot feed a joint probability
+    # back in as a marginal — quantile mapping collapses). Cross-game parlays
+    # at 3 legs are unaffected (corr=0 collapses to multiplication).
+    _is_sgp_combo = len(event_legs) == 1 and len(legs) >= 2
+    if _is_sgp_combo and len(legs) > 2:
+        return False
+
+    # Strong-independent-edge gate for SGP legs: each leg must clear 6% raw
+    # edge on its own. Stops weak singles from being correlation-boosted into
+    # an SGP ticket where the apparent edge is purely a copula artifact.
+    if _is_sgp_combo:
+        for leg in legs:
+            if leg.get('edge', 0.0) < SGP_LEG_MIN_EDGE:
+                return False
 
     # Rainbet rule: same-game combos where every leg is UNDER are illegal.
     for ev_legs in event_legs.values():
@@ -213,6 +233,11 @@ def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
     implied_probs = [leg['implied_prob'] for leg in legs]
 
     joint_true = cal_probs[0]
+    # Mirror the joint_true loop on implied probs to estimate the book's
+    # correlation-adjusted price. Without this, jb = prod(implied_probs)
+    # assumes the book ignores correlation, which manufactures phantom edge
+    # on every correlated SGP (PG ast + C pts, etc.).
+    joint_book = implied_probs[0]
     corr_applied = 0.0
 
     for i in range(1, len(legs)):
@@ -222,12 +247,16 @@ def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
         # Only inject Copula correlation modeling if both legs share a game context
         if leg_a.get('event_id') and leg_a.get('event_id') == leg_b.get('event_id'):
             pa, pb = leg_a['player_id'], leg_b['player_id']
-            ma, mb = leg_a['market'], leg_b['market']
+            ma = ALT_TO_BASE_MARKET.get(leg_a['market'], leg_a['market'])
+            mb = ALT_TO_BASE_MARKET.get(leg_b['market'], leg_b['market'])
             team_a, team_b = leg_a.get('team_name', ''), leg_b.get('team_name', '')
 
             if pa == pb:
-                # Same-player SGP (e.g. Points + Assists)
-                corr = get_pairwise_correlation(ma, mb, playoff_mode=playoff_mode)
+                # Same-player SGP: use tiered lookup (outcome phi → gamelog → league default)
+                corr, _src = get_tiered_correlation(
+                    ma, mb, player_name=pa, db=db,
+                    playoff_mode=playoff_mode,
+                )
             elif team_a and team_a == team_b and db is not None:
                 # Same-team, cross-player SGP (e.g. Point Guard Assists + Center Points)
                 db_corr = db.get_cross_player_correlation(team_a, pa, pb, ma, mb)
@@ -260,12 +289,21 @@ def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
             side_a=leg_a.get('side', 'OVER'),
             side_b=leg_b.get('side', 'OVER'),
         )
+        # Apply the same correlation to the book's marginals (bivariate normal
+        # path — implied probs have no Poisson mean to feed the copula). For
+        # cross-game legs corr=0 and this collapses to multiplication, matching
+        # the book's independent pricing of true cross-game parlays.
+        joint_book = adjust_joint_probability(
+            joint_book, implied_probs[i], corr,
+            side_a=leg_a.get('side', 'OVER'),
+            side_b=leg_b.get('side', 'OVER'),
+        )
         corr_applied += corr
 
     if len(legs) > 1:
         corr_applied /= (len(legs) - 1)
 
-    jb = prod(implied_probs)
+    jb = joint_book
     return {
         'joint_true_prob':     joint_true,
         'joint_book_prob':     jb,
@@ -301,6 +339,42 @@ def _format_combo(legs: List[Dict], edge: float, joint_prob: float, playoff_mode
         f"\n<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
     )
     return "\n".join(lines)
+
+
+def _same_player_pairs_have_data(legs: List[Dict], db, min_samples: int = 30) -> bool:
+    """
+    For every same-player leg pair in the combo, require at least one tier
+    of empirical correlation data (outcome phi ≥ min_samples OR game-log
+    Pearson ≥ 15 in sgp_correlations).  Cross-game cross-player pairs are
+    independent (ρ=0) so they need no data check.
+
+    Returns True (safe to proceed) when every correlated pair is supported.
+    Pairs with no data block the combo — we won't build a 4-leg ticket whose
+    edge depends on a league-default correlation we've never verified.
+    """
+    if db is None:
+        return False  # can't verify without DB
+    for i, leg_a in enumerate(legs):
+        for leg_b in legs[i + 1:]:
+            if leg_a['player_id'] != leg_b['player_id']:
+                continue  # different players — independent, no check needed
+            ma = ALT_TO_BASE_MARKET.get(leg_a['market'], leg_a['market'])
+            mb = ALT_TO_BASE_MARKET.get(leg_b['market'], leg_b['market'])
+            # Tier 1: outcome phi
+            phi, n1 = db.get_outcome_correlation(leg_a['player_id'], ma, mb, min_samples=min_samples)
+            if phi is not None:
+                continue
+            # Tier 2: game-log Pearson
+            corr, n2 = db.get_player_sgp_correlation(leg_a['player_id'], ma, mb, min_samples=15)
+            if corr is not None:
+                continue
+            # No empirical support for this pair — block the combo
+            logger.debug(
+                f"4-leg blocked: no empirical corr data for "
+                f"{leg_a['player_id']} {ma}/{mb} (need ≥{min_samples} or ≥15 games)"
+            )
+            return False
+    return True
 
 
 def _four_leg_sent_today_count(db) -> int:
@@ -400,13 +474,18 @@ def generate_four_leg_parlays(
             legs = list(combo)
             if not _compatible(legs):
                 continue
+            # Require empirical correlation support for any same-player pairs.
+            # Cross-game independent pairs need no data (ρ=0 is exact).
+            if not _same_player_pairs_have_data(legs, db):
+                continue
 
-            cal_probs     = [calibrate_prob(l.get('model_prob', 0.5), playoff_mode=playoff_mode) for l in legs]
-            implied_probs = [l['implied_prob'] for l in legs]
-
-            jt         = prod(cal_probs) * FOUR_LEG_REALITY_TAX
-            jb         = prod(implied_probs)
-            combo_edge = jt - jb
+            # Use the copula-aware joint probability (correlation-adjusted for
+            # same-game pairs; collapses to multiplication for true cross-game).
+            result      = _combo_edge(legs, db=db, playoff_mode=playoff_mode)
+            raw_joint   = result.get('joint_true_prob', 0)
+            jt          = raw_joint * FOUR_LEG_REALITY_TAX
+            jb          = result.get('joint_book_prob', 0)
+            combo_edge  = jt - jb
 
             if combo_edge < COMBO_EDGE_MIN:
                 continue

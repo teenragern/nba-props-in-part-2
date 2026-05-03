@@ -4,6 +4,7 @@ from src.config import (
     PLAYOFF_MIN_PROJECTED_MINUTES,
     PLAYOFF_EDGE_MIN,
     PER_MARKET_EDGE_MIN,
+    ALT_TO_BASE_MARKET,
 )
 from src.models.distributions import get_probability_distribution
 
@@ -26,9 +27,21 @@ _LATE_HOURS      = 1.0
 
 def _load_clv_thresholds() -> None:
     """
-    Query settled alerts to find the minimum edge that historically yields
-    positive CLV per market. Clamped to [0.02, 0.08], falls back to
-    hard-coded values when fewer than 50 settled bets exist per market.
+    Compute per-market edge floors from 30-day rolling CLV.
+
+    Formula:
+      base        = _EARLY_EDGE_MIN (0.05)
+      clv_delta   = clamp(-avg_clv * 3, -0.02, +0.03)
+                    — negative CLV raises floor, positive lowers it
+      floor       = clamp(base + clv_delta, 0.02, 0.12)
+
+    The result is stored in _clv_edge_mins[market].  The static
+    PER_MARKET_EDGE_MIN overrides in config are applied on top in
+    compute_dynamic_edge_min() (take max), so manually tuned hard
+    floors are never relaxed below their configured minimum.
+
+    Falls back silently when the DB is unavailable or has < 10 CLV
+    records per market.
     """
     global _clv_loaded, _clv_edge_mins
     _clv_loaded = True
@@ -36,37 +49,28 @@ def _load_clv_thresholds() -> None:
     if db is None:
         return
     try:
-        with db.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT a.market, a.edge, b.won
-                FROM alerts_sent a
-                JOIN bet_results b ON b.alert_id = a.id
-                WHERE a.edge > 0
-                ORDER BY a.market, a.edge
-            """)
-            rows = cursor.fetchall()
+        per_market_clv = db.get_per_market_clv(days_back=30, min_samples=10)
     except Exception:
         return
 
-    from collections import defaultdict
-    by_market: dict = defaultdict(list)
-    for market, edge, won in rows:
-        by_market[market].append((edge, int(won)))
+    from src.utils.logging_utils import get_logger as _log
+    log = _log(__name__)
+    for market, avg_clv in per_market_clv.items():
+        clv_delta = max(-0.02, min(0.03, -avg_clv * 3.0))
+        floor = max(0.02, min(0.12, _EARLY_EDGE_MIN + clv_delta))
+        _clv_edge_mins[market] = floor
+        log.info(
+            f"CLV floor [{market.replace('player_', '')}]: "
+            f"avg_clv={avg_clv:+.4f}  delta={clv_delta:+.3f}  floor={floor:.3f}"
+        )
 
-    for market, records in by_market.items():
-        if len(records) < 50:
-            continue
-        # Find the edge decile where win rate first exceeds 52% (breakeven at -110)
-        records.sort(key=lambda r: r[0])
-        bucket_size = max(len(records) // 10, 5)
-        for i in range(0, len(records) - bucket_size + 1, bucket_size):
-            bucket = records[i:i + bucket_size]
-            win_rate = sum(w for _, w in bucket) / len(bucket)
-            if win_rate >= 0.52:
-                threshold = bucket[0][0]  # lowest edge in this winning bucket
-                _clv_edge_mins[market] = max(0.02, min(threshold, 0.08))
-                break
+
+def reload_clv_thresholds() -> None:
+    """Force a fresh reload of CLV-adaptive floors. Called nightly by the scheduler."""
+    global _clv_loaded, _clv_edge_mins
+    _clv_loaded = False
+    _clv_edge_mins = {}
+    _load_clv_thresholds()
 
 
 def compute_dynamic_edge_min(hours_to_tipoff: float, market: str = '') -> float:
@@ -135,7 +139,8 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         odds         = c.get('odds',        0)
         proj_mins    = c.get('projected_minutes', 0)
         status       = (c.get('injury_status') or 'healthy').lower()
-        market       = c.get('market', '')
+        raw_market   = c.get('market', '')
+        market       = ALT_TO_BASE_MARKET.get(raw_market, raw_market)
         mean         = c.get('mean',   0)
         line         = c.get('line',   0)
         side         = c.get('side',   '')
