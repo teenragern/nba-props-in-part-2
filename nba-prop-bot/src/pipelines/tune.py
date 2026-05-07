@@ -10,7 +10,7 @@ import json
 import itertools
 import numpy as np
 from datetime import datetime
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -77,5 +77,5 @@ def run_tuning(db: DatabaseClient):
 
 
 if __name__ == "__main__":
-    db = DatabaseClient()
+    db = get_db_client()
     run_tuning(db)

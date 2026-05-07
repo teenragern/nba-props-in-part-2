@@ -19,6 +19,7 @@ import time
 import threading
 import schedule
 import dateutil.parser
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from dateutil import tz
 
@@ -32,7 +33,7 @@ from src.pipelines.settle_results import settle_alerts
 from src.pipelines.analytics import generate_analytics
 from src.pipelines.calibration import check_calibration
 from src.pipelines.tune import run_tuning
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.pipelines.market_stats import analyze_market_stats
 from src.pipelines.steam import check_steam
 from src.pipelines.exposure import check_exposure
@@ -50,11 +51,19 @@ from src.pipelines.scout_lines import scout_lines
 from src.execution.executor import session_summary
 from src.pipelines.backup_db import backup_db
 from src.config import SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL, BDL_SHARP_SCAN_INTERVAL
+from src.events.bus import get_bus, EventBus
+from src.clients.ws_live_feed import start_live_feed
+from src.pipelines.exchange_arb import run_exchange_arb
 
 _WATCHDOG_TIMEOUT_SEC = int(os.getenv('WATCHDOG_TIMEOUT_SEC', '300'))  # 5 min default
+# Minimum seconds between scan submissions to prevent duplicate triggers.
+_SCAN_COOLDOWN_SEC = int(os.getenv('SCAN_COOLDOWN_SEC', '60'))
 
 logger = get_logger(__name__)
 bot    = TelegramBotClient()
+
+# Thread pool for long-running jobs so they don't block the scheduler loop.
+_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='sched-worker')
 
 # Shared Odds API client — used by sync so quota is updated each morning.
 _odds_client: OddsApiClient = OddsApiClient()
@@ -67,6 +76,8 @@ ET = tz.gettz('America/New_York')
 
 # Monotonic timestamp updated every scheduler tick — used by the watchdog.
 _last_tick: float = 0.0
+# Monotonic timestamp of the last scan submission — used by cooldown guard.
+_last_scan_submit: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -109,8 +120,9 @@ def _start_watchdog():
 
 def _quota_ok() -> bool:
     """True when credits are sufficient (or quota not yet initialised)."""
-    remaining = _odds_client.requests_remaining
-    return remaining == 0 or remaining >= QUOTA_FLOOR
+    if not _odds_client._quota_fetched:
+        return True
+    return _odds_client.requests_remaining >= QUOTA_FLOOR
 
 
 def _is_scan_window() -> bool:
@@ -124,7 +136,7 @@ def _has_games() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Generic notify wrapper
+# Generic notify wrapper  (used for lightweight / once-daily jobs)
 # ---------------------------------------------------------------------------
 
 def notify(job_name, func, *args):
@@ -136,6 +148,43 @@ def notify(job_name, func, *args):
     except Exception as e:
         logger.error(f"Scheduled {job_name} failed: {e}")
         bot.send_message(f"❌ <b>Failed Scheduled Job:</b> {job_name}\n\nError: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Thread-pool submit (used for long-running jobs to avoid blocking the loop)
+# ---------------------------------------------------------------------------
+
+def submit_job(job_name: str, func, *args):
+    """Submit func to the thread pool so it doesn't block the scheduler loop."""
+    def _run():
+        logger.info(f"[pool] Starting {job_name}")
+        try:
+            func(*args)
+            logger.info(f"[pool] Finished {job_name}")
+        except Exception as e:
+            logger.error(f"[pool] {job_name} failed: {e}")
+            try:
+                bot.send_message(f"❌ <b>Job failed:</b> {job_name}\n\nError: {e}")
+            except Exception:
+                pass
+    return _pool.submit(_run)
+
+
+def _maybe_submit_scan(label: str) -> bool:
+    """
+    Submit a scan job with a cooldown guard to prevent duplicate triggers
+    (e.g., Redis event fires at the same time as the direct-call path).
+    Returns True if submitted, False if cooldown is active.
+    """
+    global _last_scan_submit
+    now = time.monotonic()
+    if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
+        remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
+        logger.info(f"Scan [{label}] skipped: cooldown active ({remaining}s remaining).")
+        return False
+    _last_scan_submit = now
+    submit_job(f"Scan [{label}]", scan_props)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -184,24 +233,33 @@ def job_scan():
         logger.warning(msg)
         bot.send_message(msg)
         return
-    notify("Scan", scan_props)
 
-    # Subscriber-facing scan summary (admin-only, not broadcast to subscribers).
-    # Individual prop edges are already broadcast immediately in evaluate_and_alert().
-    try:
-        db = DatabaseClient()
-        with db.get_conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM alerts_sent WHERE date(timestamp) = date('now')"
-            ).fetchone()
-        n_today = int(row['n'] or 0) if row else 0
-        summary_msg = (
-            f"✅ Scan complete — {n_today} edge(s) found today.\n"
-            f"Next scan in ~{SCAN_INTERVAL_MINUTES} min."
-        )
-        bot.send_message(summary_msg)
-    except Exception as e:
-        logger.debug(f"Scan summary message failed: {e}")
+    def _run_and_summarise():
+        scan_props()
+        try:
+            db = get_db_client()
+            with db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM alerts_sent WHERE date(timestamp) = date('now')"
+                ).fetchone()
+            n_today = int(row['n'] or 0) if row else 0
+            summary_msg = (
+                f"✅ <b>Scan complete</b> — {n_today} edge(s) found today.\n"
+                f"Next scan in ~{SCAN_INTERVAL_MINUTES} min."
+            )
+            bot.send_message(summary_msg)
+        except Exception as e:
+            logger.debug(f"Scan summary message failed: {e}")
+
+    # Use the cooldown logic from _maybe_submit_scan but with our custom wrapper
+    global _last_scan_submit
+    now = time.monotonic()
+    if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
+        remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
+        logger.info(f"Scan [SCHEDULED] skipped: cooldown active ({remaining}s remaining).")
+        return
+    _last_scan_submit = now
+    submit_job("Scan [SCHEDULED]", _run_and_summarise)
 
 
 def job_clv():
@@ -210,7 +268,7 @@ def job_clv():
     if not _quota_ok():
         logger.warning("CLV update skipped: quota low.")
         return
-    notify("Update CLV", update_clv_lines)
+    submit_job("Update CLV", update_clv_lines)
 
 
 def job_steam():
@@ -226,7 +284,7 @@ def job_breaking_news():
     found = check_breaking_news(_news_monitor, bot)
     if found and _quota_ok():
         logger.info("Breaking tweet → immediate scan triggered.")
-        notify("Scan [BREAKING]", scan_props)
+        _maybe_submit_scan("BREAKING")
 
 
 def job_scout_lines():
@@ -247,7 +305,7 @@ def job_scout_lines():
         result = scout_lines(_odds_client)
         if result['records_written'] > 0:
             # Run steam check right now — don't wait up to 20 min for it
-            notify("Steam [post-scout]", check_steam, bot)
+            submit_job("Steam [post-scout]", check_steam, bot)
     except Exception as e:
         logger.error(f"Scout lines failed: {e}")
 
@@ -258,7 +316,7 @@ def job_morning_briefing():
     Runs at 09:05 ET after job_sync() has populated _today_game_count.
     Admin-only when no games today so subscribers don't get noise.
     """
-    db = DatabaseClient()
+    db = get_db_client()
     if _today_game_count > 0:
         msg = (
             f"📅 <b>NBA Prop Scanner — Good morning!</b>\n\n"
@@ -297,9 +355,11 @@ def job_sync_injuries():
             bot.send_message(msg)
         except Exception:
             pass
-        if _is_scan_window() and _quota_ok():
-            logger.info(f"Newly OUT ({len(newly_out)}) → immediate scan triggered.")
-            notify("Scan [LATE-SCRATCH]", scan_props)
+        # When Redis is available the subscription in start_scheduler() handles
+        # the scan trigger.  Fall back to a direct submit when Redis is offline.
+        if not get_bus().is_available() and _is_scan_window() and _quota_ok():
+            logger.info(f"Newly OUT ({len(newly_out)}) → immediate scan triggered (direct path).")
+            _maybe_submit_scan("LATE-SCRATCH")
 
 
 def job_flush_alerts():
@@ -307,7 +367,7 @@ def job_flush_alerts():
     if not _has_games():
         logger.info("Digest flush skipped: no NBA games today.")
         return
-    flush_pending_alerts(DatabaseClient(), bot)
+    flush_pending_alerts(get_db_client(), bot)
 
 
 def job_drift_monitor():
@@ -354,7 +414,7 @@ def job_backup_db():
 
 def job_execution_summary():
     """Send paper-trade session P&L recap after overnight settlement."""
-    db = DatabaseClient()
+    db = get_db_client()
     stats = session_summary(db)
     if not stats:
         return
@@ -384,7 +444,7 @@ def job_execution_summary():
 def job_settle():        notify("Settle",          settle_alerts)
 def job_stats():         notify("Stats",            generate_analytics)
 def job_calibration():   notify("Calibration",      check_calibration)
-def job_tune():          notify("Tune",             run_tuning, DatabaseClient())
+def job_tune():          notify("Tune",             run_tuning, get_db_client())
 def job_market_stats():  notify("Market Stats",     analyze_market_stats)
 def job_exposure():      notify("Exposure",         check_exposure)
 def job_timing_analysis(): notify("Timing Analysis", analyze_timing)
@@ -395,6 +455,12 @@ def job_train_calibration():
     ok = reload_calibration_model()
     logger.info(f"Calibration model hot-reloaded: {'OK' if ok else 'no model on disk'}")
 
+def job_exchange_arb():
+    """Compare model probs vs Kalshi exchange prices. No-op when KALSHI_API_KEY unset."""
+    if not _has_games():
+        return
+    submit_job("Exchange Arb", run_exchange_arb)
+
 
 # ---------------------------------------------------------------------------
 # Scheduler entry point
@@ -404,7 +470,22 @@ def start_scheduler():
     global _last_tick
     logger.info("Starting NBA Prop Bot scheduler (credit-aware mode)...")
     _start_watchdog()
-    bot.start_listener(db=DatabaseClient())
+    bot.start_listener(db=get_db_client())
+
+    # --- Phase 3A: WebSocket live feed (no-op when LIVE_FEED_WS_URL unset) ---
+    start_live_feed()
+
+    # --- Redis EventBus subscriptions (no-op when REDIS_URL is unset) ---
+    bus = get_bus()
+    if bus.is_available():
+        def _on_injury_event(payload: dict):
+            players = payload.get("players", [])
+            if players and _has_games() and _is_scan_window() and _quota_ok():
+                logger.info(f"Redis injury event → scan triggered. Players: {players}")
+                _maybe_submit_scan("REDIS-INJURY")
+
+        bus.subscribe(EventBus.INJURY_NEWLY_OUT, _on_injury_event)
+        logger.info("Redis EventBus subscriptions active.")
 
     # --- Daily free jobs (run every day regardless of game schedule) ---
     schedule.every().day.at("01:00").do(job_train_calibration) # Nightly calibration model training
@@ -427,6 +508,7 @@ def start_scheduler():
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # ~11 credits each
     schedule.every(120).minutes.do(job_clv)                     # ~11 credits each
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
+    schedule.every(30).minutes.do(job_exchange_arb)             # 0 credits (Kalshi API, no-op when key unset)
     schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
     # Injury feed: free (BDL/scrape). Run frequently — late scratches move minutes hard.
     schedule.every(15).minutes.do(job_sync_injuries)
@@ -444,8 +526,9 @@ def start_scheduler():
     job_sync()
     # Prime injury cache before first scan so projections see fresh status.
     job_sync_injuries()
-    # Attempt an immediate scan if there are games today.
-    job_scan()
+    # Attempt an immediate scan if there are games today (non-blocking).
+    if _has_games() and _is_scan_window() and _quota_ok():
+        _maybe_submit_scan("STARTUP")
 
     logger.info(
         f"Scheduler live. "

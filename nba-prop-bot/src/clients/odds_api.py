@@ -14,6 +14,7 @@ class OddsApiClient:
         self.api_key = api_key
         self.requests_used = 0
         self.requests_remaining = 0
+        self._quota_fetched = False
 
     def _update_quota(self, headers: Any):
         used = headers.get('x-requests-used')
@@ -22,6 +23,7 @@ class OddsApiClient:
             self.requests_used = int(used)
         if remaining is not None:
             self.requests_remaining = int(remaining)
+            self._quota_fetched = True
         logger.debug(f"Odds API Quota - Used: {self.requests_used}, Remaining: {self.requests_remaining}")
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)

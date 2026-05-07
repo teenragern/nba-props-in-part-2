@@ -1,11 +1,11 @@
 import pandas as pd
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 def generate_analytics(since: str = None):
-    db = DatabaseClient()
+    db = get_db_client()
 
     params = ()
     where = ""
@@ -16,11 +16,12 @@ def generate_analytics(since: str = None):
     with db.get_conn() as conn:
         query = f"""
         SELECT a.id, a.player_name, a.market, a.edge, b.won, b.actual_result,
-               c.clv, c.closing_odds, a.odds as alert_odds
+               AVG(c.clv) as clv, AVG(c.closing_odds) as closing_odds, a.odds as alert_odds
         FROM alerts_sent a
         JOIN bet_results b ON a.id = b.alert_id
-        LEFT JOIN clv_tracking c ON a.player_name = c.player_id AND a.market = c.market
+        LEFT JOIN clv_tracking c ON a.id = c.alert_id
         {where}
+        GROUP BY a.id
         """
         df = pd.read_sql_query(query, conn, params=params)
         

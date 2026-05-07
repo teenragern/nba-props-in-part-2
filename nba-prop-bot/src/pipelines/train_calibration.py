@@ -13,12 +13,14 @@ Usage:
 
 import os
 import shutil
+from datetime import datetime
 
 import joblib
 import numpy as np
 from sklearn.isotonic import IsotonicRegression
 
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
+from src.models.experiment_tracker import training_run
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -37,12 +39,12 @@ def _brier(model, X: np.ndarray, y: np.ndarray) -> float:
 
 
 def train_isotonic_calibration() -> bool:
-    db = DatabaseClient()
+    db = get_db_client()
 
     with db.get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT a.edge, a.odds, b.won
+            SELECT a.edge, a.odds, b.won, a.market
             FROM alerts_sent a
             JOIN bet_results b ON a.id = b.alert_id
             WHERE b.push = 0
@@ -56,56 +58,88 @@ def train_isotonic_calibration() -> bool:
         logger.warning(f"Insufficient settled bets to train IsotonicRegression (n={len(rows)}). Needs {_MIN_TRAIN}.")
         return False
 
-    X_all, y_all = [], []
+    # Group data by market
+    market_data = {}
     for r in rows:
-        model_prob = float(r['edge']) + 1.0 / float(r['odds'])
-        model_prob = max(0.01, min(0.99, model_prob))
-        X_all.append(model_prob)
-        y_all.append(float(r['won']))
+        mkt = r['market']
+        model_prob = max(0.01, min(0.99, float(r['edge']) + 1.0 / float(r['odds'])))
+        market_data.setdefault(mkt, []).append((model_prob, float(r['won'])))
+        market_data.setdefault('global', []).append((model_prob, float(r['won'])))
 
-    X_all = np.array(X_all)
-    y_all = np.array(y_all)
+    models = {}
+    
+    for mkt, data in market_data.items():
+        if len(data) < 30 and mkt != 'global':
+            continue # Skip small markets, they'll use 'global'
+            
+        X = np.array([d[0] for d in data])
+        y = np.array([d[1] for d in data])
+        
+        # Chronological split
+        split = max(1, int(len(X) * (1.0 - _TEST_FRAC)))
+        X_train, y_train = X[:split], y[:split]
+        X_test,  y_test  = X[split:], y[split:]
+        
+        candidate = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds='clip')
+        try:
+            candidate.fit(X_train, y_train)
+            brier = _brier(candidate, X_test, y_test) if len(X_test) > 0 else 0
+            models[mkt] = candidate
+            logger.info(f"Trained {mkt} calibration: n_train={len(X_train)}, brier={brier:.4f}")
+        except Exception as e:
+            logger.error(f"Failed to train {mkt} calibration: {e}")
 
-    # Chronological train/test split — test = most recent _TEST_FRAC rows
-    split = max(1, int(len(X_all) * (1.0 - _TEST_FRAC)))
-    X_train, y_train = X_all[:split], y_all[:split]
-    X_test,  y_test  = X_all[split:], y_all[split:]
-
-    # Fit candidate model on training slice
-    candidate = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds='clip')
-    try:
-        candidate.fit(X_train, y_train)
-    except Exception as e:
-        logger.error(f"IsotonicRegression fit failed: {e}")
+    if 'global' not in models:
         return False
 
-    candidate_brier = _brier(candidate, X_test, y_test)
-    logger.info(f"Calibration candidate Brier on held-out {len(X_test)} bets: {candidate_brier:.4f}")
-
-    # Regression guard: compare against incumbent if one exists
-    if os.path.exists(MODEL_PATH) and len(X_test) >= 20:
+    # Regression guard: only replace if new model improves global Brier on test slice
+    if os.path.exists(MODEL_PATH):
         try:
-            incumbent = joblib.load(MODEL_PATH)
-            incumbent_brier = _brier(incumbent, X_test, y_test)
-            logger.info(f"Calibration incumbent Brier on same slice: {incumbent_brier:.4f}")
-            if candidate_brier >= incumbent_brier:
-                logger.warning(
-                    f"Calibration regression guard: candidate ({candidate_brier:.4f}) is not "
-                    f"better than incumbent ({incumbent_brier:.4f}) — keeping old model."
-                )
-                return False
+            old = joblib.load(MODEL_PATH)
+            # Handle both single-model and market-dict formats
+            old_global = old['global'] if isinstance(old, dict) else old
+            
+            # Re-generate test data for global (the hold-out slice)
+            global_data = market_data.get('global', [])
+            split = max(1, int(len(global_data) * (1.0 - _TEST_FRAC)))
+            X_test_g = np.array([d[0] for d in global_data[split:]])
+            y_test_g = np.array([d[1] for d in global_data[split:]])
+            
+            if len(X_test_g) > 0:
+                new_brier = _brier(models['global'], X_test_g, y_test_g)
+                old_brier = _brier(old_global, X_test_g, y_test_g)
+                if new_brier >= old_brier:
+                    logger.warning(f"Regression guard: New Brier {new_brier:.4f} >= Old Brier {old_brier:.4f}. Aborting save.")
+                    return False
+                logger.info(f"Regression guard passed: {new_brier:.4f} < {old_brier:.4f}")
         except Exception as e:
-            logger.warning(f"Could not load incumbent model for comparison: {e}")
+            logger.debug(f"Regression guard error (likely legacy model format): {e}")
 
-    # Back up old model before overwriting
+    # Back up and save the full models dict
     if os.path.exists(MODEL_PATH):
         shutil.copy2(MODEL_PATH, MODEL_PATH + '.bak')
 
-    joblib.dump(candidate, MODEL_PATH)
-    logger.info(
-        f"Isotonic calibration updated: trained on {len(X_train)}, "
-        f"held-out Brier {candidate_brier:.4f} ({len(X_test)} bets)."
-    )
+    joblib.dump(models, MODEL_PATH)
+    logger.info(f"Market-aware isotonic calibration updated. Markets: {list(models.keys())}")
+
+    run_name = f"calibration_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    with training_run(run_name, tags={"type": "isotonic_calibration"}) as run:
+        run.log_params({
+            "min_train": _MIN_TRAIN,
+            "test_frac": _TEST_FRAC,
+            "n_samples": len(rows),
+            "markets_trained": ",".join(models.keys()),
+        })
+        for mkt, candidate in models.items():
+            mkt_data = market_data.get(mkt, [])
+            if len(mkt_data) > 0:
+                split = max(1, int(len(mkt_data) * (1.0 - _TEST_FRAC)))
+                X_test = np.array([d[0] for d in mkt_data[split:]])
+                y_test = np.array([d[1] for d in mkt_data[split:]])
+                if len(X_test) > 0:
+                    run.log_metric(f"brier_{mkt}", _brier(candidate, X_test, y_test))
+        run.log_artifact(MODEL_PATH)
+
     return True
 
 

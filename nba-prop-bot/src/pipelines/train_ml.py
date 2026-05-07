@@ -17,15 +17,17 @@ Environment:
 import os
 import time
 import pandas as pd
+from datetime import datetime
 from typing import List, Optional
 
 from src.utils.logging_utils import get_logger
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.bdl_client import BDLClient
 from src.clients.bdl_game_logs import BDLGameLogs
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.clients.telegram_bot import TelegramBotClient
 from src.models.ml_model import train_models_from_logs, train_models_with_clv_feedback
+from src.models.experiment_tracker import training_run
 
 logger = get_logger(__name__)
 
@@ -44,7 +46,7 @@ def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
 
     stats = NbaStatsClient()
     bot   = TelegramBotClient()
-    bdl_logs = BDLGameLogs(BDLClient(), db=DatabaseClient())
+    bdl_logs = BDLGameLogs(BDLClient(), db=get_db_client())
 
     logger.info(f"ML training started: seasons={seasons}")
     bot.send_message(
@@ -98,13 +100,31 @@ def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
 
     logger.info(f"Collected logs for {len(player_logs)} players. Training XGBoost...")
 
-    results = train_models_from_logs(
-        player_logs_list=player_logs,
-        opp_stats_df=opp_stats_df,
-        team_stats_df=team_stats_df,
-        def_stats_df=def_stats_df,
-        league_avg_pace=league_avg_pace,
-    )
+    run_name = f"train_ml_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    with training_run(run_name, tags={"type": "xgboost_weekly", "seasons": ",".join(seasons)}) as run:
+        run.log_params({
+            "seasons": ",".join(seasons),
+            "n_seasons": len(seasons),
+            "min_gp": _MIN_GP,
+            "n_players": len(player_logs),
+        })
+
+        results = train_models_from_logs(
+            player_logs_list=player_logs,
+            opp_stats_df=opp_stats_df,
+            team_stats_df=team_stats_df,
+            def_stats_df=def_stats_df,
+            league_avg_pace=league_avg_pace,
+        )
+
+        for market, ok in results.items():
+            run.log_metric(f"trained_{market}", int(ok))
+
+        model_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'xgb')
+        for market, ok in results.items():
+            if ok:
+                artifact = os.path.join(model_dir, f"player_{market}_ensemble.pkl")
+                run.log_artifact(artifact)
 
     trained  = [m for m, ok in results.items() if ok]
     skipped  = [m for m, ok in results.items() if not ok]
@@ -133,10 +153,9 @@ def train_ml_models_clv_feedback(seasons: Optional[List[str]] = None) -> dict:
     if seasons is None:
         seasons = _DEFAULT_SEASONS[:_N_SEASONS]
 
-    from src.data.db import DatabaseClient
     stats = NbaStatsClient()
     bot   = TelegramBotClient()
-    db    = DatabaseClient()
+    db    = get_db_client()
     bdl_logs = BDLGameLogs(BDLClient(), db=db)
 
     logger.info(f"CLV feedback training: seasons={seasons}")

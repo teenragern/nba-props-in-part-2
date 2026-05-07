@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 import os
 
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.models.ml_model import get_ml_projection, _MARKET_COL
 from src.models.distributions import get_probability_distribution, classify_bench_tier
 from src.models.calibration_model import calibrate_prob
@@ -28,7 +28,7 @@ def build_nba_api_lookup() -> dict:
     return mapping
 
 def run_backtest():
-    db = DatabaseClient()
+    db = get_db_client()
     
     # Preload NBA API names to IDs
     name_to_id = build_nba_api_lookup()
@@ -146,7 +146,7 @@ def run_backtest():
         except TypeError:
             continue # Function signature fallback failed
         
-        calibrated_prob = calibrate_prob(raw_prob_over)
+        calibrated_prob = calibrate_prob(raw_prob_over, market=mkt)
         
         is_hit = 1 if actual_stat > line else 0
         edge = calibrated_prob - 0.50  # Flat 50% baseline for theoretical math

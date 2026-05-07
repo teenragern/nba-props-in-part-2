@@ -1,5 +1,5 @@
 from src.clients.odds_api import OddsApiClient
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.utils.logging_utils import get_logger
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -9,7 +9,7 @@ logger = get_logger(__name__)
 
 def sync_events(prefetched_events: Optional[List[Dict[str, Any]]] = None):
     client = OddsApiClient()
-    db = DatabaseClient()
+    db = get_db_client()
 
     if prefetched_events is not None:
         events = prefetched_events

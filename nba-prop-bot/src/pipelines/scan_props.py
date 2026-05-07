@@ -28,10 +28,11 @@ from datetime import datetime, timezone
 import dateutil.parser
 from dateutil import tz
 from typing import List, Dict, Any, Tuple, Optional
+import os
 import pandas as pd
 
 from src.utils.logging_utils import get_logger
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
 from src.clients.odds_api import OddsApiClient
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
@@ -91,7 +92,7 @@ _SHARP_RECENT_SEC    = 120
 _GAME_MARKET_EDGE_MIN = 0.015  # 1.5 %
 
 # Toggle this to True during the playoffs to tighten rotations and disable regular-season rest logic
-PLAYOFF_MODE = True
+PLAYOFF_MODE = os.getenv("PLAYOFF_MODE", "False").lower() in ("true", "1", "yes")
 
 # ── Credit-conservation: events TTL cache ─────────────────────────────────────
 # get_events() costs 1 credit. Between 90-min scans the event list is
@@ -701,7 +702,7 @@ def scan_props():
     _REST_CACHE.clear()  # fresh team-rest lookups each scan cycle
     logger.info(f"Initializing scan pipeline ({'BDL+Sharp' if BDL_ENABLED_RUNTIME else 'Odds API only'})...")
 
-    db             = DatabaseClient()
+    db             = get_db_client()
     odds_client    = OddsApiClient()
     stats_client   = NbaStatsClient()
     injury_client  = InjuryClient()

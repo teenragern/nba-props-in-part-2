@@ -1,9 +1,9 @@
 import pandas as pd
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.config import BANKROLL
 
 def check_exposure():
-    db = DatabaseClient()
+    db = get_db_client()
     MAX_DAILY_RISK = BANKROLL * 0.50
     MAX_PER_GAME = BANKROLL * 0.10
     

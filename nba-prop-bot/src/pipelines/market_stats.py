@@ -1,8 +1,8 @@
 import pandas as pd
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 
 def analyze_market_stats():
-    db = DatabaseClient()
+    db = get_db_client()
     with db.get_conn() as conn:
         query = """
         SELECT a.market, 

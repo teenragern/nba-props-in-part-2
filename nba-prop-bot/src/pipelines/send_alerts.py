@@ -2,7 +2,7 @@ from math import prod
 from typing import Dict, Any, List, Optional
 from src.utils.logging_utils import get_logger
 from src.clients.telegram_bot import TelegramBotClient
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
 from src.config import BANKROLL, KELLY_FRACTION
 from src.execution.executor import record_execution
 
@@ -131,26 +131,29 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         stake = min(stake, BANKROLL * 0.05)  # hard cap: 5% per bet
     stake = _camouflage_stake(stake)
 
-    if current_daily_risk + stake > MAX_DAILY_RISK:
-        logger.warning(
-            f"Skipping {player} — daily risk limit "
-            f"({current_daily_risk:.2f}/{MAX_DAILY_RISK:.2f})"
-        )
-        return
-
-    if event_id and current_game_risk + stake > MAX_PER_GAME:
-        logger.warning(
-            f"Skipping {player} — per-game risk limit for event {event_id} "
-            f"({current_game_risk:.2f}/{MAX_PER_GAME:.2f})"
-        )
-        return
-
-    alert_id = db.insert_alert(
-        player_name=player, market=market, line=line, side=side,
-        edge=edge, book=book, odds=odds, stake=stake,
-        game_date=game_date, event_id=event_id,
-        home_away=home_away, rest_days=rest_days,
+    # ── Final Risk Guard & Persist ────────────────────────────────────────────
+    # Atomic check-and-insert avoids double-spending risk limit in concurrent threads.
+    alert_id = db.insert_alert_with_limits(
+        player_name=player,
+        market=market,
+        line=line,
+        side=side,
+        edge=edge,
+        book=book,
+        odds=odds,
+        stake=stake,
+        game_date=game_date,
+        event_id=event_id,
+        home_away=home_away,
+        rest_days=rest_days,
+        max_daily_risk=MAX_DAILY_RISK,
+        max_per_game_risk=MAX_PER_GAME
     )
+
+    if not alert_id:
+        logger.warning(f"Skipping {player} — daily or per-game risk limit reached.")
+        return
+
     record_execution(alert_id, edge_data, stake, odds, db, _bot)
 
     ml_blend_note = " [ML+Bayesian blend]" if edge_data.get('ml_blend') else ""

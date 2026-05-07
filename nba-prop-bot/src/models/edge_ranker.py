@@ -27,13 +27,14 @@ _LATE_HOURS      = 1.0
 
 def _load_clv_thresholds() -> None:
     """
-    Compute per-market edge floors from 30-day rolling CLV.
+    Compute per-market edge floors from 30-day rolling CLV **and** ROI.
 
     Formula:
       base        = _EARLY_EDGE_MIN (0.05)
       clv_delta   = clamp(-avg_clv * 3, -0.02, +0.03)
-                    — negative CLV raises floor, positive lowers it
-      floor       = clamp(base + clv_delta, 0.02, 0.12)
+      roi_delta   = clamp(-roi * 2,    -0.02, +0.02)
+                    — both negative CLV and negative ROI raise the floor
+      floor       = clamp(base + clv_delta + roi_delta, 0.02, 0.15)
 
     The result is stored in _clv_edge_mins[market].  The static
     PER_MARKET_EDGE_MIN overrides in config are applied on top in
@@ -51,17 +52,29 @@ def _load_clv_thresholds() -> None:
     try:
         per_market_clv = db.get_per_market_clv(days_back=30, min_samples=10)
     except Exception:
-        return
+        per_market_clv = {}
+    try:
+        per_market_roi = db.get_per_market_roi(days_back=30, min_samples=30)
+    except Exception:
+        per_market_roi = {}
 
     from src.utils.logging_utils import get_logger as _log
     log = _log(__name__)
-    for market, avg_clv in per_market_clv.items():
+
+    all_markets = set(per_market_clv) | set(per_market_roi)
+    for market in all_markets:
+        avg_clv = per_market_clv.get(market, 0.0)
+        roi     = per_market_roi.get(market, 0.0)
+
         clv_delta = max(-0.02, min(0.03, -avg_clv * 3.0))
-        floor = max(0.02, min(0.12, _EARLY_EDGE_MIN + clv_delta))
+        roi_delta = max(-0.02, min(0.02, -roi * 2.0))
+        floor = max(0.02, min(0.15, _EARLY_EDGE_MIN + clv_delta + roi_delta))
+
         _clv_edge_mins[market] = floor
         log.info(
-            f"CLV floor [{market.replace('player_', '')}]: "
-            f"avg_clv={avg_clv:+.4f}  delta={clv_delta:+.3f}  floor={floor:.3f}"
+            f"CLV+ROI floor [{market.replace('player_', '')}]: "
+            f"avg_clv={avg_clv:+.4f}  roi={roi:+.4f}  "
+            f"delta={clv_delta+roi_delta:+.3f}  floor={floor:.3f}"
         )
 
 

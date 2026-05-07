@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 
 def check_calibration():
-    db = DatabaseClient()
+    db = get_db_client()
     
     with db.get_conn() as conn:
         query = """

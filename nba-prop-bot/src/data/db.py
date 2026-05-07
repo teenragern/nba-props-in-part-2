@@ -1,9 +1,25 @@
 import sqlite3
 import os
+import pandas as pd
 from contextlib import contextmanager
 from typing import Dict, Optional
 from src.config import DB_PATH
 from src.utils.logging_utils import get_logger
+
+
+def get_db_client():
+    """
+    Factory that returns a PostgresDatabaseClient when PG_DSN is set,
+    otherwise returns a SQLite DatabaseClient.
+
+    Use this in all pipelines instead of DatabaseClient() directly so the
+    database backend can be swapped via environment variable.
+    """
+    pg_dsn = os.getenv("PG_DSN")
+    if pg_dsn:
+        from src.data.db_postgres import PostgresDatabaseClient
+        return PostgresDatabaseClient(dsn=pg_dsn)
+    return DatabaseClient()
 
 # Default accuracy weights for consensus sharp books.
 # Based on industry research; overridden by DB once >= 20 samples accumulate.
@@ -31,10 +47,16 @@ class DatabaseClient:
     def get_conn(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
         try:
             yield conn
-        finally:
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
             conn.close()
 
     def _init_db(self):
@@ -142,6 +164,7 @@ class DatabaseClient:
                 cached_at   TEXT NOT NULL,
                 PRIMARY KEY (player_id, season, game_date)
             )"""),
+        (21, "clv_tracking: alert_id", "ALTER TABLE clv_tracking ADD COLUMN alert_id INTEGER REFERENCES alerts_sent(id)"),
     ]
 
     def _migrate_schema(self, conn):
@@ -167,8 +190,11 @@ class DatabaseClient:
                 continue
             try:
                 conn.execute(sql)
-            except Exception:
-                pass  # Column/table already exists — harmless
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "already exists" not in msg and "duplicate column" not in msg:
+                    logger.error(f"Migration v{version} failed unexpectedly: {e}")
+                    raise
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, description) VALUES (?, ?)",
                 (version, description),
@@ -197,12 +223,65 @@ class DatabaseClient:
             # Phase 3 CLV Tracking Link
             cursor.execute(
                 """
-                INSERT INTO clv_tracking (player_id, market, side, alert_odds, alert_time)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO clv_tracking (alert_id, player_id, market, side, alert_odds, alert_time)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
-                (player_name, market, side, odds)
+                (alert_id, player_name, market, side, odds)
             )
 
+            return alert_id
+
+    def insert_alert_with_limits(self, player_name: str, market: str, line: float, side: str,
+                                 edge: float, book: str, odds: float, stake: float,
+                                 game_date: str, event_id: str, home_away: str, rest_days: int,
+                                 max_daily_risk: float, max_per_game_risk: float) -> Optional[int]:
+        """
+        Atomic check-and-insert: only inserts if the new stake won't exceed
+        daily or per-game risk limits. Returns the new alert_id or None.
+        """
+        book = normalize_book(book)
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+
+            # 1. Check daily risk
+            row = cursor.execute(
+                "SELECT SUM(stake) FROM alerts_sent WHERE date(timestamp) = date('now')"
+            ).fetchone()
+            current_daily = float(row[0] or 0.0)
+            if current_daily + stake > max_daily_risk:
+                return None
+
+            # 2. Check per-game risk
+            if event_id:
+                grow = cursor.execute(
+                    "SELECT SUM(stake) FROM alerts_sent WHERE event_id = ? AND date(timestamp) = date('now')",
+                    (event_id,)
+                ).fetchone()
+                current_game = float(grow[0] or 0.0)
+                if current_game + stake > max_per_game_risk:
+                    return None
+
+            # 3. All OK -> Insert
+            cursor.execute(
+                """
+                INSERT INTO alerts_sent
+                    (player_name, market, line, side, edge, book, odds, stake,
+                     game_date, event_id, home_away, rest_days)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (player_name, market, line, side, edge, book, odds, stake,
+                 game_date, event_id, home_away, rest_days)
+            )
+            alert_id = cursor.lastrowid
+
+            # Phase 3 CLV Tracking Link
+            cursor.execute(
+                """
+                INSERT INTO clv_tracking (alert_id, player_id, market, side, alert_odds, alert_time)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (alert_id, player_name, market, side, odds)
+            )
             return alert_id
 
     def check_recent_alert(self, player_name: str, market: str, line: float, side: str, edge: float) -> bool:
@@ -322,8 +401,10 @@ class DatabaseClient:
         if not rows:
             return {"steam_flag": False, "velocity": 0.0, "dispersion": 0.0}
 
-        import pandas as pd
-        df = pd.DataFrame(rows, columns=['bookmaker', 'implied_prob', 'timestamp'])
+        if rows:
+            df = pd.DataFrame(rows, columns=['bookmaker', 'implied_prob', 'timestamp'])
+        else:
+            df = pd.DataFrame(columns=['bookmaker', 'implied_prob', 'timestamp'])
 
         if df.empty or len(df) < 2:
             return {"steam_flag": False, "velocity": 0.0, "dispersion": 0.0}
@@ -457,6 +538,40 @@ class DatabaseClient:
                 ).fetchall()
             return {
                 r['market']: float(r['avg_clv'])
+                for r in rows
+                if r['n'] and int(r['n']) >= min_samples
+            }
+        except Exception:
+            return {}
+
+    def get_per_market_roi(self, days_back: int = 30, min_samples: int = 30) -> Dict[str, float]:
+        """
+        Return {market: roi} for markets with >= min_samples settled bets in
+        the last days_back days.  ROI is (units_won - units_lost) / total_bets,
+        assuming flat 1-unit stakes at alert odds.
+
+        Used by edge_ranker to raise edge floors for persistently negative-ROI
+        markets beyond what CLV alone captures.
+        """
+        try:
+            with self.get_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT a.market,
+                           COUNT(*)                                              AS n,
+                           SUM(CASE WHEN b.won = 1 THEN (a.odds - 1) ELSE -1.0 END)
+                               / CAST(COUNT(*) AS REAL)                         AS roi
+                    FROM   alerts_sent  a
+                    JOIN   bet_results  b ON b.alert_id = a.id
+                    WHERE  b.push = 0
+                      AND  a.odds IS NOT NULL AND a.odds > 1.0
+                      AND  a.timestamp >= datetime('now', ?)
+                    GROUP  BY a.market
+                    """,
+                    (f'-{days_back} days',),
+                ).fetchall()
+            return {
+                r['market']: float(r['roi'])
                 for r in rows
                 if r['n'] and int(r['n']) >= min_samples
             }

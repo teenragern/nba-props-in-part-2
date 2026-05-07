@@ -22,7 +22,8 @@ import statistics
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
+from src.models.experiment_tracker import training_run
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -131,7 +132,7 @@ def check_drift(bot=None) -> Dict:
             'per_market': {market: brier},
         }
     """
-    db = DatabaseClient()
+    db = get_db_client()
     result: Dict = {
         'brier_100': float('nan'), 'brier_500': float('nan'),
         'brier_all': float('nan'), 'alarm': False, 'warning': False,
@@ -235,18 +236,35 @@ def check_drift(bot=None) -> Dict:
         )
 
     _log_summary(result, per_market)
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    run_name = f"drift_check_{today}"
+    with training_run(run_name, tags={"type": "drift_monitor"}) as run:
+        run.log_metric("brier_100", result['brier_100'] if not math.isnan(result['brier_100']) else -1)
+        run.log_metric("brier_500", result['brier_500'] if not math.isnan(result['brier_500']) else -1)
+        run.log_metric("brier_all", result['brier_all'] if not math.isnan(result['brier_all']) else -1)
+        run.log_metric("alarm_fired", int(result['alarm']))
+        run.log_metric("warning_fired", int(result['warning']))
+        run.log_metric("n_settled", result['n_100'])
+        for mkt, b in per_market.items():
+            run.log_metric(f"brier_{mkt.replace('player_', '')}", b)
+
     return result
 
 
 def _log_summary(result: Dict, per_market: Dict[str, float]):
+    def _fmt(v):
+        import math
+        return f"{v:.4f}" if not math.isnan(v) else "N/A"
+
     mkt_str = "  " + "  ".join(
-        f"{m.replace('player_','')[:4]}={b:.4f}" for m, b in per_market.items()
+        f"{m.replace('player_','')[:4]}={_fmt(b)}" for m, b in per_market.items()
     )
     logger.info(
         f"Drift summary | "
-        f"Brier[100]={result['brier_100']:.4f}  "
-        f"Brier[500]={result['brier_500']:.4f}  "
-        f"Brier[all]={result['brier_all']:.4f}\n"
+        f"Brier[100]={_fmt(result['brier_100'])}  "
+        f"Brier[500]={_fmt(result['brier_500'])}  "
+        f"Brier[all]={_fmt(result['brier_all'])}\n"
         f"Per-market: {mkt_str}"
     )
 

@@ -8,7 +8,7 @@ Usage:
 """
 
 import time
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.clients.bdl_client import BDLClient
 from src.clients.bdl_game_logs import BDLGameLogs
 from src.utils.logging_utils import get_logger
@@ -21,7 +21,7 @@ SEASONS = [2022, 2023, 2024, 2025]
 
 def run_ingestion():
     bdl = BDLClient()
-    db = DatabaseClient()
+    db = get_db_client()
     game_logs_client = BDLGameLogs(bdl, db=db)
 
     logger.info("Fetching active players from BDL...")

@@ -16,11 +16,16 @@ PLAYOFF_EDGE_MIN              = float(os.getenv("PLAYOFF_EDGE_MIN", "0.06"))
 PLAYOFF_MIN_PROJECTED_MINUTES = float(os.getenv("PLAYOFF_MIN_PROJECTED_MINUTES", "18.0"))
 
 # Per-market edge-floor overrides (applied on top of the dynamic floor).
-# Blocks are priced sharp — market_stats shows +0.10% bias, no real edge.
+# Floors are data-driven from settled bet history (negative ROI → raised floor).
+# Blocks / Assists / PRA were already raised from prior analysis.
+# Points raised to 0.08 due to persistent -3% ROI on marginal edges (< 8%).
+# Threes raised to 0.07 due to high variance and recent underperformance.
 PER_MARKET_EDGE_MIN: dict = {
-    'player_blocks': float(os.getenv("EDGE_MIN_BLOCKS", "0.09")),
-    'player_assists': float(os.getenv("EDGE_MIN_ASSISTS", "0.25")),
-    'player_points_rebounds_assists': float(os.getenv("EDGE_MIN_PRA", "0.15")),
+    'player_points':                  float(os.getenv("EDGE_MIN_POINTS",   "0.08")),
+    'player_threes':                  float(os.getenv("EDGE_MIN_THREES",   "0.07")),
+    'player_blocks':                  float(os.getenv("EDGE_MIN_BLOCKS",   "0.09")),
+    'player_assists':                 float(os.getenv("EDGE_MIN_ASSISTS",  "0.25")),
+    'player_points_rebounds_assists': float(os.getenv("EDGE_MIN_PRA",     "0.12")),
 }
 ODDS_REGION = os.getenv("ODDS_REGION", "us")
 BOOKMAKERS_RAW = os.getenv("BOOKMAKERS", "draftkings,fanduel,betmgm,caesars,betonlineag,lowvig")

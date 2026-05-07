@@ -1,14 +1,14 @@
 import time
 from src.utils.logging_utils import get_logger
 from src.clients.nba_stats import NbaStatsClient
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from datetime import datetime
 
 logger = get_logger(__name__)
 
 def sync_team_stats():
     client = NbaStatsClient()
-    db = DatabaseClient()
+    db = get_db_client()
     
     logger.info("Syncing team stats...")
     try:

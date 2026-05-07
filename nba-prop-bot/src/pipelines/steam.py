@@ -16,7 +16,7 @@ Algorithm
    Deduplication: skip if same player/market/side was alerted in the last 30 min.
 """
 
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
 from src.clients.telegram_bot import TelegramBotClient
 from src.utils.logging_utils import get_logger
 
@@ -79,7 +79,7 @@ def check_steam(bot: TelegramBotClient = None, db: DatabaseClient = None) -> Non
     Called by run_scheduler.job_steam() every 20 minutes on game days.
     """
     if db is None:
-        db = DatabaseClient()
+        db = get_db_client()
     if bot is None:
         bot = TelegramBotClient()
 
@@ -120,6 +120,19 @@ def check_steam(bot: TelegramBotClient = None, db: DatabaseClient = None) -> Non
             f"{move['sharp_book']} moved {move['sharp_delta']:+.1%} | "
             f"stale book: {move['stale_book']} ({_american(move['stale_odds'])})"
         )
+        try:
+            from src.events.bus import get_bus, EventBus
+            get_bus().publish(EventBus.STEAM_MOVE_DETECTED, {
+                "player": player,
+                "market": market,
+                "side": side,
+                "line": move["line"],
+                "sharp_book": move["sharp_book"],
+                "delta": move["sharp_delta"],
+                "stale_book": move["stale_book"],
+            })
+        except Exception as e:
+            logger.debug(f"EventBus publish skipped: {e}")
         sent += 1
 
     logger.info(f"Steam check complete: {sent} alert(s) sent, {len(moves)} move(s) detected.")

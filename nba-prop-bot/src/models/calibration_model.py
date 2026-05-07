@@ -31,7 +31,7 @@ import joblib
 
 _ISO_MODEL = None
 _ISO_MODEL_LOADED = False
-_ISO_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'calibration_iso.pkl')
+_ISO_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'calibration_iso.pkl')
 
 
 def _get_iso_model():
@@ -84,30 +84,37 @@ _KNOTS = [
 _PLAYOFF_CALIBRATION_STRENGTH = 0.50
 
 
-def calibrate_prob(raw_prob: float, playoff_mode: bool = False) -> float:
+def calibrate_prob(raw_prob: float, market: str = 'global', playoff_mode: bool = False) -> float:
     """
     Map a raw model probability to a calibrated probability using
-    piecewise-linear interpolation through empirical knots.
+    piecewise-linear interpolation or market-specific isotonic models.
 
     Args:
         raw_prob: model's predicted P(side hits), range [0, 1].
+        market: the prop market name (e.g. 'player_points') for specific calibration.
         playoff_mode: when True, blend the RS-fit correction with the raw
-            probability at _PLAYOFF_CALIBRATION_STRENGTH (default 0.50). The
-            knots were fit on regular-season alerts and are not validated
-            for playoff outcomes yet.
-
-    Returns:
-        Calibrated probability, clamped to [0.01, 0.99].
+            probability at _PLAYOFF_CALIBRATION_STRENGTH (default 0.50).
     """
-    iso_model = _get_iso_model()
-    if iso_model is not None:
+    models = _get_iso_model()
+    calibrated = None
+
+    if isinstance(models, dict):
+        # Market-aware models (.pkl is a dict of IsotonicRegression objects)
+        mkt_model = models.get(market) or models.get('global')
+        if mkt_model is not None:
+            try:
+                calibrated = float(mkt_model.predict([raw_prob])[0])
+            except Exception:
+                pass
+    elif models is not None:
+        # Legacy single-model .pkl
         try:
-            # Predict expects a 1D array-like input
-            calibrated = float(iso_model.predict([raw_prob])[0])
+            calibrated = float(models.predict([raw_prob])[0])
         except Exception:
-            # Fallback to knots on unexpected error
-            calibrated = _fallback_knots_calibration(raw_prob)
-    else:
+            pass
+
+    if calibrated is None:
+        # Fallback to hardcoded knots
         calibrated = _fallback_knots_calibration(raw_prob)
 
     if playoff_mode:
@@ -143,15 +150,11 @@ def calibrate_edge_candidate(candidate: Dict[str, Any],
     """
     Apply calibration to a single edge candidate dict (in-place).
     Stores both raw and calibrated values for transparency.
-
-    Adds/modifies keys:
-        raw_model_prob   — original model probability (preserved)
-        model_prob       — overwritten with calibrated value
-        calibrated       — True flag
     """
     raw = candidate.get('model_prob', 0.5)
+    market = candidate.get('market', 'global')
     candidate['raw_model_prob'] = raw
-    candidate['model_prob'] = calibrate_prob(raw, playoff_mode=playoff_mode)
+    candidate['model_prob'] = calibrate_prob(raw, market=market, playoff_mode=playoff_mode)
     candidate['calibrated'] = True
     return candidate
 

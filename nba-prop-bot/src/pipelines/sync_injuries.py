@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple
 
 from src.utils.logging_utils import get_logger
 from src.clients.injuries import InjuryClient, _STATUS_RANK
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
 
 logger = get_logger(__name__)
 
@@ -84,7 +84,7 @@ def sync_injuries() -> Dict:
       }
     """
     today = datetime.now().strftime('%Y-%m-%d')
-    db = DatabaseClient()
+    db = get_db_client()
 
     bdl_records       = _bdl_injuries()
     multi_records     = []
@@ -139,6 +139,15 @@ def sync_injuries() -> Dict:
     )
     if newly_out:
         logger.warning(f"Newly OUT: {', '.join(newly_out)}")
+        try:
+            from src.events.bus import get_bus, EventBus
+            get_bus().publish(EventBus.INJURY_NEWLY_OUT, {
+                "players": newly_out,
+                "game_date": today,
+                "source": "sync_injuries",
+            })
+        except Exception as e:
+            logger.debug(f"EventBus publish skipped: {e}")
 
     return {'records': len(merged), 'newly_out': newly_out, 'sources': counts}
 

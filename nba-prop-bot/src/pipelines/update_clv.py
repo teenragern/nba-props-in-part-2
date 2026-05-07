@@ -23,7 +23,7 @@ Schedule: every 30 minutes on game days (see run_scheduler.py).
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.clients.odds_api import OddsApiClient
 from src.models.devig import decimal_to_implied_prob
 from src.utils.logging_utils import get_logger
@@ -51,7 +51,7 @@ def update_clv_lines() -> None:
     """
     Snapshot closing lines for all unsettled CLV trackers in the tip-off window.
     """
-    db          = DatabaseClient()
+    db          = get_db_client()
     odds_client = OddsApiClient()
 
     # ── 1. Pull unsettled trackers + event context ────────────────────────
@@ -67,11 +67,7 @@ def update_clv_lines() -> None:
                    a.event_id,
                    a.game_date
             FROM   clv_tracking ct
-            LEFT   JOIN alerts_sent a
-                        ON  a.player_name = ct.player_id
-                        AND a.market      = ct.market
-                        AND a.side        = ct.side
-                        AND date(a.timestamp) = date(ct.alert_time)
+            LEFT   JOIN alerts_sent a ON a.id = ct.alert_id
             WHERE  ct.closing_odds IS NULL
             ORDER  BY ct.alert_time
             """

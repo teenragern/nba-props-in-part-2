@@ -11,7 +11,7 @@ run_scheduler.py.  Can also be called manually:
 from datetime import datetime
 from typing import List
 
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
 from src.clients.telegram_bot import TelegramBotClient
 from src.utils.logging_utils import get_logger
 
@@ -84,4 +84,4 @@ def flush_pending_alerts(db: DatabaseClient, bot: TelegramBotClient) -> int:
 
 
 if __name__ == "__main__":
-    flush_pending_alerts(DatabaseClient(), TelegramBotClient())
+    flush_pending_alerts(get_db_client(), TelegramBotClient())

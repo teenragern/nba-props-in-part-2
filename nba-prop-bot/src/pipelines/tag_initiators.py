@@ -10,7 +10,7 @@ Run via:  python main.py tag_initiators
 import time
 from typing import Dict, List, Tuple
 
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -26,7 +26,7 @@ def tag_initiators():
     from nba_api.stats.endpoints import leagueleaders
     from nba_api.stats.static import teams as nba_teams
 
-    db = DatabaseClient()
+    db = get_db_client()
 
     # Fetch league leaders sorted by AST (current season, regular season)
     logger.info("Fetching league assist leaders...")

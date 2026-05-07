@@ -15,7 +15,7 @@ import unicodedata
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.clients.bdl_client import BDLClient
 from src.clients.telegram_bot import TelegramBotClient
 from src.utils.logging_utils import get_logger
@@ -210,7 +210,7 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
     Prop stats and game scores are fetched in two batched BDL calls.
     Results are written to bet_results; a Telegram summary is sent at the end.
     """
-    db  = DatabaseClient()
+    db  = get_db_client()
     bdl = BDLClient()
     bot = TelegramBotClient()
 
@@ -311,10 +311,17 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
                 # Last-name fallback (handles "K. Caldwell-Pope" vs "Kentavious Caldwell-Pope")
                 if stat_row is None:
                     last = norm.split()[-1] if norm else ''
-                    stat_row = next(
-                        (v for k, v in stat_index.items() if k.split()[-1] == last),
-                        None,
-                    )
+                    candidates = [v for k, v in stat_index.items() if k.split()[-1] == last]
+                    if len(candidates) == 1:
+                        stat_row = candidates[0]
+                        logger.debug(f"Last-name fallback matched: {player_name!r} → single candidate OK")
+                    elif len(candidates) > 1:
+                        logger.warning(
+                            f"Last-name fallback ambiguous for {player_name!r} "
+                            f"({len(candidates)} players with same last name) — skipping."
+                        )
+                        skipped += 1
+                        continue
 
                 if stat_row is None:
                     logger.warning(f"No BDL stat line for: {player_name!r}")

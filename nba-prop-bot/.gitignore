@@ -1,0 +1,11 @@
+.env
+__pycache__/
+venv/
+.pytest_cache/
+props.db
+stats_cache.db
+*.pkl
+*.pkl.bak
+backups/
+deploy/
+out.txt

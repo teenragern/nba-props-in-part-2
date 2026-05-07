@@ -31,7 +31,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 from src.utils.logging_utils import get_logger
-from src.data.db import DatabaseClient
+from src.data.db import get_db_client
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.telegram_bot import TelegramBotClient
 from src.models.projections import build_player_projection, get_market_col
@@ -158,7 +158,7 @@ def run_backtest(seasons: Optional[List[str]] = None) -> Dict:
     if seasons is None:
         seasons = _DEFAULT_SEASONS[:_N_SEASONS]
 
-    db     = DatabaseClient()
+    db     = get_db_client()
     stats  = NbaStatsClient()
     bot    = TelegramBotClient()
 

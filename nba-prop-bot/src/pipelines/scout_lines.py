@@ -19,7 +19,7 @@ from typing import Dict, List
 
 from src.clients.odds_api import OddsApiClient
 from src.config import PROP_MARKETS, BDL_SHARP_SCAN_INTERVAL
-from src.data.db import DatabaseClient
+from src.data.db import DatabaseClient, get_db_client
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -99,7 +99,7 @@ def scout_lines(odds_client: OddsApiClient = None) -> Dict:
             'skipped': int,   # games outside the scout window
         }
     """
-    db = DatabaseClient()
+    db = get_db_client()
     if odds_client is None:
         odds_client = OddsApiClient()
 

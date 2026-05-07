@@ -1,0 +1,7 @@
+# Dependencies for the Playwright scraper worker (deploy/scraper.Dockerfile)
+# Kept intentionally minimal — the main bot's ML stack is NOT needed here.
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+playwright>=1.44.0
+requests>=2.31.0
+python-dotenv>=1.0.0

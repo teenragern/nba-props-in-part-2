@@ -122,7 +122,13 @@ class TelegramBotClient:
             return total_sent
 
         try:
-            return asyncio.run(_async_broadcast())
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    return ex.submit(asyncio.run, _async_broadcast()).result(timeout=120)
+            else:
+                return asyncio.run(_async_broadcast())
         except Exception as e:
             logger.error(f"Async broadcast failed: {e}")
             return 0
