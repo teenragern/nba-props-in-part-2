@@ -21,7 +21,7 @@ def generate_analytics(since: str = None):
         JOIN bet_results b ON a.id = b.alert_id
         LEFT JOIN clv_tracking c ON a.id = c.alert_id
         {where}
-        GROUP BY a.id
+        GROUP BY a.id, a.player_name, a.market, a.edge, b.won, b.actual_result, a.odds
         """
         df = pd.read_sql_query(query, conn, params=params)
         
@@ -30,7 +30,7 @@ def generate_analytics(since: str = None):
         return
         
     total_bets = len(df)
-    wins = len(df[df['won'] == 1])
+    wins = len(df[df['won'] == True])
     win_rate = wins / total_bets if total_bets > 0 else 0
     
     avg_edge = df['edge'].mean()

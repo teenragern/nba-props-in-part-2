@@ -225,12 +225,12 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
             """
             SELECT a.id, a.player_name, a.market, a.line, a.side,
                    a.odds, a.stake,
-                   COALESCE(a.game_date, DATE(a.timestamp)) AS game_date,
+                   COALESCE(a.game_date::DATE, a.timestamp::DATE) AS game_date,
                    a.event_id
             FROM   alerts_sent a
             LEFT   JOIN bet_results b ON a.id = b.alert_id
             WHERE  b.alert_id IS NULL
-              AND  COALESCE(a.game_date, DATE(a.timestamp)) = ?
+              AND  COALESCE(a.game_date::DATE, a.timestamp::DATE) = %s
             ORDER  BY a.id
             """,
             (target_date,),
@@ -332,7 +332,7 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
 
             # ── Write to bet_results ──────────────────────────────────────
             is_push = (won_val is None)
-            won_int = 0 if is_push else int(won_val)
+            won_bool = bool(won_val) if not is_push else False
 
             with db.get_conn() as wconn:
                 wconn.execute(
@@ -340,14 +340,14 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
                     INSERT INTO bet_results (alert_id, actual_result, won, push)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (alert_id, actual, won_int, int(is_push)),
+                    (alert_id, actual, won_bool, is_push),
                 )
 
             # Accumulate P&L
             if is_push:
                 pushes   += 1
                 pnl_delta = 0.0
-            elif won_int:
+            elif won_bool:
                 wins     += 1
                 pnl_delta = stake * (odds - 1.0)
             else:
@@ -355,7 +355,7 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
                 pnl_delta = -stake
             pnl += pnl_delta
 
-            icon = '✅' if (won_int and not is_push) else ('⚠️' if is_push else '❌')
+            icon = '✅' if won_bool else ('⚠️' if is_push else '❌')
             detail_lines.append(
                 f"{icon} {player_name} | {side} {line} "
                 f"{market.replace('_', ' ').title()} | "
@@ -363,7 +363,7 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
             )
             logger.info(
                 f"#{alert_id} settled — {player_name} {side} {line} {market}: "
-                f"actual={actual:.1f}  won={won_int}  push={is_push}"
+                f"actual={actual:.1f}  won={won_bool}  push={is_push}"
             )
 
         except Exception as exc:

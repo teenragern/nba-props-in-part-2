@@ -117,7 +117,7 @@ def _leg_passes_quality_gate(leg: Dict, playoff_mode: bool = False) -> bool:
     implied  = leg.get('implied_prob', 0.0)
 
     # Use calibrated probability for the quality check
-    cal_prob = calibrate_prob(raw_prob, playoff_mode=playoff_mode)
+    cal_prob = raw_prob if leg.get('calibrated') else calibrate_prob(raw_prob, playoff_mode=playoff_mode)
 
     if cal_prob < PER_LEG_PROB_MIN:
         return False
@@ -229,7 +229,7 @@ def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
     Same-Team, and Cross-Team SGP sequences. Assumes independence for 
     cross-game links.
     """
-    cal_probs = [calibrate_prob(leg.get('model_prob', 0.5), playoff_mode=playoff_mode) for leg in legs]
+    cal_probs = [leg.get('model_prob', 0.5) if leg.get('calibrated') else calibrate_prob(leg.get('model_prob', 0.5), playoff_mode=playoff_mode) for leg in legs]
     implied_probs = [leg['implied_prob'] for leg in legs]
 
     joint_true = cal_probs[0]
@@ -326,7 +326,7 @@ def _format_combo(legs: List[Dict], edge: float, joint_prob: float, playoff_mode
     for leg in legs:
         market = _MARKET_LABELS.get(leg['market'], leg['market'])
         raw_p  = leg.get('model_prob', 0)
-        cal_p  = calibrate_prob(raw_p, playoff_mode=playoff_mode)
+        cal_p  = raw_p if leg.get('calibrated') else calibrate_prob(raw_p, playoff_mode=playoff_mode)
         lines.append(
             f"• <b>{leg['player_id']}</b> {leg['side']} {leg['line']} {market}"
             f" @ {leg.get('book', '')} ({_american(leg['odds'])})"
@@ -405,7 +405,7 @@ def _format_four_leg_parlay(
     lines     = [header]
     for leg in legs:
         market = _MARKET_LABELS.get(leg['market'], leg['market'])
-        cal_p  = calibrate_prob(leg.get('model_prob', 0), playoff_mode=playoff_mode)
+        cal_p  = leg.get('model_prob', 0) if leg.get('calibrated') else calibrate_prob(leg.get('model_prob', 0), playoff_mode=playoff_mode)
         away   = leg.get('away_team', '')
         home   = leg.get('home_team', '')
         game   = f"[{away}@{home}]" if away and home else ''
@@ -557,7 +557,7 @@ def _format_slate_ultimate(
     lines    = [header]
     for leg in legs:
         market = _MARKET_LABELS.get(leg['market'], leg['market'])
-        cal_p  = calibrate_prob(leg.get('model_prob', 0), playoff_mode=playoff_mode)
+        cal_p  = leg.get('model_prob', 0) if leg.get('calibrated') else calibrate_prob(leg.get('model_prob', 0), playoff_mode=playoff_mode)
         away   = leg.get('away_team', '')
         home   = leg.get('home_team', '')
         game   = f"[{away}@{home}]" if away and home else ''
@@ -629,7 +629,7 @@ def generate_slate_ultimate(
         if len({l['player_id'] for l in legs}) < len(legs):
             continue
 
-        cal_probs     = [calibrate_prob(l.get('model_prob', 0.5), playoff_mode=playoff_mode) for l in legs]
+        cal_probs     = [l.get('model_prob', 0.5) if l.get('calibrated') else calibrate_prob(l.get('model_prob', 0.5), playoff_mode=playoff_mode) for l in legs]
         implied_probs = [l['implied_prob'] for l in legs]
 
         jt         = prod(cal_probs) * SLATE_ULTIMATE_REALITY

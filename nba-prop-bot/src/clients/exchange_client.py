@@ -171,6 +171,51 @@ class ExchangeClient:
         )
         return self._post("/portfolio/orders", body)
 
+    def sell_position(
+        self,
+        ticker: str,
+        side: str,
+        contracts: int,
+        min_price_cents: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Sell an existing position on Kalshi.
+
+        Args:
+            ticker:           Kalshi market ticker, e.g. "KXNBAGAME-..."
+            side:             "yes" or "no" — same side as the original buy
+            contracts:        Exact number of contracts to sell (from live_positions)
+            min_price_cents:  Floor limit in cents (1–99). Use max(1, bid_cents - 1)
+                              for a quick fill while guarding against bad executions.
+
+        Returns:
+            Order response dict on success, None on failure.
+        """
+        if not self._enabled:
+            return None
+
+        if contracts <= 0 or not (1 <= min_price_cents <= 99):
+            logger.warning(
+                f"ExchangeClient.sell_position: invalid args "
+                f"contracts={contracts} min_price_cents={min_price_cents}"
+            )
+            return None
+
+        body = {
+            "ticker":           ticker,
+            "action":           "sell",
+            "side":             side,
+            "count":            contracts,
+            "type":             "limit",
+            f"{side}_price":    min_price_cents,
+        }
+
+        logger.info(
+            f"ExchangeClient: selling position — {ticker} {side.upper()} "
+            f"{min_price_cents}¢ x {contracts} contracts"
+        )
+        return self._post("/portfolio/orders", body)
+
     def search_markets(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
         """
         Full-text search across Kalshi market titles.

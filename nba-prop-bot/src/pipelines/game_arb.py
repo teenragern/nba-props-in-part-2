@@ -31,6 +31,7 @@ from src.clients.telegram_bot import TelegramBotClient
 from src.config import SHARP_BOOKS
 from src.data.db import get_db_client
 from src.models.devig import devig_two_way
+from src.utils.kalshi_matching import TEAM_LOOKUP, find_kalshi_game_markets, resolve_team_for_market
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -41,41 +42,8 @@ _MAX_ORDERS_DAY  = int(os.getenv("GAME_ARB_MAX_ORDERS_PER_DAY",  "6"))
 # Per-star-player-out win probability adjustment
 _INJURY_ADJ_PER_STAR = 0.05
 
-# Maps last word of team name → (city_fragment, abbreviation)
-# Kalshi titles often say "Minnesota" not "Timberwolves", so we check all variants.
-_TEAM_LOOKUP: Dict[str, Tuple[str, str]] = {
-    "timberwolves": ("minnesota",     "min"),
-    "spurs":        ("san antonio",   "sa"),
-    "celtics":      ("boston",        "bos"),
-    "lakers":       ("los angeles",   "lal"),
-    "warriors":     ("golden state",  "gsw"),
-    "nets":         ("brooklyn",      "bkn"),
-    "knicks":       ("new york",      "nyk"),
-    "bulls":        ("chicago",       "chi"),
-    "heat":         ("miami",         "mia"),
-    "76ers":        ("philadelphia",  "phi"),
-    "raptors":      ("toronto",       "tor"),
-    "bucks":        ("milwaukee",     "mil"),
-    "pacers":       ("indiana",       "ind"),
-    "cavaliers":    ("cleveland",     "cle"),
-    "pistons":      ("detroit",       "det"),
-    "hawks":        ("atlanta",       "atl"),
-    "hornets":      ("charlotte",     "cha"),
-    "wizards":      ("washington",    "was"),
-    "magic":        ("orlando",       "orl"),
-    "nuggets":      ("denver",        "den"),
-    "thunder":      ("oklahoma city", "okc"),
-    "jazz":         ("utah",          "uta"),
-    "suns":         ("phoenix",       "phx"),
-    "clippers":     ("los angeles",   "lac"),
-    "kings":        ("sacramento",    "sac"),
-    "blazers":      ("portland",      "por"),
-    "trail":        ("portland",      "por"),
-    "grizzlies":    ("memphis",       "mem"),
-    "pelicans":     ("new orleans",   "nop"),
-    "mavericks":    ("dallas",        "dal"),
-    "rockets":      ("houston",       "hou"),
-}
+# Team lookup is shared via src/utils/kalshi_matching.TEAM_LOOKUP.
+_TEAM_LOOKUP = TEAM_LOOKUP
 
 # In-process daily order counter
 _orders_today: Dict[str, int] = {}
@@ -208,49 +176,14 @@ def _injury_adjustment(home_team: str, away_team: str, db) -> Tuple[float, float
 
 
 # ── Step 3: Find Kalshi game markets ─────────────────────────────────────────
+# Delegates to the shared kalshi_matching utility.
 
 def _find_kalshi_game_markets(
     client: ExchangeClient,
     home_team: str,
     away_team: str,
 ) -> List[Dict]:
-    """
-    Fetch all open KXNBAGAME markets and return those matching today's matchup.
-    Matches against team nickname, city name, and abbreviation in both ticker and title.
-    Falls back to text search when the series fetch returns nothing.
-    """
-    all_markets = client.get_nba_game_markets()
-    logger.debug(f"game_arb: {len(all_markets)} KXNBAGAME markets fetched from Kalshi")
-
-    home_last = home_team.split()[-1].lower()
-    away_last = away_team.split()[-1].lower()
-
-    def _variants(last: str) -> List[str]:
-        v = [last]
-        info = _TEAM_LOOKUP.get(last)
-        if info:
-            v.append(info[0])   # city name  e.g. "minnesota"
-            v.append(info[1])   # abbreviation e.g. "min"
-        return v
-
-    home_variants = _variants(home_last)
-    away_variants = _variants(away_last)
-
-    matches = []
-    for m in all_markets:
-        text = (m.get("ticker", "") + " " + m.get("title", "")).lower()
-        if any(v in text for v in home_variants) and any(v in text for v in away_variants):
-            matches.append(m)
-
-    # Fallback: text search if series fetch returned nothing (e.g. API change)
-    if not all_markets:
-        city = _TEAM_LOOKUP.get(home_last, (home_last,))[0]
-        for m in client.search_markets(city, limit=30):
-            text = (m.get("ticker", "") + " " + m.get("title", "")).lower()
-            if any(v in text for v in home_variants) and any(v in text for v in away_variants):
-                matches.append(m)
-
-    return matches
+    return find_kalshi_game_markets(client, home_team, away_team)
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -324,22 +257,13 @@ def run_game_arb() -> Dict:
             continue
 
         for km in kalshi_markets:
-            ticker    = km.get("ticker", "")
-            title_raw = km.get("title", "")
-            title     = title_raw.lower()
-
-            home_last = home_team.split()[-1].lower()
-            away_last = away_team.split()[-1].lower()
+            ticker = km.get("ticker", "")
 
             # Which team does this YES contract represent winning?
-            if home_last in title:
-                model_prob = home_prob
-                team_label = home_team
-            elif away_last in title:
-                model_prob = away_prob
-                team_label = away_team
-            else:
+            team_label = resolve_team_for_market(km, home_team, away_team)
+            if team_label is None:
                 continue
+            model_prob = home_prob if team_label == home_team else away_prob
 
             # 4. Get live Kalshi price
             price = client.get_market_price(ticker)

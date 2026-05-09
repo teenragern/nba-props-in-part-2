@@ -384,3 +384,50 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     description TEXT,
     applied_at  TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ── Live In-Game Trading ──────────────────────────────────────────────────────
+
+-- live_positions: one row per open Kalshi position (keyed by ticker).
+-- Upserted on BUY, deleted on SELL.
+CREATE TABLE IF NOT EXISTS live_positions (
+    ticker          TEXT        PRIMARY KEY,
+    game_id         TEXT        NOT NULL,
+    team            TEXT        NOT NULL,
+    side            TEXT        NOT NULL CHECK (side IN ('yes', 'no')),
+    contracts       INTEGER     NOT NULL DEFAULT 0,
+    avg_price_cents INTEGER     NOT NULL,
+    total_stake_usd REAL        NOT NULL DEFAULT 0.0,
+    opened_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    order_id        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_positions_game_id
+    ON live_positions(game_id);
+
+-- live_trades: immutable audit log of every execution attempt.
+-- action='rejected' rows have zero contracts/price and a rejection_reason.
+-- realized_pnl is NULL on BUY rows, populated when the matching SELL fills.
+CREATE TABLE IF NOT EXISTS live_trades (
+    id               BIGSERIAL   PRIMARY KEY,
+    ticker           TEXT        NOT NULL,
+    game_id          TEXT        NOT NULL,
+    team             TEXT        NOT NULL,
+    side             TEXT        NOT NULL CHECK (side IN ('yes', 'no')),
+    action           TEXT        NOT NULL CHECK (action IN ('buy', 'sell', 'rejected')),
+    contracts        INTEGER     NOT NULL DEFAULT 0,
+    price_cents      INTEGER     NOT NULL DEFAULT 0,
+    stake_usd        REAL        NOT NULL DEFAULT 0.0,
+    model_prob       REAL        NOT NULL,
+    kalshi_price     REAL        NOT NULL,
+    edge             REAL        NOT NULL,
+    order_id         TEXT,
+    session_id       TEXT        NOT NULL,
+    rejection_reason TEXT,
+    executed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    realized_pnl     REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_trades_ticker_session
+    ON live_trades(ticker, session_id, executed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_live_trades_game_id
+    ON live_trades(game_id, executed_at DESC);

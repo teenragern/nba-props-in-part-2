@@ -20,7 +20,7 @@ _clv_loaded: bool = False
 # Close to tip-off the line is efficient but late info (scratches, warm-up reports)
 # can create real, low-latency edges that justify a looser threshold.
 _EARLY_EDGE_MIN  = 0.05   # > 4 hours to tip
-_LATE_EDGE_MIN   = 0.02   # < 1 hour to tip
+_LATE_EDGE_MIN   = 0.04   # < 1 hour to tip (2% was below calibration uncertainty)
 _EARLY_HOURS     = 4.0
 _LATE_HOURS      = 1.0
 
@@ -66,9 +66,9 @@ def _load_clv_thresholds() -> None:
         avg_clv = per_market_clv.get(market, 0.0)
         roi     = per_market_roi.get(market, 0.0)
 
-        clv_delta = max(-0.02, min(0.03, -avg_clv * 3.0))
-        roi_delta = max(-0.02, min(0.02, -roi * 2.0))
-        floor = max(0.02, min(0.15, _EARLY_EDGE_MIN + clv_delta + roi_delta))
+        clv_delta = max(-0.02, min(0.06, -avg_clv * 3.0))
+        roi_delta = max(-0.02, min(0.04, -roi * 2.0))
+        floor = max(0.04, min(0.15, _EARLY_EDGE_MIN + clv_delta + roi_delta))
 
         _clv_edge_mins[market] = floor
         log.info(
@@ -165,6 +165,7 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         edge = model_prob - implied_prob
+        raw_edge = edge  # preserve pre-booster edge for cap
 
         # Phase 4: Edge Stability Filter
         # Market-scaled perturbation: low-mean markets (blocks/steals) need
@@ -238,6 +239,10 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 edge *= 1.15   # consensus confirms — more confident
             elif consensus_edge < -0.02:
                 edge *= 0.80   # consensus contradicts — reduce confidence
+
+        # Cap cumulative booster inflation to 30% above raw edge
+        if raw_edge > 0 and edge > raw_edge * 1.30:
+            edge = raw_edge * 1.30
 
         # Priority 7: Per-book/market bias correction from historical results
         factor = get_market_feedback_factor(market, book)

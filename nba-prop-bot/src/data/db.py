@@ -301,11 +301,7 @@ class DatabaseClient:
             if not row:
                 return False
 
-            last_edge = row['edge']
-            if edge - last_edge > 0.01:
-                return False  # Allow re-alert: edge improved > 1%
-
-            return True
+            return True  # Already alerted on this prop today — block duplicate
 
     def get_unsettled_clv(self):
         with self.get_conn() as conn:

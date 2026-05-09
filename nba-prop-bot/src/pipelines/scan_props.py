@@ -63,6 +63,7 @@ from src.models.edge_ranker import (
     set_db as set_ranker_db,
     set_playoff_mode as set_ranker_playoff_mode,
 )
+from src.models.calibration_model import calibrate_candidates
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert, send_line_disagreement_alert
 from src.pipelines.combos import generate_and_alert_combos, generate_slate_ultimate, generate_four_leg_parlays
@@ -755,7 +756,6 @@ def scan_props():
                 _EVENTS_CACHE['fetched_at'] = now_utc
                 logger.info(f"Events cache refreshed ({len(events)} events).")
             except OddsApiQuotaError:
-                global ODDS_API_DEAD
                 ODDS_API_DEAD = True
                 logger.error("Odds API out of credits during initial sync.")
                 events = []
@@ -771,7 +771,6 @@ def scan_props():
     except (Exception, OddsApiQuotaError) as e:
         logger.error(f"Failed to fetch Odds API events: {e}")
         if isinstance(e, OddsApiQuotaError):
-            global ODDS_API_DEAD
             ODDS_API_DEAD = True
             logger.warning("Odds API out of credits — forcing BDL fallback mode.")
         if not BDL_ENABLED or _bdl_bridge is None:
@@ -873,7 +872,6 @@ def scan_props():
                     )
                     sharp_bookmakers = sharp_odds.get('bookmakers', [])
                 except OddsApiQuotaError:
-                    global ODDS_API_DEAD
                     ODDS_API_DEAD = True
                     logger.warning(f"Odds API quota exceeded — skipping sharp fetch for {event_id}")
                     sharp_bookmakers = []
@@ -917,7 +915,6 @@ def scan_props():
                     ]
                 )
             except OddsApiQuotaError:
-                global ODDS_API_DEAD
                 ODDS_API_DEAD = True
                 logger.error("Odds API out of credits during legacy scan.")
                 continue
@@ -2128,6 +2125,7 @@ def scan_props():
             logger.warning(f"Failed to build cross-team correlation matrix for {home_team} vs {away_team}: {e}")
 
     # ── Rank and alert ────────────────────────────────────────────────
+    candidates = calibrate_candidates(candidates, playoff_mode=PLAYOFF_MODE)
     ranked_edges = rank_edges(candidates)
     _edge_min_floor = PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN
     actionable = [e for e in ranked_edges if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)]

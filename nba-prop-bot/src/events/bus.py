@@ -37,10 +37,12 @@ logger = get_logger(__name__)
 
 class EventBus:
     # Channel name constants
-    INJURY_NEWLY_OUT    = "nba:injury:newly_out"
-    STEAM_MOVE_DETECTED = "nba:steam:move"
-    LINE_SNAPSHOT_READY = "nba:line:snapshot"
-    SCAN_TRIGGER        = "nba:scan:trigger"
+    INJURY_NEWLY_OUT     = "nba:injury:newly_out"
+    STEAM_MOVE_DETECTED  = "nba:steam:move"
+    LINE_SNAPSHOT_READY  = "nba:line:snapshot"
+    SCAN_TRIGGER         = "nba:scan:trigger"
+    LIVE_STATE_UPDATE    = "nba:live:state_update"
+    LIVE_EXECUTION_QUEUE = "nba:live:execution_queue"
 
     def __init__(self, redis_url: Optional[str] = None):
         self._redis_url = redis_url

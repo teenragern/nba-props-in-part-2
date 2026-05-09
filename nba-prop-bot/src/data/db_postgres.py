@@ -308,9 +308,8 @@ class PostgresDatabaseClient:
             row = cur.fetchone()
         if not row:
             return False
-        if edge - float(row['edge']) > 0.01:
-            return False
-        return True
+
+        return True  # Already alerted on this prop today — block duplicate
 
     # ------------------------------------------------------------------
     # CLV tracking

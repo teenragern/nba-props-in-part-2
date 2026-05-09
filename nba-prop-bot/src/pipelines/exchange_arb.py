@@ -98,7 +98,7 @@ def _load_today_model_probs(db) -> List[Dict]:
         # to handle the evening/night rollover correctly.
         rows = conn.execute(
             """
-            SELECT a.player_name, a.market, a.edge, a.side
+            SELECT a.player_name, a.market, a.edge, a.side, a.odds
             FROM alerts_sent a
             WHERE a.timestamp >= NOW() - INTERVAL '12 hours'
               AND a.market IN ('player_points','player_rebounds',
@@ -160,9 +160,10 @@ def run_exchange_arb() -> Dict:
     for row in model_rows:
         player = row["player_name"]
         market = row["market"]
-        # edge here is the raw edge from the alert (model_prob - 0.5),
-        # so model_prob ≈ edge + 0.50
-        model_prob = max(0.01, min(0.99, (row.get("edge") or 0.0) + 0.50))
+        # Reconstruct model_prob from edge + implied_prob (= 1/odds)
+        odds = row.get("odds") or 2.0
+        implied_prob = 1.0 / odds if odds > 1.0 else 0.50
+        model_prob = max(0.01, min(0.99, (row.get("edge") or 0.0) + implied_prob))
 
         # Find matching Kalshi market(s)
         for km in kalshi_markets:
