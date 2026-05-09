@@ -74,7 +74,7 @@ SKIP_TABLES = {
     "schema_migrations",  # managed by _init_db()
 }
 
-# SQLite → PostgreSQL type coercions applied to individual values.
+# SQLite -> PostgreSQL type coercions applied to individual values.
 # Most types are compatible; this handles edge cases.
 def _coerce(val):
     if isinstance(val, bytes):
@@ -97,7 +97,21 @@ def _get_pg_columns(pg_conn, table: str) -> list:
         """,
         (table,),
     )
-    return [r[0] for r in cur.fetchall()]
+    return [r["column_name"] for r in cur.fetchall()]
+
+
+def _get_pg_bool_columns(pg_conn, table: str) -> set:
+    """Return the set of boolean column names for a PostgreSQL table."""
+    cur = pg_conn.cursor()
+    cur.execute(
+        """
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = %s
+          AND data_type = 'boolean'
+        """,
+        (table,),
+    )
+    return {r["column_name"] for r in cur.fetchall()}
 
 
 def migrate_table(sqlite_conn: sqlite3.Connection, pg_conn,
@@ -118,10 +132,13 @@ def migrate_table(sqlite_conn: sqlite3.Connection, pg_conn,
         return 0
 
     # Only copy columns that exist in BOTH databases
-    common = [c for c in sqlite_cols if c in pg_cols]
+    pg_cols_set = set(pg_cols)
+    common = [c for c in sqlite_cols if c in pg_cols_set]
     if not common:
         logger.warning(f"  {table}: no common columns — skipped.")
         return 0
+
+    bool_cols = _get_pg_bool_columns(pg_conn, table)
 
     col_str     = ", ".join(common)
     placeholder = ", ".join(["%s"] * len(common))
@@ -133,12 +150,21 @@ def migrate_table(sqlite_conn: sqlite3.Connection, pg_conn,
     sqlite_cur = sqlite_conn.execute(f"SELECT {col_str} FROM {table}")
     pg_cur     = pg_conn.cursor()
 
+    def _coerce_row(row):
+        out = []
+        for col, val in zip(common, row):
+            val = _coerce(val)
+            if col in bool_cols and isinstance(val, int):
+                val = bool(val)
+            out.append(val)
+        return tuple(out)
+
     total = 0
     while True:
         rows = sqlite_cur.fetchmany(batch_size)
         if not rows:
             break
-        coerced = [tuple(_coerce(v) for v in row) for row in rows]
+        coerced = [_coerce_row(row) for row in rows]
         pg_cur.executemany(insert_sql, coerced)
         total += len(rows)
 
@@ -156,7 +182,7 @@ def run_migration():
         sys.exit(1)
 
     print(f"\n{'='*60}")
-    print(f"SQLite → PostgreSQL migration")
+    print(f"SQLite -> PostgreSQL migration")
     print(f"  Source:      {SQLITE_PATH}")
     print(f"  Destination: {PG_DSN.split('@')[-1]}")
     print(f"  Started:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -167,6 +193,8 @@ def run_migration():
     sqlite_conn.row_factory = sqlite3.Row
 
     pg_conn = psycopg2.connect(PG_DSN, cursor_factory=psycopg2.extras.RealDictCursor)
+    pg_conn.cursor().execute("SET session_replication_role = replica;")
+    pg_conn.commit()
 
     # Ensure PostgreSQL schema is initialised before migrating
     print("Initialising PostgreSQL schema...")

@@ -93,7 +93,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
 
         # Daily total risk check
         cursor.execute(
-            "SELECT SUM(stake) as total_risk FROM alerts_sent WHERE date(timestamp) = date('now')"
+            "SELECT SUM(stake) as total_risk FROM alerts_sent WHERE timestamp >= NOW() - INTERVAL '12 hours'"
         )
         row = cursor.fetchone()
         current_daily_risk = float(row['total_risk'] or 0.0) if row else 0.0
@@ -102,7 +102,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         if event_id:
             cursor.execute(
                 "SELECT SUM(stake) as game_risk FROM alerts_sent "
-                "WHERE event_id = ? AND date(timestamp) = date('now')",
+                "WHERE event_id = ? AND timestamp >= NOW() - INTERVAL '12 hours'",
                 (event_id,),
             )
             game_row = cursor.fetchone()
@@ -407,7 +407,7 @@ def send_game_market_alert(
         cursor = conn.cursor()
 
         cursor.execute(
-            "SELECT SUM(stake) as total_risk FROM alerts_sent WHERE date(timestamp) = date('now')"
+            "SELECT SUM(stake) as total_risk FROM alerts_sent WHERE timestamp >= NOW() - INTERVAL '12 hours'"
         )
         row = cursor.fetchone()
         current_daily_risk = float(row['total_risk'] or 0.0) if row else 0.0
@@ -421,7 +421,7 @@ def send_game_market_alert(
         if event_id:
             cursor.execute(
                 "SELECT SUM(stake) as game_risk FROM alerts_sent "
-                "WHERE event_id = ? AND date(timestamp) = date('now')",
+                "WHERE event_id = ? AND timestamp >= NOW() - INTERVAL '12 hours'",
                 (event_id,),
             )
             game_row = cursor.fetchone()

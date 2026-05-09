@@ -1,31 +1,23 @@
 """
 Exchange API client — Phase 3C.
 
-Thin wrapper around the Kalshi REST API (v2) for fetching NBA prop market
-prices. Paper-mode only initially — no order placement.
-
-Kalshi markets relevant to NBA props follow the slug pattern:
-    NBAPROP-{PLAYER_ID}-{STAT}-{DATE}
+Kalshi REST API (v2) wrapper for reading NBA prop market prices and
+placing live limit orders.
 
 Environment:
     KALSHI_API_KEY      Kalshi API key (enables this client)
-    KALSHI_API_SECRET   Kalshi API secret (used for HMAC request signing)
-    KALSHI_BASE_URL     default: https://trading-api.kalshi.com/trade-api/v2
+    KALSHI_API_SECRET   RSA private key (PEM or base64)
+    KALSHI_BASE_URL     default: https://api.elections.kalshi.com/trade-api/v2
+    KALSHI_MAX_STAKE    Max dollars per order (default 5.00)
+    KALSHI_MAX_ORDERS_PER_DAY  Daily order cap (default 10)
 
-Falls back gracefully when KALSHI_API_KEY is unset — all methods return
-empty results so callers treat exchange data as optional enrichment.
-
-Usage:
-    from src.clients.exchange_client import ExchangeClient
-    client = ExchangeClient()
-    markets = client.get_nba_prop_markets()          # all active NBA props
-    price   = client.get_market_price("NBAPROP-...")  # yes/no price for one market
+Falls back gracefully when KALSHI_API_KEY is unset.
 """
 
-import hashlib
-import hmac
+import json
 import os
 import time
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -34,7 +26,7 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-_DEFAULT_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+_DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 _REQUEST_TIMEOUT  = 15
 
 
@@ -81,12 +73,25 @@ class ExchangeClient:
             return []
 
         # Kalshi uses series_ticker prefix filter for NBA props
-        params = {
-            "limit":         limit,
-            "status":        status,
-            "series_ticker": "NBAPROP",
-        }
-        data = self._get("/markets", params)
+        # Individual player prop series on Kalshi:
+        #   KXNBAPTS  — points    KXNBAREB — rebounds
+        #   KXNBAAST  — assists   KXNBA3PT — 3-pointers
+        all_markets = []
+        for series in ("KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBA3PT"):
+            params = {"limit": limit, "status": status, "series_ticker": series}
+            data = self._get("/markets", params)
+            all_markets.extend(data.get("markets", []) if data else [])
+        return all_markets
+
+    def get_nba_game_markets(
+        self,
+        limit: int = 200,
+        status: str = "open",
+    ) -> List[Dict[str, Any]]:
+        """Return all open Kalshi NBA game-winner markets (series KXNBAGAME)."""
+        if not self._enabled:
+            return []
+        data = self._get("/markets", {"limit": limit, "status": status, "series_ticker": "KXNBAGAME"})
         return data.get("markets", []) if data else []
 
     def get_market_price(self, ticker: str) -> Optional[Dict[str, float]]:
@@ -121,6 +126,51 @@ class ExchangeClient:
             "implied_yes": implied_yes,
         }
 
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        limit_price_cents: int,
+        max_stake_dollars: float = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Place a live limit order on Kalshi.
+
+        Args:
+            ticker:              Kalshi market ticker, e.g. "KXNBAPTS-..."
+            side:                "yes" (OVER) or "no" (UNDER)
+            limit_price_cents:   Price in cents (1–99), e.g. 55 = 55¢
+            max_stake_dollars:   Max dollars to spend. Defaults to KALSHI_MAX_STAKE env var.
+
+        Returns:
+            Order response dict on success, None on failure.
+        """
+        if not self._enabled:
+            return None
+
+        max_stake = max_stake_dollars or float(os.getenv("KALSHI_MAX_STAKE", "5.00"))
+        price_frac = limit_price_cents / 100.0
+        if price_frac <= 0:
+            return None
+
+        # Number of $1-face-value contracts we can afford
+        count = max(1, int(max_stake / price_frac))
+
+        body = {
+            "ticker":     ticker,
+            "action":     "buy",
+            "side":       side,
+            "count":      count,
+            "type":       "limit",
+            f"{side}_price": limit_price_cents,
+        }
+
+        logger.info(
+            f"ExchangeClient: placing order — {ticker} {side.upper()} "
+            f"{limit_price_cents}¢ x {count} contracts (${count * price_frac:.2f})"
+        )
+        return self._post("/portfolio/orders", body)
+
     def search_markets(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
         """
         Full-text search across Kalshi market titles.
@@ -136,25 +186,53 @@ class ExchangeClient:
 
     def _headers(self, method: str, path: str) -> Dict[str, str]:
         """
-        Build Kalshi HMAC-signed request headers.
-        If no API secret is configured, returns key-only headers (read-only endpoints
-        on some environments do not require signing).
+        Build Kalshi RSA-signed request headers (API v2).
+        Signature = base64(RSA-SHA256(timestamp + method.upper() + path))
         """
+        import base64
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
         ts = str(int(time.time() * 1000))
         headers = {
-            "Content-Type":  "application/json",
-            "Kalshi-API-Key": self._api_key,
-            "Kalshi-Timestamp": ts,
+            "Content-Type":       "application/json",
+            "KALSHI-ACCESS-KEY":  self._api_key,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
         }
         if self._api_secret:
-            msg       = ts + method.upper() + path
-            signature = hmac.new(
-                self._api_secret.encode(),
-                msg.encode(),
-                hashlib.sha256,
-            ).hexdigest()
-            headers["Kalshi-Signature"] = signature
+            msg = (ts + method.upper() + path).encode()
+            # Load the PEM private key — handle both full PEM and raw base64 blobs
+            secret = self._api_secret.strip()
+            if not secret.startswith("-----"):
+                secret = f"-----BEGIN RSA PRIVATE KEY-----\n{secret}\n-----END RSA PRIVATE KEY-----"
+            private_key = serialization.load_pem_private_key(secret.encode(), password=None)
+            sig = private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+            headers["KALSHI-ACCESS-SIGNATURE"] = base64.b64encode(sig).decode()
         return headers
+
+    def _post(self, path: str, body: Dict[str, Any]) -> Optional[Dict]:
+        url = f"{self._base_url}{path}"
+        try:
+            r = self._session.post(
+                url,
+                data=json.dumps(body),
+                headers=self._headers("POST", path),
+                timeout=_REQUEST_TIMEOUT,
+            )
+            if r.status_code == 401:
+                logger.warning("ExchangeClient: authentication failed on POST.")
+                return None
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"ExchangeClient: connection error on POST {url}")
+            return None
+        except requests.exceptions.Timeout:
+            logger.warning(f"ExchangeClient: timeout on POST {url}")
+            return None
+        except Exception as e:
+            logger.warning(f"ExchangeClient: POST failed {url}: {e}")
+            return None
 
     def _get(self, path: str, params: Dict[str, Any]) -> Optional[Dict]:
         url = f"{self._base_url}{path}"

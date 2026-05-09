@@ -6,6 +6,10 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+class OddsApiQuotaError(Exception):
+    """Raised when the Odds API is out of credits (401/403)."""
+    pass
+
 class OddsApiClient:
     BASE_URL = "https://api.the-odds-api.com/v4/sports"
     SPORT = "basketball_nba"
@@ -15,6 +19,7 @@ class OddsApiClient:
         self.requests_used = 0
         self.requests_remaining = 0
         self._quota_fetched = False
+        self.out_of_credits = False
 
     def _update_quota(self, headers: Any):
         used = headers.get('x-requests-used')
@@ -34,6 +39,11 @@ class OddsApiClient:
         }
         logger.info("Fetching NBA events from Odds API")
         response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code in (401, 403):
+            self.out_of_credits = True
+            raise OddsApiQuotaError("Odds API out of credits or unauthorized (401/403)")
+            
         response.raise_for_status()
         self._update_quota(response.headers)
         return response.json()
@@ -52,6 +62,11 @@ class OddsApiClient:
         
         logger.info(f"Fetching odds for event {event_id} markets: {markets}")
         response = requests.get(url, params=params, timeout=15)
+        
+        if response.status_code in (401, 403):
+            self.out_of_credits = True
+            raise OddsApiQuotaError(f"Odds API out of credits or unauthorized (401/403) for event {event_id}")
+            
         response.raise_for_status()
         self._update_quota(response.headers)
         return response.json()

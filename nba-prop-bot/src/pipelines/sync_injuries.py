@@ -117,18 +117,10 @@ def sync_injuries() -> Dict:
             old_status = prior.get(key, 'Unknown')
             if rec['status'] == 'Out' and old_status != 'Out':
                 newly_out.append(rec['player_name'])
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO injury_reports
-                    (game_date, player_name, team, status, description,
-                     return_date, severity, source, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    today, rec['player_name'], rec['team'], rec['status'],
-                    rec['description'], rec['return_date'], rec['severity'],
-                    ','.join(sorted(rec['sources'])), now_iso,
-                ),
+            db.upsert_injury_report(
+                today, rec['player_name'], rec['team'], rec['status'],
+                rec['description'], rec['return_date'], rec['severity'],
+                ','.join(sorted(rec['sources'])), now_iso
             )
 
     out_count = sum(1 for r in merged.values() if r['status'] == 'Out')

@@ -31,13 +31,7 @@ def sync_events(prefetched_events: Optional[List[Dict[str, Any]]] = None):
             if dt.timestamp() < datetime.now().timestamp():
                 status = 'started'
                 
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO games (game_id, home_team, away_team, commence_time, status)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (game_id, home_team, away_team, commence_time, status)
-            )
+            db.upsert_game(game_id, home_team, away_team, commence_time, status)
             
     logger.info("Events synchronized to database.")
 

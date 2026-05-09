@@ -387,7 +387,7 @@ def _four_leg_sent_today_count(db) -> int:
             """
             SELECT COUNT(*) FROM pending_alerts
             WHERE alert_type = 'four_leg_parlay'
-              AND date(created_at) = date('now', 'localtime')
+              AND created_at >= NOW() - INTERVAL '12 hours'
             """
         )
         row = cursor.fetchone()
@@ -540,7 +540,7 @@ def _slate_ultimate_sent_today(db) -> bool:
             """
             SELECT COUNT(*) FROM pending_alerts
             WHERE alert_type = 'slate_ultimate'
-              AND date(created_at) = date('now', 'localtime')
+              AND created_at >= NOW() - INTERVAL '12 hours'
             """
         )
         row = cursor.fetchone()

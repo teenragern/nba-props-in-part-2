@@ -28,6 +28,22 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
+def _to_py(v):
+    """
+    Coerce numpy scalar types to native Python so psycopg2 can serialize them.
+    numpy.float64 / int64 / bool_ are not registered as psycopg2 adapters and
+    get stringified as 'np.float64(x)' which PostgreSQL rejects.
+    """
+    typ = type(v).__name__
+    if typ in ("float64", "float32", "float16"):
+        return float(v)
+    if typ in ("int64", "int32", "int16", "int8", "uint64", "uint32"):
+        return int(v)
+    if typ == "bool_":
+        return bool(v)
+    return v
+
 # Default weights for sharp books (mirrors db.py)
 _SHARP_DEFAULT_WEIGHTS: Dict[str, float] = {
     'pinnacle': 1.00,
@@ -46,6 +62,37 @@ def normalize_book(book: Optional[str]) -> str:
 # Thin wrapper so code using conn.execute() works identically to SQLite
 # ---------------------------------------------------------------------------
 
+class _PgCursor:
+    """Wraps a psycopg2 cursor to provide SQLite-compatible '?' placeholder support."""
+
+    def __init__(self, raw_cursor):
+        self._cursor = raw_cursor
+
+    def execute(self, sql: str, params=()):
+        if '?' in sql:
+            sql = sql.replace('?', '%s')
+        self._cursor.execute(sql, tuple(_to_py(p) for p in params))
+        return self
+
+    def executemany(self, sql: str, params_list):
+        if '?' in sql:
+            sql = sql.replace('?', '%s')
+        self._cursor.executemany(sql, [tuple(_to_py(p) for p in row) for row in params_list])
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 class _PgConn:
     """Wraps a psycopg2 connection to provide a SQLite-compatible .execute() shortcut."""
 
@@ -53,17 +100,18 @@ class _PgConn:
         self._conn = raw_conn
 
     def execute(self, sql: str, params=()):
-        cur = self._conn.cursor()
+        cur = self.cursor()
         cur.execute(sql, params)
         return cur
 
     def executemany(self, sql: str, params_list):
-        cur = self._conn.cursor()
+        cur = self.cursor()
         cur.executemany(sql, params_list)
         return cur
 
     def cursor(self):
-        return self._conn.cursor()
+        from psycopg2.extras import DictCursor
+        return _PgCursor(self._conn.cursor(cursor_factory=DictCursor))
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +133,11 @@ class PostgresDatabaseClient:
         if not self._dsn:
             raise ValueError("PG_DSN must be set (env var or constructor arg)")
 
-        # ThreadedConnectionPool: min=1, max=10 connections
+        # ThreadedConnectionPool
         self._pool = psycopg2.pool.ThreadedConnectionPool(
             minconn=1,
             maxconn=10,
             dsn=self._dsn,
-            cursor_factory=psycopg2.extras.RealDictCursor,
         )
         self._init_db()
 
@@ -123,19 +170,25 @@ class PostgresDatabaseClient:
         with open(schema_path, 'r') as f:
             schema_sql = f.read()
 
+        # Strip all single-line comments (-- ...) before splitting by semicolon
+        # to avoid splitting on semicolons found inside comments.
+        import re
+        schema_sql = re.sub(r'--.*', '', schema_sql)
+
         # Run in autocommit mode — PostgreSQL DDL is transactional but
         # TimescaleDB create_hypertable requires its own transaction context.
         raw = self._pool.getconn()
         try:
             raw.autocommit = True
             cur = raw.cursor()
+            
             for stmt in schema_sql.split(';'):
-                stmt = stmt.strip()
-                if stmt and not stmt.startswith('--'):
+                clean_stmt = stmt.strip()
+                if clean_stmt:
                     try:
-                        cur.execute(stmt)
+                        cur.execute(clean_stmt)
                     except Exception as e:
-                        logger.debug(f"Schema stmt skipped ({e}): {stmt[:60]}")
+                        logger.error(f"Schema stmt FAILED ({e}): {clean_stmt[:60]}")
 
             # Enable TimescaleDB extension and hypertable (idempotent)
             try:
@@ -152,6 +205,19 @@ class PostgresDatabaseClient:
             except Exception as e:
                 logger.warning(f"TimescaleDB setup skipped (may not be installed): {e}")
 
+            # Reset sequences so they stay ahead of existing max IDs.
+            # Prevents duplicate key errors after data was inserted outside
+            # the normal sequence path (e.g. manual inserts or migrations).
+            for table, col in [('alerts_sent', 'id'), ('clv_tracking', 'id')]:
+                try:
+                    cur.execute(
+                        f"SELECT setval("
+                        f"pg_get_serial_sequence('{table}', '{col}'), "
+                        f"COALESCE((SELECT MAX({col}) FROM {table}), 0) + 1, false)"
+                    )
+                except Exception as _seq_err:
+                    logger.debug(f"Sequence reset skipped for {table}.{col}: {_seq_err}")
+
             logger.info("PostgreSQL schema initialized.")
         finally:
             raw.autocommit = False
@@ -166,6 +232,7 @@ class PostgresDatabaseClient:
                      game_date: str = None, event_id: str = None,
                      home_away: str = None, rest_days: int = 2) -> int:
         book = normalize_book(book)
+        line, edge, odds, stake = _to_py(line), _to_py(edge), _to_py(odds), _to_py(stake)
         with self.get_conn() as conn:
             cur = conn.execute(
                 """
@@ -188,6 +255,42 @@ class PostgresDatabaseClient:
                 (alert_id, player_name, market, side, odds),
             )
             return alert_id
+
+    def insert_alert_with_limits(self, player_name: str, market: str, line: float, side: str,
+                                 edge: float, book: str, odds: float, stake: float,
+                                 game_date: str = None, event_id: str = None,
+                                 home_away: str = None, rest_days: int = 2,
+                                 max_daily_risk: float = 1000.0,
+                                 max_per_game_risk: float = 400.0) -> Optional[int]:
+        """Atomic check-and-insert for PostgreSQL."""
+        line, edge, odds, stake = _to_py(line), _to_py(edge), _to_py(odds), _to_py(stake)
+        with self.get_conn() as conn:
+            cur = conn.execute(
+                """
+                WITH daily_risk AS (
+                    SELECT COALESCE(SUM(stake), 0) as total
+                    FROM alerts_sent
+                    WHERE timestamp >= NOW() - INTERVAL '12 hours'
+                ),
+                game_risk AS (
+                    SELECT COALESCE(SUM(stake), 0) as total
+                    FROM alerts_sent
+                    WHERE event_id = %s AND timestamp >= NOW() - INTERVAL '12 hours'
+                )
+                INSERT INTO alerts_sent
+                    (player_name, market, line, side, edge, book, odds, stake,
+                     game_date, event_id, home_away, rest_days)
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                WHERE (SELECT total FROM daily_risk) + %s <= %s
+                  AND (SELECT total FROM game_risk) + %s <= %s
+                RETURNING id
+                """,
+                (event_id, player_name, market, line, side, edge, book, odds, stake,
+                 game_date, event_id, home_away, rest_days, stake, max_daily_risk,
+                 stake, max_per_game_risk)
+            )
+            row = cur.fetchone()
+            return row['id'] if row else None
 
     def check_recent_alert(self, player_name: str, market: str, line: float,
                            side: str, edge: float) -> bool:
@@ -299,6 +402,7 @@ class PostgresDatabaseClient:
 
     def insert_line_history(self, player_name: str, market: str, bookmaker: str,
                             line: float, side: str, odds: float, implied_prob: float):
+        line, odds, implied_prob = _to_py(line), _to_py(odds), _to_py(implied_prob)
         with self.get_conn() as conn:
             conn.execute(
                 """
@@ -322,7 +426,9 @@ class PostgresDatabaseClient:
         import pandas as pd
         raw = self._pool.getconn()
         try:
-            df = pd.read_sql_query(
+            from psycopg2.extras import DictCursor
+            cur = raw.cursor(cursor_factory=DictCursor)
+            cur.execute(
                 """
                 SELECT bookmaker, implied_prob, timestamp
                 FROM line_history
@@ -330,9 +436,10 @@ class PostgresDatabaseClient:
                   AND timestamp >= NOW() - INTERVAL '60 minutes'
                 ORDER BY timestamp ASC
                 """,
-                raw,
-                params=(player_name, market, line, side),
+                (player_name, market, line, side),
             )
+            rows = cur.fetchall()
+            df = pd.DataFrame(rows, columns=['bookmaker', 'implied_prob', 'timestamp']) if rows else pd.DataFrame()
         except Exception:
             df = pd.DataFrame()
         finally:
@@ -941,6 +1048,9 @@ class PostgresDatabaseClient:
                             sharp_current_prob: float, stale_book: str,
                             stale_odds: float, stale_current_prob: float,
                             direction: str) -> None:
+        line = _to_py(line)
+        sharp_delta, sharp_current_prob = _to_py(sharp_delta), _to_py(sharp_current_prob)
+        stale_odds, stale_current_prob  = _to_py(stale_odds),  _to_py(stale_current_prob)
         with self.get_conn() as conn:
             conn.execute(
                 """
@@ -977,6 +1087,7 @@ class PostgresDatabaseClient:
 
     def queue_pending_alert(self, alert_type: str, title: str, body: str,
                              priority: float = 0.0, game_date: str = None) -> int:
+        priority = _to_py(priority)
         with self.get_conn() as conn:
             cur = conn.execute(
                 """
@@ -1159,6 +1270,43 @@ class PostgresDatabaseClient:
                     )
                 except Exception:
                     pass
+
+    def upsert_game(self, game_id: str, home_team: str, away_team: str,
+                    commence_time: str, status: str) -> None:
+        with self.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO games (game_id, home_team, away_team, commence_time, status)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (game_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    commence_time = EXCLUDED.commence_time
+                """,
+                (game_id, home_team, away_team, commence_time, status),
+            )
+
+    def upsert_injury_report(self, game_date: str, player_name: str, team: str,
+                             status: str, description: str, return_date: str,
+                             severity: int, source: str, updated_at: str) -> None:
+        with self.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO injury_reports
+                    (game_date, player_name, team, status, description,
+                     return_date, severity, source, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (game_date, player_name) DO UPDATE SET
+                    team        = EXCLUDED.team,
+                    status      = EXCLUDED.status,
+                    description = EXCLUDED.description,
+                    return_date = EXCLUDED.return_date,
+                    severity    = EXCLUDED.severity,
+                    source      = EXCLUDED.source,
+                    updated_at  = EXCLUDED.updated_at
+                """,
+                (game_date, player_name, team, status, description,
+                 return_date, severity, source, updated_at),
+            )
 
     def get_cached_bdl_game_logs(self, player_id: int, season: int,
                                   ignore_ttl: bool = False) -> list:

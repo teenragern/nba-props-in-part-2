@@ -292,7 +292,7 @@ class DatabaseClient:
                 SELECT edge FROM alerts_sent
                 WHERE player_name = ? AND market = ? AND side = ?
                 AND abs(line - ?) <= 0.5
-                AND date(timestamp) = date('now', 'localtime')
+                AND timestamp >= NOW() - INTERVAL '12 hours'
                 ORDER BY timestamp DESC LIMIT 1
                 """,
                 (player_name, market, side, line)
@@ -624,6 +624,34 @@ class DatabaseClient:
         except Exception:
             pass
         return 0.0
+
+    def upsert_game(self, game_id: str, home_team: str, away_team: str,
+                    commence_time: str, status: str):
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO games (game_id, home_team, away_team, commence_time, status)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (game_id, home_team, away_team, commence_time, status)
+            )
+
+    def upsert_injury_report(self, game_date: str, player_name: str, team: str,
+                             status: str, description: str, return_date: str,
+                             severity: int, source: str, updated_at: str):
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO injury_reports
+                    (game_date, player_name, team, status, description,
+                     return_date, severity, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (game_date, player_name, team, status, description,
+                 return_date, severity, source, updated_at)
+            )
 
     def upsert_team_opponent_stats(self, team_name: str, season: str,
                                    opp_pts: float, opp_reb: float, opp_ast: float,

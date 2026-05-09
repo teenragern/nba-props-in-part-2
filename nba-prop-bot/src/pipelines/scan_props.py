@@ -33,7 +33,7 @@ import pandas as pd
 
 from src.utils.logging_utils import get_logger
 from src.data.db import DatabaseClient, get_db_client
-from src.clients.odds_api import OddsApiClient
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
@@ -100,6 +100,7 @@ PLAYOFF_MODE = os.getenv("PLAYOFF_MODE", "False").lower() in ("true", "1", "yes"
 # (or breaking-news triggered scans) reuse the same fetch.
 _EVENTS_CACHE: Dict[str, Any] = {'data': [], 'fetched_at': None}
 _EVENTS_CACHE_TTL_SEC = 5400  # 90 minutes — matches scan interval
+ODDS_API_DEAD = False  # Track if API is out of credits
 
 # Only fetch sharp Pinnacle odds when the game tips off within this window.
 # Saves 1 Odds API credit per out-of-window game per scan.
@@ -659,18 +660,18 @@ def _sync_injuries_bdl(db: DatabaseClient, game_date: str):
         logger.warning("BDL: No injury data — falling back to scraping.")
         return False
 
-    with db.get_conn() as conn:
-        cursor = conn.cursor()
-        for inj in injuries:
-            try:
-                cursor.execute(
-                    """INSERT OR REPLACE INTO injury_reports
-                       (game_date, player_name, team, status)
-                       VALUES (?, ?, ?, ?)""",
-                    (game_date, inj['player_name'], inj['team'], inj['status'])
-                )
-            except Exception:
-                continue
+    for inj in injuries:
+        db.upsert_injury_report(
+            game_date=game_date,
+            player_name=inj['player_name'],
+            team=inj['team'],
+            status=inj['status'],
+            description=inj.get('description', ''),
+            return_date=inj.get('return_date', ''),
+            severity=inj.get('severity', 0),
+            source='BDL',
+            updated_at=datetime.now().isoformat()
+        )
     logger.info(f"BDL: Persisted {len(injuries)} injury records for {game_date}.")
     return True
 
@@ -681,24 +682,26 @@ def _sync_injuries_legacy(db: DatabaseClient, injury_client: InjuryClient, game_
     if not injuries:
         logger.warning("No injury data fetched — all players treated as Healthy.")
         return
-    with db.get_conn() as conn:
-        cursor = conn.cursor()
-        for inj in injuries:
-            try:
-                cursor.execute(
-                    """INSERT OR REPLACE INTO injury_reports
-                       (game_date, player_name, team, status)
-                       VALUES (?, ?, ?, ?)""",
-                    (game_date, inj['player_name'], inj['team'], inj['status'])
-                )
-            except Exception:
-                continue
+    for inj in injuries:
+        db.upsert_injury_report(
+            game_date=game_date,
+            player_name=inj['player_name'],
+            team=inj['team'],
+            status=inj['status'],
+            description=inj.get('description', ''),
+            return_date=inj.get('return_date', ''),
+            severity=inj.get('severity', 0),
+            source='Scraper',
+            updated_at=datetime.now().isoformat()
+        )
     logger.info(f"Legacy: Persisted {len(injuries)} injury records for {game_date}.")
 
 
 # ─── Main scan pipeline ──────────────────────────────────────────────
 
 def scan_props():
+    global ODDS_API_DEAD
+    ODDS_API_DEAD = False
     _REST_CACHE.clear()  # fresh team-rest lookups each scan cycle
     logger.info(f"Initializing scan pipeline ({'BDL+Sharp' if BDL_ENABLED_RUNTIME else 'Odds API only'})...")
 
@@ -742,11 +745,21 @@ def scan_props():
         if cache_age < _EVENTS_CACHE_TTL_SEC and _EVENTS_CACHE['data']:
             events = _EVENTS_CACHE['data']
             logger.info(f"Events cache hit ({cache_age:.0f}s old) — skipping get_events() call.")
+        elif ODDS_API_DEAD:
+            logger.warning("Odds API is dead — skipping events fetch.")
+            events = []
         else:
-            events = odds_client.get_events()
-            _EVENTS_CACHE['data'] = events
-            _EVENTS_CACHE['fetched_at'] = now_utc
-            logger.info(f"Events cache refreshed ({len(events)} events).")
+            try:
+                events = odds_client.get_events()
+                _EVENTS_CACHE['data'] = events
+                _EVENTS_CACHE['fetched_at'] = now_utc
+                logger.info(f"Events cache refreshed ({len(events)} events).")
+            except OddsApiQuotaError:
+                global ODDS_API_DEAD
+                ODDS_API_DEAD = True
+                logger.error("Odds API out of credits during initial sync.")
+                events = []
+
         odds_events = [
             e for e in events
             if dateutil.parser.isoparse(e['commence_time'])
@@ -755,10 +768,15 @@ def scan_props():
         for e in events:
             odds_map[e['home_team'].lower()] = e['id']
             odds_map[e['away_team'].lower()] = e['id']
-    except Exception as e:
+    except (Exception, OddsApiQuotaError) as e:
         logger.error(f"Failed to fetch Odds API events: {e}")
-        if not BDL_ENABLED_RUNTIME:
+        if isinstance(e, OddsApiQuotaError):
+            global ODDS_API_DEAD
+            ODDS_API_DEAD = True
+            logger.warning("Odds API out of credits — forcing BDL fallback mode.")
+        if not BDL_ENABLED or _bdl_bridge is None:
             return
+        events = []
 
     if BDL_ENABLED_RUNTIME:
         bdl_games = _bdl_bridge.get_today_games(today)
@@ -823,20 +841,14 @@ def scan_props():
             bdl_best_odds    = bdl_data["best_odds"]
             bdl_player_map   = bdl_data["player_id_map"]
 
-            # Batch-prefetch BDL profiles for all players in this game.
-            # Reduces API calls from ~9 per player to ~9 per game.
             if bdl_player_map:
                 _bdl_bridge.prefetch_player_profiles(list(bdl_player_map.values()), season=_season_int)
 
-            # Insert line history
             _all_line_records = bdl_data["line_records"]
             if _all_line_records:
                 db.insert_line_history_batch(_all_line_records)
 
-            # Fetch sharp books from Odds API (1 credit per game — Pinnacle only).
-            # Skip if the game is more than _TIP_OFF_SHARP_HOURS away — sharp
-            # lines barely move that far out, and this is the largest single
-            # source of credit waste on morning/afternoon scans.
+            # Sharp fetch (Pinnacle/Circa/Bookmaker)
             sharp_bookmakers = []
             _tip_hours_away = float('inf')
             if commence_str:
@@ -847,7 +859,8 @@ def scan_props():
                     ).total_seconds() / 3600
                 except Exception:
                     pass
-            if _tip_hours_away <= _TIP_OFF_SHARP_HOURS:
+
+            if not ODDS_API_DEAD and _tip_hours_away <= _TIP_OFF_SHARP_HOURS:
                 try:
                     sharp_odds = odds_client.get_event_odds(
                         event_id=event_id,
@@ -859,9 +872,14 @@ def scan_props():
                         ]
                     )
                     sharp_bookmakers = sharp_odds.get('bookmakers', [])
+                except OddsApiQuotaError:
+                    global ODDS_API_DEAD
+                    ODDS_API_DEAD = True
+                    logger.warning(f"Odds API quota exceeded — skipping sharp fetch for {event_id}")
+                    sharp_bookmakers = []
                 except Exception as _se:
                     logger.debug(f"Sharp book fetch skipped for {event_id}: {_se}")
-            else:
+            elif not ODDS_API_DEAD:
                 logger.info(
                     f"Skipping Odds API fetch for {home_team} vs {away_team} "
                     f"({_tip_hours_away:.1f}h to tip — outside {_TIP_OFF_SHARP_HOURS}h window)."
@@ -872,7 +890,6 @@ def scan_props():
             _home_spread = _ctx.get("spread_home", 0.0)
             _game_total  = _ctx.get("total", 0.0)
 
-            # If BDL didn't have odds, try Odds API bookmakers
             if not _home_spread and sharp_bookmakers:
                 _home_spread = OddsApiClient.extract_consensus_spread(
                     sharp_bookmakers, home_team) or 0.0
@@ -880,7 +897,6 @@ def scan_props():
                 _game_total = OddsApiClient.extract_consensus_total(
                     sharp_bookmakers) or 0.0
 
-            # Confirmed starters from BDL
             bdl_starters = _bdl_bridge.get_confirmed_starters(bdl_game_id)
         else:
             # Legacy path: everything from Odds API
@@ -889,6 +905,8 @@ def scan_props():
             bdl_starters = {}
 
             try:
+                if ODDS_API_DEAD:
+                    raise OddsApiQuotaError("Odds API is already dead")
                 odds_data = odds_client.get_event_odds(
                     event_id=event_id,
                     markets=[
@@ -898,6 +916,11 @@ def scan_props():
                         'h2h_h1', 'spreads_h1', 'totals_h1',
                     ]
                 )
+            except OddsApiQuotaError:
+                global ODDS_API_DEAD
+                ODDS_API_DEAD = True
+                logger.error("Odds API out of credits during legacy scan.")
+                continue
             except Exception:
                 continue
 
@@ -1034,8 +1057,8 @@ def scan_props():
             cursor = conn.cursor()
             cursor.execute(
                 """SELECT player_name FROM injury_reports
-                   WHERE game_date = ? AND status = 'Out'
-                   AND (team = ? OR team = ?)""",
+                   WHERE game_date = %s AND status = 'Out'
+                   AND (team = %s OR team = %s)""",
                 (today, home_team, away_team)
             )
             out_players = [r['player_name'] for r in cursor.fetchall()]
@@ -1557,7 +1580,7 @@ def scan_props():
                 with db.get_conn() as conn:
                     cursor = conn.cursor()
                     cursor.execute(
-                        "SELECT status FROM injury_reports WHERE player_name = ? AND game_date = ?",
+                        "SELECT status FROM injury_reports WHERE player_name = %s AND game_date = %s",
                         (player_name, today)
                     )
                     inj_row = cursor.fetchone()

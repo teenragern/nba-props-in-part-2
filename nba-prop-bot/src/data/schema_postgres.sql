@@ -359,7 +359,7 @@ CREATE INDEX IF NOT EXISTS idx_placed_bets_session
 CREATE TABLE IF NOT EXISTS model_health (
     id            BIGSERIAL PRIMARY KEY,
     snapshot_date DATE    NOT NULL,
-    window        TEXT    NOT NULL,
+    "window"      TEXT    NOT NULL,
     market        TEXT    NOT NULL DEFAULT 'all',
     brier         REAL    NOT NULL,
     n_samples     INTEGER NOT NULL,
@@ -367,7 +367,7 @@ CREATE TABLE IF NOT EXISTS model_health (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_model_health_unique
-    ON model_health(snapshot_date, window, market);
+    ON model_health(snapshot_date, "window", market);
 
 CREATE TABLE IF NOT EXISTS subscribers (
     id        BIGSERIAL PRIMARY KEY,

@@ -52,7 +52,7 @@ def generate_analytics(since: str = None):
     avg_clv = clv_df['clv'].mean() if not clv_df.empty else 0
     clv_hit_rate = len(clv_df[clv_df['clv'] > 0]) / len(clv_df) if not clv_df.empty else 0
 
-    print("\\n===========================================")
+    print("\n===========================================")
     print("      NBA PROP BOT MODEL PERFORMANCE       ")
     print("===========================================")
     if since:
@@ -69,7 +69,7 @@ def generate_analytics(since: str = None):
     else:
         print(f"Average CLV Captured : {avg_clv:.2%}")
         print(f"Beat Closing Line %  : {clv_hit_rate:.2%}")
-    print("===========================================\\n")
+    print("===========================================\n")
     
 if __name__ == "__main__":
     generate_analytics()

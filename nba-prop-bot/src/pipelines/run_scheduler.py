@@ -54,6 +54,7 @@ from src.config import SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL
 from src.events.bus import get_bus, EventBus
 from src.clients.ws_live_feed import start_live_feed
 from src.pipelines.exchange_arb import run_exchange_arb
+from src.pipelines.game_arb import run_game_arb
 
 _WATCHDOG_TIMEOUT_SEC = int(os.getenv('WATCHDOG_TIMEOUT_SEC', '300'))  # 5 min default
 # Minimum seconds between scan submissions to prevent duplicate triggers.
@@ -240,7 +241,7 @@ def job_scan():
             db = get_db_client()
             with db.get_conn() as conn:
                 row = conn.execute(
-                    "SELECT COUNT(*) AS n FROM alerts_sent WHERE date(timestamp) = date('now')"
+                    "SELECT COUNT(*) AS n FROM alerts_sent WHERE timestamp >= NOW() - INTERVAL '12 hours'"
                 ).fetchone()
             n_today = int(row['n'] or 0) if row else 0
             summary_msg = (
@@ -462,6 +463,13 @@ def job_exchange_arb():
     submit_job("Exchange Arb", run_exchange_arb)
 
 
+def job_game_arb():
+    """Compare model win probs vs Kalshi game markets. No-op when KALSHI_API_KEY unset."""
+    if not _has_games():
+        return
+    submit_job("Game Arb", run_game_arb)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler entry point
 # ---------------------------------------------------------------------------
@@ -509,6 +517,7 @@ def start_scheduler():
     schedule.every(120).minutes.do(job_clv)                     # ~11 credits each
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
     schedule.every(30).minutes.do(job_exchange_arb)             # 0 credits (Kalshi API, no-op when key unset)
+    schedule.every(5).minutes.do(job_game_arb)                  # 0 credits (Kalshi game markets, no-op when key unset)
     schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
     # Injury feed: free (BDL/scrape). Run frequently — late scratches move minutes hard.
     schedule.every(15).minutes.do(job_sync_injuries)
