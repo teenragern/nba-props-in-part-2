@@ -43,6 +43,7 @@ class EventBus:
     SCAN_TRIGGER         = "nba:scan:trigger"
     LIVE_STATE_UPDATE    = "nba:live:state_update"
     LIVE_EXECUTION_QUEUE = "nba:live:execution_queue"
+    LIVE_MICRO_STATE     = "nba:live:micro_state"
 
     def __init__(self, redis_url: Optional[str] = None):
         self._redis_url = redis_url

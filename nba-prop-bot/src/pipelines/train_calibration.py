@@ -44,10 +44,10 @@ def train_isotonic_calibration() -> bool:
     with db.get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT a.edge, a.odds, b.won, a.market
+            SELECT a.edge, a.odds, b.won, a.market, a.raw_model_prob
             FROM alerts_sent a
             JOIN bet_results b ON a.id = b.alert_id
-            WHERE b.push = 0
+            WHERE b.push = FALSE
               AND a.odds IS NOT NULL
               AND a.odds > 1.0
             ORDER BY COALESCE(b.settled_at, a.timestamp) ASC
@@ -62,7 +62,13 @@ def train_isotonic_calibration() -> bool:
     market_data = {}
     for r in rows:
         mkt = r['market']
-        model_prob = max(0.01, min(0.99, float(r['edge']) + 1.0 / float(r['odds'])))
+        # Use stored raw_model_prob when available (correct value);
+        # fall back to legacy reconstruction for historical rows without it.
+        stored_raw = r['raw_model_prob']
+        if stored_raw is not None:
+            model_prob = max(0.01, min(0.99, float(stored_raw)))
+        else:
+            model_prob = max(0.01, min(0.99, float(r['edge']) + 1.0 / float(r['odds'])))
         market_data.setdefault(mkt, []).append((model_prob, float(r['won'])))
         market_data.setdefault('global', []).append((model_prob, float(r['won'])))
 

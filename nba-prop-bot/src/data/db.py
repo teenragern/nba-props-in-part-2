@@ -165,6 +165,8 @@ class DatabaseClient:
                 PRIMARY KEY (player_id, season, game_date)
             )"""),
         (21, "clv_tracking: alert_id", "ALTER TABLE clv_tracking ADD COLUMN alert_id INTEGER REFERENCES alerts_sent(id)"),
+        (22, "alerts_sent: raw_model_prob", "ALTER TABLE alerts_sent ADD COLUMN raw_model_prob REAL"),
+        (23, "alerts_sent: model_prob",     "ALTER TABLE alerts_sent ADD COLUMN model_prob REAL"),
     ]
 
     def _migrate_schema(self, conn):
@@ -204,7 +206,8 @@ class DatabaseClient:
     def insert_alert(self, player_name: str, market: str, line: float, side: str,
                      edge: float, book: str, odds: float, stake: float = 0.0,
                      game_date: str = None, event_id: str = None,
-                     home_away: str = None, rest_days: int = 2) -> int:
+                     home_away: str = None, rest_days: int = 2,
+                     raw_model_prob: float = None, model_prob: float = None) -> int:
         book = normalize_book(book)
         with self.get_conn() as conn:
             cursor = conn.cursor()
@@ -212,11 +215,13 @@ class DatabaseClient:
                 """
                 INSERT INTO alerts_sent
                     (player_name, market, line, side, edge, book, odds, stake,
-                     game_date, event_id, home_away, rest_days)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     game_date, event_id, home_away, rest_days,
+                     raw_model_prob, model_prob)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (player_name, market, line, side, edge, book, odds, stake,
-                 game_date, event_id, home_away, rest_days)
+                 game_date, event_id, home_away, rest_days,
+                 raw_model_prob, model_prob)
             )
             alert_id = cursor.lastrowid
 
@@ -234,7 +239,8 @@ class DatabaseClient:
     def insert_alert_with_limits(self, player_name: str, market: str, line: float, side: str,
                                  edge: float, book: str, odds: float, stake: float,
                                  game_date: str, event_id: str, home_away: str, rest_days: int,
-                                 max_daily_risk: float, max_per_game_risk: float) -> Optional[int]:
+                                 max_daily_risk: float, max_per_game_risk: float,
+                                 raw_model_prob: float = None, model_prob: float = None) -> Optional[int]:
         """
         Atomic check-and-insert: only inserts if the new stake won't exceed
         daily or per-game risk limits. Returns the new alert_id or None.
@@ -266,11 +272,13 @@ class DatabaseClient:
                 """
                 INSERT INTO alerts_sent
                     (player_name, market, line, side, edge, book, odds, stake,
-                     game_date, event_id, home_away, rest_days)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     game_date, event_id, home_away, rest_days,
+                     raw_model_prob, model_prob)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (player_name, market, line, side, edge, book, odds, stake,
-                 game_date, event_id, home_away, rest_days)
+                 game_date, event_id, home_away, rest_days,
+                 raw_model_prob, model_prob)
             )
             alert_id = cursor.lastrowid
 

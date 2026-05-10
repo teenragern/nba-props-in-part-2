@@ -58,7 +58,7 @@ def _fetch_settled(db: DatabaseClient, limit: Optional[int] = None,
     where = " AND ".join(where_clauses)
 
     sql = f"""
-        SELECT (a.edge + 1.0 / a.odds) AS model_prob,
+        SELECT COALESCE(a.raw_model_prob, a.edge + 1.0 / a.odds) AS model_prob,
                CAST(b.won AS INTEGER)   AS outcome
         FROM alerts_sent a
         JOIN bet_results b ON a.id = b.alert_id

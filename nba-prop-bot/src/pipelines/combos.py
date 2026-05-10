@@ -7,11 +7,10 @@ Key changes from V1:
     compressed to match actual hit rates.
   • Per-leg minimums: each leg must independently show ≥5% edge AND
     ≥55% calibrated probability. No more stacking marginal props.
-  • Max legs capped at 3. The math on 4+ leggers doesn't work at current
-    calibration levels (0.55^4 = 9.1% — below break-even on any book).
+  • Max legs capped at 3 for standard combos. 4-leg and 8-leg parlays use
+    a separate path with multi-SGP support (independence + heavy reality
+    tax for 3+ same-game legs where the copula chain breaks).
   • Heavier reality tax: 0.90 for 2-leg, 0.82 for 3-leg.
-  • Slate-wide high-prob parlays (4-leg, 8-leg) removed entirely —
-    they were the primary source of parlay losses.
   • SGPs allowed: same-game OVER/OVER and OVER/UNDER combos are valid.
     Rainbet only bans same-game double-unders (all legs UNDER same match).
   • Legs must come from different players AND different markets
@@ -59,10 +58,13 @@ FOUR_LEG_KELLY_CAP    = 0.006  # hard cap: 0.6% bankroll (midpoint of 0.5–0.75
 
 # ── Slate Ultimate (8-Leg Golden Ticket) ──────────────────────────────────────
 SLATE_ULTIMATE_LEGS      = 8
-SLATE_ULTIMATE_MIN_GAMES = 8      # silent on slates with < 8 qualifying games
-SLATE_ULTIMATE_MAX_INPUT = 12     # top-N games considered in combo search
+SLATE_ULTIMATE_MAX_INPUT = 12     # top-N candidates considered in combo search
 SLATE_ULTIMATE_REALITY   = 0.65  # 8-leg reality dampening (accounts for news, variance)
 SLATE_ULTIMATE_KELLY_CAP = 0.0015 # hard cap: 0.15% bankroll (midpoint of 0.10–0.25%)
+
+# ── Multi-SGP (3+ legs from one game) ────────────────────────────────────────
+MULTI_SGP_LEGS_PER_GAME  = 3      # top-N legs per game for slate ultimate pool
+MULTI_SGP_MAX_PER_EVENT  = 4      # max same-game legs in 4-leg / 8-leg parlays
 
 # Per-leg quality gates — each leg must pass BOTH independently
 PER_LEG_EDGE_MIN    = 0.05   # each leg must show ≥5% edge after calibration
@@ -75,8 +77,12 @@ PER_LEG_IMPLIED_MIN = 0.15   # skip lottery-ticket legs priced below ~15% implie
 # model miscalibration, and unknown unknowns.
 # Cross-game parlays get full tax; SGPs already have Gaussian Copula
 # correlation adjustment so they get a lighter dampening.
-_REALITY_TAX_CROSS: Dict[int, float] = {2: 0.92, 3: 0.82, 4: 0.75}
-_REALITY_TAX_SGP:   Dict[int, float] = {2: 0.96, 3: 0.90, 4: 0.84}
+_REALITY_TAX_CROSS: Dict[int, float] = {2: 0.92, 3: 0.82, 4: 0.75, 5: 0.70, 6: 0.65, 7: 0.62, 8: 0.60}
+_REALITY_TAX_SGP:   Dict[int, float] = {2: 0.96, 3: 0.90, 4: 0.84, 5: 0.78, 6: 0.72, 7: 0.68, 8: 0.65}
+
+# Reality tax for 3+ same-game legs (independence assumption — copula chain breaks at 3+).
+# Heavier than standard taxes to absorb unknown higher-order correlation.
+_REALITY_TAX_MULTI_SGP: Dict[int, float] = {3: 0.78, 4: 0.65, 5: 0.55}
 
 # Market families — legs from the same family are correlated and shouldn't stack
 _MARKET_FAMILY: Dict[str, str] = {
@@ -148,7 +154,7 @@ def _leg_passes_quality_gate(leg: Dict, playoff_mode: bool = False) -> bool:
 _TIP_OFF_WINDOW_SECS = 5400  # 90 minutes
 
 
-def _compatible(legs: List[Dict]) -> bool:
+def _compatible(legs: List[Dict], max_sgp_legs: int = 2) -> bool:
     """
     Return True only when passing structural parlay tests:
       1. Prevent double-dipping same-market families for the SAME player.
@@ -157,6 +163,8 @@ def _compatible(legs: List[Dict]) -> bool:
          is disallowed; OVER/OVER and OVER/UNDER SGPs are fine).
       4. Cross-game legs must tip off within 90 minutes of each other —
          prevents late-scratch risk on games that start hours apart.
+      5. Per-event SGP leg count capped at max_sgp_legs (default 2 for
+         standard combos; 4 for four-leg and slate-ultimate generators).
     """
     player_families: Set[Tuple[str, str]] = set()
 
@@ -165,35 +173,33 @@ def _compatible(legs: List[Dict]) -> bool:
         raw_mkt = leg.get('market', '')
         base_mkt = ALT_TO_BASE_MARKET.get(raw_mkt, raw_mkt)
         family = _MARKET_FAMILY.get(base_mkt, base_mkt)
-        
+
         # Disallow the same player stacking correlated markets (e.g. LeBron PTS and PRA)
         key = (pid, family)
         if key in player_families:
             return False
         player_families.add(key)
 
-    # Group legs by event for the next two checks.
+    # Group legs by event for the next checks.
     event_legs: Dict[str, List] = {}
     for leg in legs:
         eid = leg.get('event_id', '')
         if eid:
             event_legs.setdefault(eid, []).append(leg)
 
-    # Cap SGPs at 2 legs. The bivariate-normal copula chain in _combo_edge
-    # silently breaks at 3+ correlated legs (you cannot feed a joint probability
-    # back in as a marginal — quantile mapping collapses). Cross-game parlays
-    # at 3 legs are unaffected (corr=0 collapses to multiplication).
-    _is_sgp_combo = len(event_legs) == 1 and len(legs) >= 2
-    if _is_sgp_combo and len(legs) > 2:
-        return False
+    # Enforce per-event SGP cap.
+    for eid, ev_legs in event_legs.items():
+        if len(ev_legs) > max_sgp_legs:
+            return False
 
-    # Strong-independent-edge gate for SGP legs: each leg must clear 6% raw
-    # edge on its own. Stops weak singles from being correlation-boosted into
-    # an SGP ticket where the apparent edge is purely a copula artifact.
-    if _is_sgp_combo:
-        for leg in legs:
-            if leg.get('edge', 0.0) < SGP_LEG_MIN_EDGE:
-                return False
+    # Strong-independent-edge gate for same-game leg groups (≥2 from one event).
+    # Each leg must clear 6% raw edge on its own — stops weak singles from being
+    # correlation-boosted into an SGP ticket with phantom edge.
+    for eid, ev_legs in event_legs.items():
+        if len(ev_legs) >= 2:
+            for leg in ev_legs:
+                if leg.get('edge', 0.0) < SGP_LEG_MIN_EDGE:
+                    return False
 
     # Rainbet rule: same-game combos where every leg is UNDER are illegal.
     for ev_legs in event_legs.values():
@@ -221,30 +227,29 @@ def _compatible(legs: List[Dict]) -> bool:
     return True
 
 
-def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
+def _pairwise_joint(
+    legs: List[Dict], db=None, playoff_mode: bool = False,
+) -> Tuple[float, float, float]:
     """
-    Compute joint edge for a combo using CALIBRATED probabilities.
-
-    Dynamically applies Gaussian Copula adjustments for Same-Player, 
-    Same-Team, and Cross-Team SGP sequences. Assumes independence for 
-    cross-game links.
+    Compute joint true/book probability for a group of legs using the
+    pairwise copula chain.  Valid for ≤2 same-game legs; used as a
+    building block by _combo_edge.
     """
-    cal_probs = [leg.get('model_prob', 0.5) if leg.get('calibrated') else calibrate_prob(leg.get('model_prob', 0.5), playoff_mode=playoff_mode) for leg in legs]
+    cal_probs = [
+        leg.get('model_prob', 0.5) if leg.get('calibrated')
+        else calibrate_prob(leg.get('model_prob', 0.5), playoff_mode=playoff_mode)
+        for leg in legs
+    ]
     implied_probs = [leg['implied_prob'] for leg in legs]
 
     joint_true = cal_probs[0]
-    # Mirror the joint_true loop on implied probs to estimate the book's
-    # correlation-adjusted price. Without this, jb = prod(implied_probs)
-    # assumes the book ignores correlation, which manufactures phantom edge
-    # on every correlated SGP (PG ast + C pts, etc.).
     joint_book = implied_probs[0]
-    corr_applied = 0.0
+    corr_sum = 0.0
 
     for i in range(1, len(legs)):
         leg_a, leg_b = legs[i - 1], legs[i]
         corr = 0.0
 
-        # Only inject Copula correlation modeling if both legs share a game context
         if leg_a.get('event_id') and leg_a.get('event_id') == leg_b.get('event_id'):
             pa, pb = leg_a['player_id'], leg_b['player_id']
             ma = ALT_TO_BASE_MARKET.get(leg_a['market'], leg_a['market'])
@@ -252,23 +257,16 @@ def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
             team_a, team_b = leg_a.get('team_name', ''), leg_b.get('team_name', '')
 
             if pa == pb:
-                # Same-player SGP: use tiered lookup (outcome phi → gamelog → league default)
                 corr, _src = get_tiered_correlation(
-                    ma, mb, player_name=pa, db=db,
-                    playoff_mode=playoff_mode,
+                    ma, mb, player_name=pa, db=db, playoff_mode=playoff_mode,
                 )
             elif team_a and team_a == team_b and db is not None:
-                # Same-team, cross-player SGP (e.g. Point Guard Assists + Center Points)
                 db_corr = db.get_cross_player_correlation(team_a, pa, pb, ma, mb)
                 if db_corr is None:
                     db_corr = db.get_cross_player_correlation(team_a, pb, pa, mb, ma)
                 if db_corr is not None:
                     corr = db_corr
             elif team_a and team_b and team_a != team_b:
-                # Cross-team SGP (e.g. finite rebounding logic).
-                # Prefer the matchup's DB record — in playoff_mode with ≥3 series
-                # games, it holds an empirical Pearson. Fall back to the league
-                # default when no record exists.
                 corr = None
                 if db is not None:
                     matchup_key = "|".join(sorted([team_a.lower(), team_b.lower()]))
@@ -278,7 +276,6 @@ def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
                 if corr is None:
                     corr = get_cross_team_default_corr(ma, mb)
 
-        # Copula applied to first pair; subsequent legs sequence via Bivariate Normal
         mean_a = leg_a.get('mean') if i == 1 else None
         line_a = leg_a.get('line') if i == 1 else None
 
@@ -289,26 +286,83 @@ def _combo_edge(legs: List[Dict], db=None, playoff_mode: bool = False) -> Dict:
             side_a=leg_a.get('side', 'OVER'),
             side_b=leg_b.get('side', 'OVER'),
         )
-        # Apply the same correlation to the book's marginals (bivariate normal
-        # path — implied probs have no Poisson mean to feed the copula). For
-        # cross-game legs corr=0 and this collapses to multiplication, matching
-        # the book's independent pricing of true cross-game parlays.
         joint_book = adjust_joint_probability(
             joint_book, implied_probs[i], corr,
             side_a=leg_a.get('side', 'OVER'),
             side_b=leg_b.get('side', 'OVER'),
         )
-        corr_applied += corr
+        corr_sum += corr
 
-    if len(legs) > 1:
-        corr_applied /= (len(legs) - 1)
+    avg_corr = corr_sum / max(len(legs) - 1, 1)
+    return joint_true, joint_book, avg_corr
 
-    jb = joint_book
+
+def _combo_edge(
+    legs: List[Dict], db=None, playoff_mode: bool = False,
+    multi_sgp_tax: bool = False,
+) -> Dict:
+    """
+    Compute joint edge for a combo using CALIBRATED probabilities.
+
+    When multi_sgp_tax=False (default, used by 2-3 leg combos):
+      Sequential pairwise copula chain — same as before.
+
+    When multi_sgp_tax=True (used by 4-leg and 8-leg generators):
+      Groups legs by event_id. For each event group:
+        • ≤2 legs: pairwise copula (mathematically sound).
+        • 3+ legs: prod(marginals) with _REALITY_TAX_MULTI_SGP applied
+          (copula chain breaks at 3+; heavy tax absorbs unknown correlation).
+      Cross-game groups are multiplied (true independence).
+    """
+    if not multi_sgp_tax:
+        # Original path for 2-3 leg combos — unchanged behaviour.
+        jt, jb, avg_corr = _pairwise_joint(legs, db=db, playoff_mode=playoff_mode)
+        return {
+            'joint_true_prob':     jt,
+            'joint_book_prob':     jb,
+            'sgp_edge':            jt - jb,
+            'correlation_applied': avg_corr,
+        }
+
+    # ── Group-based path for multi-SGP parlays ──────────────────────────
+    event_groups: Dict[str, List[Dict]] = {}
+    for leg in legs:
+        eid = leg.get('event_id', '') or 'unknown'
+        event_groups.setdefault(eid, []).append(leg)
+
+    joint_true = 1.0
+    joint_book = 1.0
+    total_corr = 0.0
+    n_pairs = 0
+
+    for eid, group in event_groups.items():
+        if len(group) <= 2:
+            # Pairwise copula — mathematically sound for ≤2.
+            gt, gb, gc = _pairwise_joint(group, db=db, playoff_mode=playoff_mode)
+        else:
+            # 3+ same-game legs: independence assumption + multi-SGP tax.
+            cal_probs = [
+                leg.get('model_prob', 0.5) if leg.get('calibrated')
+                else calibrate_prob(leg.get('model_prob', 0.5), playoff_mode=playoff_mode)
+                for leg in group
+            ]
+            implied = [leg['implied_prob'] for leg in group]
+            tax = _REALITY_TAX_MULTI_SGP.get(len(group), 0.55)
+            gt = prod(cal_probs) * tax
+            gb = prod(implied)
+            gc = 0.0
+
+        joint_true *= gt
+        joint_book *= gb
+        total_corr += gc
+        n_pairs += max(len(group) - 1, 0)
+
+    avg_corr = total_corr / max(n_pairs, 1)
     return {
         'joint_true_prob':     joint_true,
-        'joint_book_prob':     jb,
-        'sgp_edge':            joint_true - jb,
-        'correlation_applied': corr_applied,
+        'joint_book_prob':     joint_book,
+        'sgp_edge':            joint_true - joint_book,
+        'correlation_applied': avg_corr,
     }
 
 
@@ -352,6 +406,12 @@ def _same_player_pairs_have_data(legs: List[Dict], db, min_samples: int = 30) ->
     Pairs with no data block the combo — we won't build a 4-leg ticket whose
     edge depends on a league-default correlation we've never verified.
     """
+    has_same_player = any(
+        legs[i]['player_id'] == legs[j]['player_id']
+        for i in range(len(legs)) for j in range(i + 1, len(legs))
+    )
+    if not has_same_player:
+        return True  # no same-player pairs — nothing to verify
     if db is None:
         return False  # can't verify without DB
     for i, leg_a in enumerate(legs):
@@ -421,6 +481,16 @@ def _format_four_leg_parlay(
     return "\n".join(lines)
 
 
+def _has_multi_sgp_group(legs: List[Dict]) -> bool:
+    """Return True if any event has 3+ legs (multi-SGP territory)."""
+    counts: Dict[str, int] = {}
+    for leg in legs:
+        eid = leg.get('event_id', '')
+        if eid:
+            counts[eid] = counts.get(eid, 0) + 1
+    return any(c >= 3 for c in counts.values())
+
+
 def generate_four_leg_parlays(
     actionable: List[Dict[str, Any]],
     bot: TelegramBotClient,
@@ -428,16 +498,20 @@ def generate_four_leg_parlays(
     playoff_mode: bool = False,
 ) -> None:
     """
-    Generate up to 2 non-overlapping 4-leg parlays per day.
+    Generate up to FOUR_LEG_MAX_TICKETS non-overlapping 4-leg parlays per day.
+
+    Allows multiple legs from the same game (up to MULTI_SGP_MAX_PER_EVENT)
+    so that parlays are produced even on thin slates.
 
     Architecture:
-      • Each leg must pass the standard quality gate (≥60% cal prob, ≥5% edge).
+      • Each leg must pass the standard quality gate (≥55% cal prob, ≥5% edge).
       • Ticket 1 uses the highest-EV legs; ticket 2 draws from the remainder.
       • No player may appear in more than one ticket (excluded_players set).
-      • Uses existing _compatible() — SGPs allowed, tip-off window enforced.
-      • Reality tax: 0.75 (tighter than 3-leg due to compounding variance).
+      • Uses _compatible(max_sgp_legs=MULTI_SGP_MAX_PER_EVENT).
+      • For 3+ same-game leg groups: independence + _REALITY_TAX_MULTI_SGP.
+      • For ≤2 same-game legs: pairwise copula (unchanged).
+      • Overall reality tax: FOUR_LEG_REALITY_TAX applied on top.
       • Kelly staking: hard cap at 0.6% of bankroll.
-      • At most FOUR_LEG_MAX_TICKETS tickets queued per calendar day.
     """
     already_sent = _four_leg_sent_today_count(db)
     remaining_slots = FOUR_LEG_MAX_TICKETS - already_sent
@@ -472,16 +546,17 @@ def generate_four_leg_parlays(
         best: Dict = {}
         for combo in combinations(available, 4):
             legs = list(combo)
-            if not _compatible(legs):
+            if not _compatible(legs, max_sgp_legs=MULTI_SGP_MAX_PER_EVENT):
                 continue
-            # Require empirical correlation support for any same-player pairs.
-            # Cross-game independent pairs need no data (ρ=0 is exact).
-            if not _same_player_pairs_have_data(legs, db):
+            # Require empirical correlation data only for ≤2 same-game pairs
+            # where the copula is actually used.  For 3+ same-game groups the
+            # independence + heavy tax path doesn't rely on correlation data.
+            if not _has_multi_sgp_group(legs) and not _same_player_pairs_have_data(legs, db):
                 continue
 
-            # Use the copula-aware joint probability (correlation-adjusted for
-            # same-game pairs; collapses to multiplication for true cross-game).
-            result      = _combo_edge(legs, db=db, playoff_mode=playoff_mode)
+            # Group-aware joint probability: copula for ≤2 same-game legs,
+            # independence + multi-SGP tax for 3+ same-game legs.
+            result      = _combo_edge(legs, db=db, playoff_mode=playoff_mode, multi_sgp_tax=True)
             raw_joint   = result.get('joint_true_prob', 0)
             jt          = raw_joint * FOUR_LEG_REALITY_TAX
             jb          = result.get('joint_book_prob', 0)
@@ -582,12 +657,18 @@ def generate_slate_ultimate(
     """
     Generate and queue exactly one 8-leg 'Slate Ultimate' Golden Ticket per day.
 
+    Allows multiple legs per game (up to MULTI_SGP_MAX_PER_EVENT) so that
+    a Golden Ticket is produced even on thin slates with only 2-3 games.
+
     Architecture:
-      • One leg per game (event_id). True independence; no copula needed.
-      • Each leg must pass the standard quality gate (≥60% cal prob, ≥5% edge).
-      • Requires ≥8 games with qualifying legs — silent on low-volume slates.
-      • Per-leg selection: best leg per game by risk_adjusted_ev.
-      • Reality tax: 0.65 (more conservative than 2-3 leg combos).
+      • Up to MULTI_SGP_LEGS_PER_GAME best legs per game pooled as candidates.
+      • Each leg must pass the standard quality gate (≥55% cal prob, ≥5% edge).
+      • Requires ≥8 qualifying legs (not games) in the pool.
+      • Same player allowed in multiple legs if different market families
+        (enforced by _compatible).
+      • For ≤2 same-game legs: pairwise copula.
+      • For 3+ same-game legs: independence + _REALITY_TAX_MULTI_SGP.
+      • Overall reality tax: SLATE_ULTIMATE_REALITY applied on top.
       • Kelly staking: hard cap at 0.15% of bankroll.
       • Fires at most once per day (deduplication via pending_alerts).
     """
@@ -597,26 +678,33 @@ def generate_slate_ultimate(
 
     parlay_eligible = [e for e in actionable if _leg_passes_quality_gate(e, playoff_mode=playoff_mode)]
 
-    # One best leg per game
-    best_per_game: Dict[str, Dict] = {}
+    # Collect top-N legs per game (allows multiple legs from the same game).
+    top_n_per_game: Dict[str, List[Dict]] = {}
     for leg in parlay_eligible:
         eid = leg.get('event_id', '')
         if not eid:
             continue
-        existing = best_per_game.get(eid)
-        if existing is None or leg.get('risk_adjusted_ev', 0) > existing.get('risk_adjusted_ev', 0):
-            best_per_game[eid] = leg
+        top_n_per_game.setdefault(eid, []).append(leg)
 
-    if len(best_per_game) < SLATE_ULTIMATE_MIN_GAMES:
+    candidates: List[Dict] = []
+    for eid, game_legs in top_n_per_game.items():
+        sorted_legs = sorted(
+            game_legs,
+            key=lambda e: e.get('risk_adjusted_ev', 0),
+            reverse=True,
+        )
+        candidates.extend(sorted_legs[:MULTI_SGP_LEGS_PER_GAME])
+
+    if len(candidates) < SLATE_ULTIMATE_LEGS:
         logger.info(
-            f"Slate Ultimate: only {len(best_per_game)} qualifying games "
-            f"(need ≥{SLATE_ULTIMATE_MIN_GAMES}). Silent today."
+            f"Slate Ultimate: only {len(candidates)} qualifying legs "
+            f"(need ≥{SLATE_ULTIMATE_LEGS}). Silent today."
         )
         return
 
-    # Sort by ev and take the top-N games for the combination search
+    # Cap pool to limit combinatorial search
     candidates = sorted(
-        best_per_game.values(),
+        candidates,
         key=lambda e: e.get('risk_adjusted_ev', 0),
         reverse=True,
     )[:SLATE_ULTIMATE_MAX_INPUT]
@@ -625,15 +713,14 @@ def generate_slate_ultimate(
     for combo in combinations(candidates, SLATE_ULTIMATE_LEGS):
         legs = list(combo)
 
-        # Unique-player guard (same player could theoretically appear in two games)
-        if len({l['player_id'] for l in legs}) < len(legs):
+        if not _compatible(legs, max_sgp_legs=MULTI_SGP_MAX_PER_EVENT):
             continue
 
-        cal_probs     = [l.get('model_prob', 0.5) if l.get('calibrated') else calibrate_prob(l.get('model_prob', 0.5), playoff_mode=playoff_mode) for l in legs]
-        implied_probs = [l['implied_prob'] for l in legs]
-
-        jt         = prod(cal_probs) * SLATE_ULTIMATE_REALITY
-        jb         = prod(implied_probs)
+        # Group-aware joint probability (copula for ≤2, independence+tax for 3+)
+        result     = _combo_edge(legs, db=db, playoff_mode=playoff_mode, multi_sgp_tax=True)
+        raw_joint  = result.get('joint_true_prob', 0)
+        jt         = raw_joint * SLATE_ULTIMATE_REALITY
+        jb         = result.get('joint_book_prob', 0)
         joint_edge = jt - jb
 
         if joint_edge <= 0:

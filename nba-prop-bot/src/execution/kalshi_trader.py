@@ -26,6 +26,9 @@ Environment:
     LIVE_SIGNAL_LATENCY_LIMIT    Max signal age in seconds (default: 1.5)
     LIVE_WASH_COOLDOWN           Min seconds between actions on same ticker (default: 2.0)
     EXECUTION_MODE               "paper" (default) or "live"
+    EXECUTION_STYLE              "maker" (default, resting limit) or "taker" (cross spread)
+    ORDER_POLL_INTERVAL          Seconds between pending order status checks (default: 5.0)
+    ORDER_POLL_TIMEOUT           Seconds before a resting order is auto-cancelled (default: 120.0)
 
 Run:
     python -m src.execution.kalshi_trader
@@ -51,9 +54,43 @@ _MAX_EXPOSURE     = float(os.getenv("LIVE_MAX_EXPOSURE_PER_TEAM", "100.0"))
 _LATENCY_LIMIT    = float(os.getenv("LIVE_SIGNAL_LATENCY_LIMIT",  "1.5"))
 _WASH_COOLDOWN    = float(os.getenv("LIVE_WASH_COOLDOWN",          "2.0"))
 _EXECUTION_MODE   = os.getenv("EXECUTION_MODE", "paper").lower()
+_EXECUTION_STYLE  = os.getenv("EXECUTION_STYLE", "maker").lower()  # "maker", "taker", or "l2"
+_ORDER_POLL_INTERVAL = float(os.getenv("ORDER_POLL_INTERVAL", "5.0"))
+_ORDER_POLL_TIMEOUT  = float(os.getenv("ORDER_POLL_TIMEOUT", "120.0"))
+
+# L2 Execution Engine (lazy import to avoid circular deps)
+_l2_engine = None
+
+def _get_l2_engine(exchange: 'ExchangeClient'):
+    """Lazily initialize the L2 execution engine."""
+    global _l2_engine
+    if _l2_engine is None:
+        from src.execution.l2_execution import L2ExecutionEngine
+        _l2_engine = L2ExecutionEngine(exchange)
+    return _l2_engine
 
 
 # ── In-process session state ──────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class PendingOrder:
+    """Tracks an order submitted to the exchange awaiting fill confirmation."""
+    order_id: str
+    ticker: str
+    game_id: str
+    team: str
+    side: str
+    action: str           # "buy" or "sell"
+    total_contracts: int
+    price_cents: int
+    model_prob: float
+    kalshi_price: float
+    edge: float
+    stake_usd: float
+    avg_entry_cents: Optional[int]  # only for sell orders — entry price
+    submitted_at: float
+    filled_so_far: int = 0
+
 
 @dataclasses.dataclass
 class TraderState:
@@ -64,6 +101,28 @@ class TraderState:
     session_id: str = dataclasses.field(
         default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d")
     )
+    # order_id → PendingOrder (live mode only)
+    pending_orders: Dict[str, PendingOrder] = dataclasses.field(default_factory=dict)
+
+
+# ── Limit price helpers ──────────────────────────────────────────────────────
+
+def _compute_limit_price_cents(
+    model_prob: float, kalshi_price: float, style: str,
+) -> int:
+    """Compute buy limit price. Maker posts at fair value; taker crosses spread."""
+    if style == "maker":
+        return max(1, min(99, int(model_prob * 100)))
+    return max(1, min(99, int(kalshi_price * 100) + 1))
+
+
+def _compute_sell_price_cents(
+    model_prob: float, kalshi_price: float, style: str,
+) -> int:
+    """Compute sell limit price. Maker posts at fair value; taker floors 2% below bid."""
+    if style == "maker":
+        return max(1, min(99, int(model_prob * 100)))
+    return max(1, int(kalshi_price * 100 * 0.98))
 
 
 # ── Circuit breakers ──────────────────────────────────────────────────────────
@@ -182,6 +241,31 @@ def _delete_position_sync(ticker: str, db) -> None:
             conn.execute("DELETE FROM live_positions WHERE ticker = %s", (ticker,))
     except Exception as e:
         logger.error(f"kalshi_trader: failed to delete live_positions for {ticker}: {e}")
+
+
+def _reduce_position_sync(ticker: str, filled_contracts: int, db) -> None:
+    """Reduce contracts in live_positions by filled_contracts. Delete if zero."""
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT contracts FROM live_positions WHERE ticker = %s",
+                (ticker,),
+            ).fetchone()
+            if not row:
+                return
+            remaining = row[0] - filled_contracts
+            if remaining <= 0:
+                conn.execute("DELETE FROM live_positions WHERE ticker = %s", (ticker,))
+            else:
+                conn.execute(
+                    """UPDATE live_positions
+                       SET contracts = %s,
+                           total_stake_usd = total_stake_usd * (%s::real / (%s + %s)::real)
+                       WHERE ticker = %s""",
+                    (remaining, remaining, remaining, filled_contracts, ticker),
+                )
+    except Exception as e:
+        logger.error(f"kalshi_trader: failed to reduce position for {ticker}: {e}")
 
 
 def _get_position_sync(ticker: str, db) -> Optional[dict]:
@@ -305,9 +389,50 @@ async def execute_buy(
         return False
 
     # ── Order placement ───────────────────────────────────────────────
-    limit_cents = max(1, min(99, int(kalshi_price * 100) + 1))  # ask + 1¢ taker
+    limit_cents = _compute_limit_price_cents(model_prob, kalshi_price, _EXECUTION_STYLE)
 
-    if _EXECUTION_MODE == "live":
+    if _EXECUTION_MODE == "live" and _EXECUTION_STYLE == "l2":
+        # ── L2 Order Book Execution (TWAP/Passive) ────────────────────
+        l2_engine = _get_l2_engine(exchange)
+        price_frac = limit_cents / 100.0
+        total_contracts = max(1, int(stake_usd / price_frac))
+
+        result = await l2_engine.execute_order(
+            ticker=ticker, side=side, action="buy",
+            total_contracts=total_contracts,
+            model_prob=model_prob, kalshi_price=kalshi_price, edge=edge,
+        )
+
+        if result.total_contracts_filled == 0:
+            reason = f"L2 execution: 0 fills ({result.strategy.value} strategy)"
+            await _log_rejection(sig, reason, db, state)
+            return False
+
+        contracts = result.total_contracts_filled
+        fill_price_cents = int(result.avg_fill_price_cents)
+        actual_cost = contracts * (fill_price_cents / 100.0)
+        order_id = result.tranches[0].order_id if result.tranches else f"l2-{int(time.time())}"
+
+        # L2 fills are confirmed immediately — persist position
+        await asyncio.to_thread(
+            _upsert_position_sync,
+            ticker, game_id, team, side, contracts, fill_price_cents, actual_cost, order_id, db,
+        )
+        await asyncio.to_thread(
+            _insert_trade_sync,
+            ticker, game_id, team, side, "buy", contracts, fill_price_cents, actual_cost,
+            model_prob, kalshi_price, edge, order_id, state.session_id, None, None, db,
+        )
+        logger.info(
+            f"kalshi_trader [l2]: BUY executed — {ticker} {side.upper()} "
+            f"{fill_price_cents}¢ x {contracts} contracts (${actual_cost:.2f}) "
+            f"strategy={result.strategy.value} fill_rate={result.fill_rate:.0%} "
+            f"duration={result.total_duration_seconds:.1f}s"
+        )
+        state.last_action_ts[ticker] = time.time()
+        return True
+
+    elif _EXECUTION_MODE == "live":
         order = await asyncio.to_thread(
             exchange.place_order, ticker, side, limit_cents, stake_usd
         )
@@ -327,23 +452,39 @@ async def execute_buy(
     actual_cost = contracts * (limit_cents / 100.0)
 
     # ── Persist ───────────────────────────────────────────────────────
-    await asyncio.to_thread(
-        _upsert_position_sync,
-        ticker, game_id, team, side, contracts, limit_cents, actual_cost, order_id, db,
-    )
-    await asyncio.to_thread(
-        _insert_trade_sync,
-        ticker, game_id, team, side, "buy", contracts, limit_cents, actual_cost,
-        model_prob, kalshi_price, edge, order_id, state.session_id, None, None, db,
-    )
+    if _EXECUTION_MODE == "live":
+        # Defer position update — fill polling will confirm actual fills
+        pending = PendingOrder(
+            order_id=order_id, ticker=ticker, game_id=game_id, team=team,
+            side=side, action="buy", total_contracts=contracts,
+            price_cents=limit_cents, model_prob=model_prob,
+            kalshi_price=kalshi_price, edge=edge, stake_usd=stake_usd,
+            avg_entry_cents=None, submitted_at=time.time(),
+        )
+        state.pending_orders[order_id] = pending
+        logger.info(
+            f"kalshi_trader [live]: BUY submitted — {ticker} {side.upper()} "
+            f"{limit_cents}¢ x {contracts} contracts (${actual_cost:.2f}) "
+            f"order_id={order_id} — tracking for fill"
+        )
+    else:
+        # Paper mode — assume immediate full fill
+        await asyncio.to_thread(
+            _upsert_position_sync,
+            ticker, game_id, team, side, contracts, limit_cents, actual_cost, order_id, db,
+        )
+        await asyncio.to_thread(
+            _insert_trade_sync,
+            ticker, game_id, team, side, "buy", contracts, limit_cents, actual_cost,
+            model_prob, kalshi_price, edge, order_id, state.session_id, None, None, db,
+        )
+        logger.info(
+            f"kalshi_trader [paper]: BUY executed — {ticker} {side.upper()} "
+            f"{limit_cents}¢ x {contracts} contracts (${actual_cost:.2f}) "
+            f"order_id={order_id}"
+        )
 
     state.last_action_ts[ticker] = time.time()
-
-    logger.info(
-        f"kalshi_trader [{_EXECUTION_MODE}]: BUY executed — {ticker} {side.upper()} "
-        f"{limit_cents}¢ x {contracts} contracts (${actual_cost:.2f}) "
-        f"order_id={order_id}"
-    )
     return True
 
 
@@ -398,10 +539,48 @@ async def execute_sell(
         )
         side = open_side
 
-    # Floor: 2% below current bid to accept a quick fill.
-    min_price_cents = max(1, int(kalshi_price * 100 * 0.98))
+    min_price_cents = _compute_sell_price_cents(model_prob, kalshi_price, _EXECUTION_STYLE)
 
-    if _EXECUTION_MODE == "live":
+    if _EXECUTION_MODE == "live" and _EXECUTION_STYLE == "l2":
+        # ── L2 Order Book Execution for SELL ──────────────────────────
+        l2_engine = _get_l2_engine(exchange)
+        result = await l2_engine.execute_order(
+            ticker=ticker, side=side, action="sell",
+            total_contracts=contracts,
+            model_prob=model_prob, kalshi_price=kalshi_price, edge=edge,
+        )
+
+        if result.total_contracts_filled == 0:
+            reason = f"L2 sell execution: 0 fills ({result.strategy.value} strategy)"
+            await _log_rejection(sig, reason, db, state)
+            return False
+
+        filled = result.total_contracts_filled
+        fill_cents = int(result.avg_fill_price_cents)
+        realized_pnl = (fill_cents - avg_price_cents) / 100.0 * filled
+
+        if filled >= contracts:
+            await asyncio.to_thread(_delete_position_sync, ticker, db)
+        else:
+            await asyncio.to_thread(_reduce_position_sync, ticker, filled, db)
+
+        order_id = result.tranches[0].order_id if result.tranches else f"l2-sell-{int(time.time())}"
+        await asyncio.to_thread(
+            _insert_trade_sync,
+            ticker, game_id, team, side, "sell", filled, fill_cents,
+            0.0, model_prob, kalshi_price, edge, order_id,
+            state.session_id, None, realized_pnl, db,
+        )
+        logger.info(
+            f"kalshi_trader [l2]: SELL executed — {ticker} {side.upper()} "
+            f"{fill_cents}¢ x {filled} contracts | "
+            f"avg_entry={avg_price_cents}¢ | realized_pnl=${realized_pnl:+.2f} "
+            f"strategy={result.strategy.value} duration={result.total_duration_seconds:.1f}s"
+        )
+        state.last_action_ts[ticker] = time.time()
+        return True
+
+    elif _EXECUTION_MODE == "live":
         order = await asyncio.to_thread(
             exchange.sell_position, ticker, side, contracts, min_price_cents
         )
@@ -419,29 +598,156 @@ async def execute_sell(
 
     order_data = order.get("order", {})
     order_id   = str(order_data.get("order_id", ""))
-    fill_cents = min_price_cents   # assume filled at limit for P&L calculation
-
-    realized_pnl = (fill_cents - avg_price_cents) / 100.0 * contracts
 
     # ── Persist ───────────────────────────────────────────────────────
-    await asyncio.to_thread(_delete_position_sync, ticker, db)
-    await asyncio.to_thread(
-        _insert_trade_sync,
-        ticker, game_id, team, side, "sell", contracts, fill_cents,
-        0.0,   # no new stake on sell
-        model_prob, kalshi_price, edge, order_id,
-        state.session_id, None, realized_pnl, db,
-    )
+    if _EXECUTION_MODE == "live":
+        # Defer position update — fill polling will confirm actual fills
+        pending = PendingOrder(
+            order_id=order_id, ticker=ticker, game_id=game_id, team=team,
+            side=side, action="sell", total_contracts=contracts,
+            price_cents=min_price_cents, model_prob=model_prob,
+            kalshi_price=kalshi_price, edge=edge, stake_usd=0.0,
+            avg_entry_cents=avg_price_cents, submitted_at=time.time(),
+        )
+        state.pending_orders[order_id] = pending
+        logger.info(
+            f"kalshi_trader [live]: SELL submitted — {ticker} {side.upper()} "
+            f"{min_price_cents}¢ x {contracts} contracts | "
+            f"avg_entry={avg_price_cents}¢ | order_id={order_id} — tracking for fill"
+        )
+    else:
+        # Paper mode — assume immediate full fill
+        fill_cents = min_price_cents
+        realized_pnl = (fill_cents - avg_price_cents) / 100.0 * contracts
+        await asyncio.to_thread(_delete_position_sync, ticker, db)
+        await asyncio.to_thread(
+            _insert_trade_sync,
+            ticker, game_id, team, side, "sell", contracts, fill_cents,
+            0.0, model_prob, kalshi_price, edge, order_id,
+            state.session_id, None, realized_pnl, db,
+        )
+        logger.info(
+            f"kalshi_trader [paper]: SELL executed — {ticker} {side.upper()} "
+            f"{fill_cents}¢ x {contracts} contracts | "
+            f"avg_entry={avg_price_cents}¢ | realized_pnl=${realized_pnl:+.2f} "
+            f"order_id={order_id}"
+        )
 
     state.last_action_ts[ticker] = time.time()
-
-    logger.info(
-        f"kalshi_trader [{_EXECUTION_MODE}]: SELL executed — {ticker} {side.upper()} "
-        f"{fill_cents}¢ x {contracts} contracts | "
-        f"avg_entry={avg_price_cents}¢ | realized_pnl=${realized_pnl:+.2f} "
-        f"order_id={order_id}"
-    )
     return True
+
+
+# ── Partial fill processing ───────────────────────────────────────────────────
+
+async def _process_fill(
+    pending: PendingOrder,
+    filled_count: int,
+    status: str,
+    state: TraderState,
+    db,
+) -> None:
+    """Process a (partial or full) fill for a pending order."""
+    if filled_count <= 0:
+        return
+
+    if pending.action == "buy":
+        actual_cost = filled_count * (pending.price_cents / 100.0)
+        await asyncio.to_thread(
+            _upsert_position_sync,
+            pending.ticker, pending.game_id, pending.team, pending.side,
+            filled_count, pending.price_cents, actual_cost, pending.order_id, db,
+        )
+        await asyncio.to_thread(
+            _insert_trade_sync,
+            pending.ticker, pending.game_id, pending.team, pending.side,
+            "buy", filled_count, pending.price_cents, actual_cost,
+            pending.model_prob, pending.kalshi_price, pending.edge,
+            pending.order_id, state.session_id, None, None, db,
+        )
+        logger.info(
+            f"kalshi_trader: BUY fill — {pending.ticker} {filled_count} contracts "
+            f"at {pending.price_cents}¢ (status={status})"
+        )
+
+    elif pending.action == "sell":
+        avg_entry = pending.avg_entry_cents or 0
+        realized_pnl = (pending.price_cents - avg_entry) / 100.0 * filled_count
+        await asyncio.to_thread(_reduce_position_sync, pending.ticker, filled_count, db)
+        await asyncio.to_thread(
+            _insert_trade_sync,
+            pending.ticker, pending.game_id, pending.team, pending.side,
+            "sell", filled_count, pending.price_cents, 0.0,
+            pending.model_prob, pending.kalshi_price, pending.edge,
+            pending.order_id, state.session_id, None, realized_pnl, db,
+        )
+        logger.info(
+            f"kalshi_trader: SELL fill — {pending.ticker} {filled_count} contracts "
+            f"realized_pnl=${realized_pnl:+.2f} (status={status})"
+        )
+
+
+async def _poll_pending_orders(
+    state: TraderState,
+    exchange: ExchangeClient,
+    db,
+    shutdown: asyncio.Event,
+) -> None:
+    """Background task that polls pending order status and processes fills."""
+    while not shutdown.is_set():
+        try:
+            await asyncio.sleep(_ORDER_POLL_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+        if not state.pending_orders:
+            continue
+
+        completed = []
+        for order_id, pending in list(state.pending_orders.items()):
+            try:
+                status_data = await asyncio.to_thread(
+                    exchange.get_order_status, order_id
+                )
+                if status_data is None:
+                    continue
+
+                status = status_data.get("status", "")
+                total = status_data.get("count", pending.total_contracts)
+                remaining = status_data.get("remaining_count", total)
+                filled = total - remaining
+
+                if status == "executed":
+                    new_fills = filled - pending.filled_so_far
+                    await _process_fill(pending, new_fills, status, state, db)
+                    completed.append(order_id)
+
+                elif status == "canceled":
+                    new_fills = filled - pending.filled_so_far
+                    if new_fills > 0:
+                        await _process_fill(pending, new_fills, status, state, db)
+                    else:
+                        logger.info(f"kalshi_trader: order {order_id} cancelled with 0 fills")
+                    completed.append(order_id)
+
+                elif status == "resting":
+                    new_fills = filled - pending.filled_so_far
+                    if new_fills > 0:
+                        await _process_fill(pending, new_fills, "partial", state, db)
+                        pending.filled_so_far = filled
+
+                    # Cancel stale orders
+                    age = time.time() - pending.submitted_at
+                    if age > _ORDER_POLL_TIMEOUT:
+                        logger.info(
+                            f"kalshi_trader: order {order_id} stale ({age:.0f}s) — cancelling"
+                        )
+                        await asyncio.to_thread(exchange.cancel_order, order_id)
+
+            except Exception as e:
+                logger.error(f"kalshi_trader: error polling order {order_id}: {e}")
+
+        for oid in completed:
+            del state.pending_orders[oid]
 
 
 # ── Main event loop ───────────────────────────────────────────────────────────
@@ -484,9 +790,14 @@ async def main() -> None:
 
     logger.info(
         f"kalshi_trader: started in {_EXECUTION_MODE.upper()} mode "
-        f"(max_exposure=${_MAX_EXPOSURE:.0f}, "
+        f"(style={_EXECUTION_STYLE}, max_exposure=${_MAX_EXPOSURE:.0f}, "
         f"latency_limit={_LATENCY_LIMIT}s, "
         f"wash_cooldown={_WASH_COOLDOWN}s)"
+    )
+
+    # Background fill-polling task (only meaningful in live mode)
+    poll_task = asyncio.create_task(
+        _poll_pending_orders(state, exchange, db, shutdown)
     )
 
     while not shutdown.is_set():
@@ -507,6 +818,12 @@ async def main() -> None:
                 logger.warning(f"kalshi_trader: unknown signal action '{action}' — ignoring")
         except Exception as e:
             logger.error(f"kalshi_trader: unhandled error on {action} {sig.get('ticker','?')}: {e}")
+
+    poll_task.cancel()
+    try:
+        await poll_task
+    except asyncio.CancelledError:
+        pass
 
     logger.info("kalshi_trader: stopped.")
 

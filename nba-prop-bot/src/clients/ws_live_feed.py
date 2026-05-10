@@ -95,6 +95,7 @@ def _parse_message(raw: str) -> Optional[dict]:
                 "player_name": data.get("player_name", ""),
                 "event_type":  data.get("event", ""),
                 "value":       data.get("value", 0),
+                "team":        data.get("team", ""),
             },
         }
 

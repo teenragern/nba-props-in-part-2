@@ -95,7 +95,9 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
     book TEXT,
     odds REAL,
     stake REAL DEFAULT 0.0,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    raw_model_prob REAL,
+    model_prob REAL
 );
 
 CREATE TABLE IF NOT EXISTS bet_results (

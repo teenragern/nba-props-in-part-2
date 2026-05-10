@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 
 from src.config import BANKROLL
 from src.utils.logging_utils import get_logger
+from src.execution.kalshi_adapter import try_place_kalshi_trade
 
 logger = get_logger(__name__)
 
@@ -169,7 +170,49 @@ def record_execution(
     game_date = edge_data.get('game_date')
     today    = _session_id()
 
-    if EXECUTION_MODE == 'paper':
+    # LIVE mode execution
+    if EXECUTION_MODE == 'live':
+        logger.info(f"Live execution requested for {player} {market} {side} {line}")
+        
+        # Determine max stake for Kalshi
+        kalshi_max = float(os.getenv('KALSHI_MAX_STAKE', '5.00'))
+        
+        # Try placing trade on Kalshi
+        result = try_place_kalshi_trade(edge_data, max_stake=kalshi_max)
+        
+        if result:
+            fill_odds = result['fill_odds']
+            slippage  = fill_odds - alerted_odds
+            
+            logger.info(
+                f"LIVE FILL (Kalshi): {player} {market} {side} — "
+                f"alerted={alerted_odds:.3f} fill={fill_odds:.3f} slippage={slippage:+.4f}"
+            )
+            
+            try:
+                with db.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO placed_bets
+                            (alert_id, mode, player_name, market, side, line, book,
+                             alerted_odds, fill_odds, slippage, stake, game_date, session_id)
+                        VALUES (?, 'live', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (alert_id, player, market, side, line, 'kalshi',
+                         alerted_odds, fill_odds, slippage, kalshi_max, game_date, today),
+                    )
+                return True
+            except Exception as e:
+                logger.error(f"Live bet record failed: {e}")
+                return False
+                
+        # If live execution failed or skipped (no edge, unsupported market, etc), fall through to paper
+        logger.info(f"Live execution skipped/failed for {player}. Falling back to paper mode.")
+        EXECUTION_MODE_FALLBACK = 'paper'
+    else:
+        EXECUTION_MODE_FALLBACK = EXECUTION_MODE
+
+    if EXECUTION_MODE_FALLBACK == 'paper':
         fill_odds = _best_fill_odds(db, player, market, side, line)
         slippage  = (fill_odds - alerted_odds) if fill_odds else None
         logger.info(
@@ -197,11 +240,6 @@ def record_execution(
             logger.error(f"Paper bet record failed: {e}")
             return False
 
-    # LIVE mode — stub.  Wire sportsbook adapter here.
-    logger.warning(
-        "LIVE execution mode is not yet implemented. "
-        "Switch EXECUTION_MODE=paper until sportsbook adapters are wired."
-    )
     return False
 
 

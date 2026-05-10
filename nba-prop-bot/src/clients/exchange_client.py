@@ -216,6 +216,65 @@ class ExchangeClient:
         )
         return self._post("/portfolio/orders", body)
 
+    def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Query the status of an existing order.
+
+        GET /portfolio/orders/{order_id}
+
+        Returns dict with order_id, status, ticker, action, side,
+        remaining_count, count.  filled = count - remaining_count.
+
+        Kalshi statuses: "resting", "executed", "canceled", "pending".
+        """
+        if not self._enabled:
+            return None
+        data = self._get(f"/portfolio/orders/{order_id}", {})
+        if not data:
+            return None
+        order = data.get("order", {})
+        return {
+            "order_id":        str(order.get("order_id", "")),
+            "status":          order.get("status", ""),
+            "ticker":          order.get("ticker", ""),
+            "action":          order.get("action", ""),
+            "side":            order.get("side", ""),
+            "remaining_count": int(order.get("remaining_count", 0)),
+            "count":           int(order.get("count", 0)),
+        }
+
+    def cancel_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Cancel a resting order.  DELETE /portfolio/orders/{order_id}."""
+        if not self._enabled:
+            return None
+        return self._delete(f"/portfolio/orders/{order_id}")
+
+    def get_order_book(self, ticker: str, depth: int = 10) -> Optional[Dict[str, Any]]:
+        """
+        Fetch L2 order book for a market.
+
+        GET /markets/{ticker}/orderbook?depth={depth}
+
+        Returns:
+            {
+                "yes": [{"price": int (cents), "quantity": int}, ...],
+                "no":  [{"price": int (cents), "quantity": int}, ...],
+            }
+            Price levels are sorted best-first (descending for bids).
+            Returns None if client is disabled or request fails.
+        """
+        if not self._enabled:
+            return None
+
+        data = self._get(f"/markets/{ticker}/orderbook", {"depth": depth})
+        if not data:
+            return None
+
+        return {
+            "yes": data.get("yes", []),
+            "no": data.get("no", []),
+        }
+
     def search_markets(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
         """
         Full-text search across Kalshi market titles.
@@ -277,6 +336,29 @@ class ExchangeClient:
             return None
         except Exception as e:
             logger.warning(f"ExchangeClient: POST failed {url}: {e}")
+            return None
+
+    def _delete(self, path: str) -> Optional[Dict]:
+        url = f"{self._base_url}{path}"
+        try:
+            r = self._session.delete(
+                url,
+                headers=self._headers("DELETE", path),
+                timeout=_REQUEST_TIMEOUT,
+            )
+            if r.status_code == 401:
+                logger.warning("ExchangeClient: authentication failed on DELETE.")
+                return None
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"ExchangeClient: connection error on DELETE {url}")
+            return None
+        except requests.exceptions.Timeout:
+            logger.warning(f"ExchangeClient: timeout on DELETE {url}")
+            return None
+        except Exception as e:
+            logger.warning(f"ExchangeClient: DELETE failed {url}: {e}")
             return None
 
     def _get(self, path: str, params: Dict[str, Any]) -> Optional[Dict]:

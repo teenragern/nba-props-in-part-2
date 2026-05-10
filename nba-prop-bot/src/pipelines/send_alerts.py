@@ -74,6 +74,8 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     event_id  = edge_data.get('event_id',  None)
     home_away = edge_data.get('home_away', None)
     rest_days = edge_data.get('rest_days', 2)
+    raw_model_prob = edge_data.get('raw_model_prob', None)
+    model_prob_val = edge_data.get('model_prob', None)
 
     if db.check_recent_alert(player, market, line, side, edge):
         logger.info(f"Skipping duplicate alert for {player} {market} {side} {line}")
@@ -147,7 +149,9 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         home_away=home_away,
         rest_days=rest_days,
         max_daily_risk=MAX_DAILY_RISK,
-        max_per_game_risk=MAX_PER_GAME
+        max_per_game_risk=MAX_PER_GAME,
+        raw_model_prob=raw_model_prob,
+        model_prob=model_prob_val,
     )
 
     if not alert_id:
@@ -437,6 +441,7 @@ def send_game_market_alert(
         player_name=matchup, market=market, line=line, side=side,
         edge=edge, book=book, odds=book_odds, stake=stake,
         game_date=game_date, event_id=event_id,
+        raw_model_prob=model_prob, model_prob=model_prob,
     )
     game_edge_data = {
         'player_name': matchup, 'market': market, 'side': side, 'line': line,

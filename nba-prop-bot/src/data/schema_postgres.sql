@@ -105,7 +105,9 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
     game_date   TEXT,
     event_id    TEXT,
     home_away   TEXT,
-    rest_days   INTEGER DEFAULT 2
+    rest_days       INTEGER DEFAULT 2,
+    raw_model_prob  REAL,
+    model_prob      REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_sent_timestamp ON alerts_sent(timestamp DESC);
@@ -431,3 +433,7 @@ CREATE INDEX IF NOT EXISTS idx_live_trades_ticker_session
     ON live_trades(ticker, session_id, executed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_live_trades_game_id
     ON live_trades(game_id, executed_at DESC);
+
+-- Migration: add probability columns to alerts_sent for calibration fix
+ALTER TABLE alerts_sent ADD COLUMN IF NOT EXISTS raw_model_prob REAL;
+ALTER TABLE alerts_sent ADD COLUMN IF NOT EXISTS model_prob REAL;

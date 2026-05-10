@@ -1,32 +1,30 @@
 """
-Live trading engine — Phase 3 live trading.
+Live trading engine — Phase 4 institutional upgrade.
 
 The "brain" of the live trading pipeline.
 
-Subscribes to nba:live:state_update (from live_state_tracker), fetches the
-matching Kalshi KXNBAGAME market price, and computes a live in-game win
-probability.  When the model disagrees with the market beyond configured
-thresholds it publishes BUY or SELL signals to nba:live:execution_queue for
-the kalshi_trader to execute.
+Subscribes to nba:live:micro_state (from pbp_streamer, primary) and
+nba:live:state_update (from live_state_tracker, fallback). Fetches matching
+Kalshi KXNBAGAME market prices and computes live in-game win probability
+using a Markov possession model (endgame MC simulation).
 
-Win-probability model
----------------------
-Uses a Normal-approximation anchored to the pre-game devigged sharp line:
+When the model disagrees with the market beyond configured thresholds it
+publishes BUY or SELL signals to nba:live:execution_queue for the
+kalshi_trader to execute.
 
-    sigma = 11.0 * sqrt(minutes_remaining / 48.0)
-    prior_adj = norm.ppf(pre_game_prob) * sigma
-    win_prob = norm.cdf((score_diff + prior_adj) / sigma)
+Win-probability model (upgraded)
+---------------------------------
+Hybrid approach:
+  • Early/mid-game (>6 min): Enhanced Normal with possession value + bonus state
+  • Endgame (<=6 min): Monte Carlo forward simulation over remaining possessions
 
-This gives:
-  • win_prob == pre_game_prob at tip-off (score_diff=0, full time remaining).
-  • win_prob → 1.0 / 0.0 as sigma → 0 when the clock expires.
-  • sigma = 11.0 at tip-off, matching empirical NBA scoring standard deviation.
+Portfolio sizing (upgraded)
+---------------------------
+Uses PortfolioRiskManager with covariance-adjusted Kelly to prevent
+over-concentration on correlated positions.
 
 Entry signal:  (win_prob - kalshi_price) > LIVE_BUY_THRESHOLD (default 0.07)
 Exit signal:   holding position AND (kalshi_price - win_prob) > LIVE_SELL_THRESHOLD (0.03)
-
-Kelly stake: bankroll * kelly_fraction * (edge / (1 - kalshi_price)), clamped to
-             [0.50, KALSHI_MAX_STAKE].
 
 Environment:
     REDIS_URL               Redis connection URL (required)
@@ -39,6 +37,8 @@ Environment:
     KALSHI_MAX_STAKE        Max USD per order (default: 5.00)
     LIVE_BUY_THRESHOLD      Entry edge threshold (default: 0.07)
     LIVE_SELL_THRESHOLD     Exit edge threshold (default: 0.03)
+    PORTFOLIO_MAX_EXPOSURE_PCT   Max portfolio exposure (default: 0.20)
+    PORTFOLIO_RISK_LAMBDA        Risk aversion (default: 2.0)
 
 Run:
     python -m src.pipelines.live_engine
@@ -46,13 +46,10 @@ Run:
 
 import asyncio
 import dataclasses
-import math
 import os
 import signal
 import time
 from typing import Dict, Optional
-
-import scipy.stats
 
 from src.clients.exchange_client import ExchangeClient
 from src.clients.odds_api import OddsApiClient
@@ -60,6 +57,8 @@ from src.config import BANKROLL, KELLY_FRACTION, SHARP_BOOKS
 from src.data.db import get_db_client
 from src.events.bus import EventBus, get_bus
 from src.models.devig import devig_shin
+from src.models.possession_model import compute_live_win_prob
+from src.models.portfolio_risk import PortfolioRiskManager, ProposedTrade
 from src.utils.async_bridge import make_event_bridge
 from src.utils.kalshi_matching import find_kalshi_game_markets, resolve_team_for_market
 from src.utils.logging_utils import get_logger
@@ -74,41 +73,11 @@ _KALSHI_MAX_STAKE = float(os.getenv("KALSHI_MAX_STAKE",   "5.00"))
 _NBA_SIGMA_FULL = 11.0
 
 
-# ── Win-probability model ─────────────────────────────────────────────────────
-
-def compute_live_win_prob(
-    score_diff: int,
-    minutes_elapsed: float,
-    pre_game_prob: float,
-) -> float:
-    """
-    Normal-approximation live win probability.
-
-    Args:
-        score_diff:     home_score - away_score (positive = home leading).
-        minutes_elapsed: Total game minutes elapsed (0–48+).
-        pre_game_prob:  Pre-game devigged P(home wins) — the model's prior.
-
-    Returns:
-        Float in (0.02, 0.98) — probability the home team wins.
-    """
-    minutes_remaining = max(0.1, 48.0 - minutes_elapsed)
-    sigma = _NBA_SIGMA_FULL * math.sqrt(minutes_remaining / 48.0)
-
-    # prior_adj shifts the distribution centre so that at score_diff=0 and
-    # full time remaining win_prob == pre_game_prob exactly.
-    prior_adj = scipy.stats.norm.ppf(pre_game_prob) * sigma
-
-    win_prob = float(scipy.stats.norm.cdf((score_diff + prior_adj) / sigma))
-    # Hard floors to avoid degenerate probabilities near the buzzer.
-    return max(0.02, min(0.98, win_prob))
-
-
 # ── Kelly stake sizing ────────────────────────────────────────────────────────
 
 def _kelly_stake(edge: float, kalshi_price: float) -> float:
     """
-    Fractional Kelly stake in dollars.
+    Fractional Kelly stake in dollars (raw, unconstrained by portfolio).
 
     f* = edge / (1 - kalshi_price)   (binary Kelly for a $1 payout contract)
     stake = bankroll * kelly_fraction * f*
@@ -121,6 +90,57 @@ def _kelly_stake(edge: float, kalshi_price: float) -> float:
     f_star = edge / denominator
     raw = BANKROLL * KELLY_FRACTION * f_star
     return max(0.50, min(_KALSHI_MAX_STAKE, raw))
+
+
+async def _portfolio_sized_stake(
+    edge: float,
+    kalshi_price: float,
+    ticker: str,
+    game_id: str,
+    team: str,
+    model_prob: float,
+    db,
+    score_diff: int = 0,
+    period: int = 1,
+    minutes_elapsed: float = 0.0,
+) -> float:
+    """
+    Portfolio-aware Kelly stake using covariance-adjusted sizing.
+
+    Falls back to raw Kelly if PortfolioRiskManager encounters errors.
+    """
+    raw_stake = _kelly_stake(edge, kalshi_price)
+
+    try:
+        risk_mgr = PortfolioRiskManager(db, BANKROLL)
+        proposed = ProposedTrade(
+            ticker=ticker,
+            game_id=game_id,
+            team=team,
+            side="yes",
+            market_type="game_winner",
+            player_name=None,
+            model_prob=model_prob,
+            kalshi_price=kalshi_price,
+            edge=edge,
+            raw_kelly_stake=raw_stake,
+            score_diff=score_diff,
+            period=period,
+            minutes_elapsed=minutes_elapsed,
+        )
+        sizing = await risk_mgr.size_position(proposed)
+
+        if sizing.dampening_factor < 1.0:
+            logger.debug(
+                f"live_engine: portfolio sizing dampened {ticker}: "
+                f"${raw_stake:.2f} → ${sizing.adjusted_stake:.2f} "
+                f"({sizing.reason})"
+            )
+        return sizing.adjusted_stake
+
+    except Exception as e:
+        logger.warning(f"live_engine: portfolio sizing failed, using raw Kelly: {e}")
+        return raw_stake
 
 
 # ── In-process state ──────────────────────────────────────────────────────────
@@ -301,16 +321,17 @@ async def process_state_update(
     exchange: ExchangeClient,
     odds_client: OddsApiClient,
     bus: EventBus,
+    db=None,
 ) -> None:
     """
-    Called once per LIVE_STATE_UPDATE message.
+    Called once per LIVE_STATE_UPDATE or LIVE_MICRO_STATE message.
 
     1. Derive score diff and game clock from payload.
     2. Load or cache EngineState (pre-game probability).
     3. Find matching Kalshi KXNBAGAME market(s) for this game.
     4. Fetch current Kalshi price.
-    5. Compute live win_prob.
-    6. Apply BUY / SELL logic and publish signals.
+    5. Compute live win_prob using PossessionWinModel (enriched) or Normal (fallback).
+    6. Apply portfolio-aware BUY / SELL logic and publish signals.
     """
     game_id         = str(payload.get("game_id", ""))
     home_team       = payload.get("home_team", "")
@@ -318,6 +339,7 @@ async def process_state_update(
     home_score      = int(payload.get("home_score", 0))
     away_score      = int(payload.get("away_score", 0))
     minutes_elapsed = float(payload.get("minutes_elapsed", 0.0))
+    period          = int(payload.get("period", 1))
 
     if not game_id or not home_team:
         return
@@ -326,6 +348,32 @@ async def process_state_update(
     if eng is None:
         return  # no sharp prior — skip this game entirely
     score_diff = home_score - away_score
+
+    # ── Extract enriched micro_state fields (from pbp_streamer) ────────
+    # These are only present in nba:live:micro_state payloads
+    possession_raw = payload.get("possession", "unknown")
+    home_in_bonus = bool(payload.get("home_in_bonus", False))
+    away_in_bonus = bool(payload.get("away_in_bonus", False))
+    home_in_double_bonus = bool(payload.get("home_in_double_bonus", False))
+    away_in_double_bonus = bool(payload.get("away_in_double_bonus", False))
+
+    # Legacy possession adjustment (fallback when no micro_state)
+    has_possession = payload.get("has_possession")
+    possession_adj = 0.0
+    if has_possession == home_team:
+        possession_adj = 1.1
+    elif has_possession == away_team:
+        possession_adj = -1.1
+
+    # Map possession to "home"/"away"/"unknown" for the model
+    if possession_raw in ("home", "away"):
+        possession = possession_raw
+    elif has_possession == home_team:
+        possession = "home"
+    elif has_possession == away_team:
+        possession = "away"
+    else:
+        possession = "unknown"
 
     # Find matching Kalshi markets (blocking — runs in thread pool)
     markets = await asyncio.to_thread(
@@ -345,12 +393,31 @@ async def process_state_update(
         if team_for_yes is None:
             continue
 
-        # Align score_diff to the perspective of the YES team
+        # ── Compute win probability using PossessionWinModel ──────────
         if team_for_yes == home_team:
-            model_prob = compute_live_win_prob(score_diff, minutes_elapsed, eng.pre_game_prob)
+            model_prob = compute_live_win_prob(
+                score_diff, minutes_elapsed, eng.pre_game_prob,
+                possession_adj,
+                possession=possession,
+                home_in_bonus=home_in_bonus,
+                away_in_bonus=away_in_bonus,
+                home_in_double_bonus=home_in_double_bonus,
+                away_in_double_bonus=away_in_double_bonus,
+                game_id=game_id,
+            )
         else:
-            # Away team: flip score_diff and use (1 - pre_game_prob) as prior
-            model_prob = compute_live_win_prob(-score_diff, minutes_elapsed, 1.0 - eng.pre_game_prob)
+            # Away team: flip score_diff, prior, possession, and bonus states
+            away_possession = {"home": "away", "away": "home"}.get(possession, "unknown")
+            model_prob = compute_live_win_prob(
+                -score_diff, minutes_elapsed, 1.0 - eng.pre_game_prob,
+                -possession_adj,
+                possession=away_possession,
+                home_in_bonus=away_in_bonus,
+                away_in_bonus=home_in_bonus,
+                home_in_double_bonus=away_in_double_bonus,
+                away_in_double_bonus=home_in_double_bonus,
+                game_id=f"{game_id}_away",
+            )
 
         # Fetch live Kalshi price
         kalshi_price = await _fetch_kalshi_price(exchange, ticker)
@@ -363,13 +430,36 @@ async def process_state_update(
         logger.debug(
             f"live_engine: {team_for_yes} model={model_prob:.1%} "
             f"kalshi={kalshi_price:.1%} buy_edge={buy_edge:+.1%} "
-            f"sell_edge={sell_edge:+.1%} holding={ticker in _holdings}"
+            f"sell_edge={sell_edge:+.1%} holding={ticker in _holdings} "
+            f"poss={possession} bonus={home_in_bonus}/{away_in_bonus}"
         )
 
-        # ── BUY logic ──────────────────────────────────────────────────
+        # ── BUY logic (portfolio-aware sizing) ─────────────────────────
         if buy_edge > _BUY_THRESHOLD and ticker not in _holdings:
-            stake = _kelly_stake(buy_edge, kalshi_price)
-            signal = _make_signal(
+            if db is not None:
+                stake = await _portfolio_sized_stake(
+                    edge=buy_edge,
+                    kalshi_price=kalshi_price,
+                    ticker=ticker,
+                    game_id=game_id,
+                    team=team_for_yes,
+                    model_prob=model_prob,
+                    db=db,
+                    score_diff=score_diff,
+                    period=period,
+                    minutes_elapsed=minutes_elapsed,
+                )
+            else:
+                stake = _kelly_stake(buy_edge, kalshi_price)
+
+            if stake <= 0:
+                logger.debug(
+                    f"live_engine: BUY rejected by portfolio risk — {ticker} "
+                    f"edge={buy_edge:+.1%} (concentration/covariance limit)"
+                )
+                continue
+
+            sig = _make_signal(
                 action      = "buy",
                 ticker      = ticker,
                 game_id     = game_id,
@@ -381,7 +471,7 @@ async def process_state_update(
                 stake_usd   = stake,
             )
             published = await asyncio.to_thread(
-                bus.publish, EventBus.LIVE_EXECUTION_QUEUE, signal
+                bus.publish, EventBus.LIVE_EXECUTION_QUEUE, sig
             )
             if published:
                 _holdings[ticker] = "yes"
@@ -393,7 +483,7 @@ async def process_state_update(
 
         # ── SELL logic (profit-take) ───────────────────────────────────
         elif sell_edge > _SELL_THRESHOLD and ticker in _holdings:
-            signal = _make_signal(
+            sig = _make_signal(
                 action      = "sell",
                 ticker      = ticker,
                 game_id     = game_id,
@@ -405,7 +495,7 @@ async def process_state_update(
                 stake_usd   = 0.0,   # determined by open contracts in trader
             )
             published = await asyncio.to_thread(
-                bus.publish, EventBus.LIVE_EXECUTION_QUEUE, signal
+                bus.publish, EventBus.LIVE_EXECUTION_QUEUE, sig
             )
             if published:
                 del _holdings[ticker]
@@ -420,8 +510,10 @@ async def process_state_update(
 
 async def main() -> None:
     """
-    1. Set up the LIVE_STATE_UPDATE → asyncio.Queue bridge.
-    2. Initialise ExchangeClient, OddsApiClient.
+    1. Set up dual-channel subscription:
+       - nba:live:micro_state (primary, from pbp_streamer — sub-second)
+       - nba:live:state_update (fallback, from live_state_tracker)
+    2. Initialise ExchangeClient, OddsApiClient, DB.
     3. Install SIGINT/SIGTERM shutdown handler.
     4. Loop: consume state-update payloads and call process_state_update().
     """
@@ -433,7 +525,11 @@ async def main() -> None:
         )
 
     loop = asyncio.get_event_loop()
-    queue, _sub_thread = make_event_bridge(EventBus.LIVE_STATE_UPDATE, loop)
+
+    # Primary: micro_state from pbp_streamer (sub-second, enriched)
+    micro_queue, _micro_thread = make_event_bridge(EventBus.LIVE_MICRO_STATE, loop)
+    # Fallback: state_update from live_state_tracker (polling-based)
+    state_queue, _state_thread = make_event_bridge(EventBus.LIVE_STATE_UPDATE, loop)
 
     exchange    = ExchangeClient()
     odds_client = OddsApiClient()
@@ -459,20 +555,39 @@ async def main() -> None:
 
     logger.info(
         f"live_engine: started (buy_threshold={_BUY_THRESHOLD:.0%}, "
-        f"sell_threshold={_SELL_THRESHOLD:.0%}, max_stake=${_KALSHI_MAX_STAKE:.2f})"
+        f"sell_threshold={_SELL_THRESHOLD:.0%}, max_stake=${_KALSHI_MAX_STAKE:.2f}, "
+        f"model=PossessionWinModel, sizing=PortfolioRisk)"
     )
 
+    # Track which games have micro_state active (to suppress duplicate state_update)
+    _micro_active_games: set = set()
+
     while not shutdown.is_set():
+        # Prefer micro_state (sub-second) over state_update (polling)
+        payload = None
         try:
-            payload = await asyncio.wait_for(queue.get(), timeout=30.0)
+            # Check micro_state first (non-blocking)
+            try:
+                payload = micro_queue.get_nowait()
+                game_id = payload.get("game_id", "")
+                if game_id:
+                    _micro_active_games.add(game_id)
+            except asyncio.QueueEmpty:
+                # Fall back to state_update with timeout
+                payload = await asyncio.wait_for(state_queue.get(), timeout=5.0)
+                # Suppress if micro_state is active for this game
+                if payload.get("game_id") in _micro_active_games:
+                    continue
         except asyncio.TimeoutError:
-            # Heartbeat — no live games or Redis is quiet. Loop to check shutdown.
             continue
         except asyncio.CancelledError:
             break
 
+        if payload is None:
+            continue
+
         try:
-            await process_state_update(payload, exchange, odds_client, bus)
+            await process_state_update(payload, exchange, odds_client, bus, db)
         except Exception as e:
             logger.error(f"live_engine: unhandled error processing state update: {e}")
 

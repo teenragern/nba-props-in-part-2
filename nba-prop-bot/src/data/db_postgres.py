@@ -230,20 +230,23 @@ class PostgresDatabaseClient:
     def insert_alert(self, player_name: str, market: str, line: float, side: str,
                      edge: float, book: str, odds: float, stake: float = 0.0,
                      game_date: str = None, event_id: str = None,
-                     home_away: str = None, rest_days: int = 2) -> int:
+                     home_away: str = None, rest_days: int = 2,
+                     raw_model_prob: float = None, model_prob: float = None) -> int:
         book = normalize_book(book)
         line, edge, odds, stake = _to_py(line), _to_py(edge), _to_py(odds), _to_py(stake)
+        raw_model_prob = _to_py(raw_model_prob) if raw_model_prob is not None else None
+        model_prob = _to_py(model_prob) if model_prob is not None else None
         with self.get_conn() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO alerts_sent
                     (player_name, market, line, side, edge, book, odds, stake,
-                     game_date, event_id, home_away, rest_days)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     game_date, event_id, home_away, rest_days, raw_model_prob, model_prob)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (player_name, market, line, side, edge, book, odds, stake,
-                 game_date, event_id, home_away, rest_days),
+                 game_date, event_id, home_away, rest_days, raw_model_prob, model_prob),
             )
             alert_id = cur.fetchone()['id']
 
@@ -261,9 +264,13 @@ class PostgresDatabaseClient:
                                  game_date: str = None, event_id: str = None,
                                  home_away: str = None, rest_days: int = 2,
                                  max_daily_risk: float = 1000.0,
-                                 max_per_game_risk: float = 400.0) -> Optional[int]:
+                                 max_per_game_risk: float = 400.0,
+                                 raw_model_prob: float = None,
+                                 model_prob: float = None) -> Optional[int]:
         """Atomic check-and-insert for PostgreSQL."""
         line, edge, odds, stake = _to_py(line), _to_py(edge), _to_py(odds), _to_py(stake)
+        raw_model_prob = _to_py(raw_model_prob) if raw_model_prob is not None else None
+        model_prob = _to_py(model_prob) if model_prob is not None else None
         with self.get_conn() as conn:
             cur = conn.execute(
                 """
@@ -279,14 +286,15 @@ class PostgresDatabaseClient:
                 )
                 INSERT INTO alerts_sent
                     (player_name, market, line, side, edge, book, odds, stake,
-                     game_date, event_id, home_away, rest_days)
-                SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                     game_date, event_id, home_away, rest_days, raw_model_prob, model_prob)
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 WHERE (SELECT total FROM daily_risk) + %s <= %s
                   AND (SELECT total FROM game_risk) + %s <= %s
                 RETURNING id
                 """,
                 (event_id, player_name, market, line, side, edge, book, odds, stake,
-                 game_date, event_id, home_away, rest_days, stake, max_daily_risk,
+                 game_date, event_id, home_away, rest_days, raw_model_prob, model_prob,
+                 stake, max_daily_risk,
                  stake, max_per_game_risk)
             )
             row = cur.fetchone()
