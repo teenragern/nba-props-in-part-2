@@ -29,8 +29,14 @@ import os
 import signal
 import time
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None  # type: ignore[assignment]
 
 from src.events.bus import EventBus, get_bus
 from src.utils.logging_utils import get_logger
@@ -41,9 +47,21 @@ logger = get_logger(__name__)
 
 _PBP_WS_URL = os.getenv("PBP_WS_URL", "")
 _PBP_API_KEY = os.getenv("PBP_API_KEY", "")
+_PBP_MODE = os.getenv("PBP_MODE", "auto")  # "auto", "stream", "rest_poll"
+_PBP_POLL_INTERVAL = float(os.getenv("PBP_POLL_INTERVAL", "3.0"))  # seconds between REST polls
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MULTIPLIER = 2.0
 _RECONNECT_MAX_DELAY = 120.0
+
+# Sportradar REST PBP base URL (trial-compatible)
+_SPORTRADAR_REST_BASE = os.getenv(
+    "SPORTRADAR_REST_BASE",
+    "https://api.sportradar.com/nba/trial/v8/en"
+)
+# Sportradar daily schedule endpoint
+_SPORTRADAR_SCHEDULE_URL = f"{_SPORTRADAR_REST_BASE}/games/{{date}}/schedule.json"
+# Sportradar PBP endpoint
+_SPORTRADAR_PBP_URL = f"{_SPORTRADAR_REST_BASE}/games/{{game_id}}/pbp.json"
 
 
 # ── Data Structures ──────────────────────────────────────────────────────────
@@ -501,17 +519,26 @@ class PBPStateEngine:
 
 class PBPStreamer:
     """
-    Async WebSocket consumer for play-by-play data.
+    Async consumer for play-by-play data.
+
+    Supports two transport modes (auto-detected from URL):
+      1. HTTP Chunked Streaming (Sportradar Push Feeds) — https:// URLs
+      2. WebSocket — wss:// or ws:// URLs
+
     Publishes enriched MicroGameState to Redis on every meaningful event.
     """
 
     def __init__(self, ws_url: str, bus: EventBus, api_key: str = ""):
-        self._ws_url = self._build_url(ws_url, api_key)
+        self._base_url = ws_url
+        self._api_key = api_key
+        self._url = self._build_url(ws_url, api_key)
         self._bus = bus
         self._engine = PBPStateEngine()
         self._reconnect_delay = _RECONNECT_BASE_DELAY
         self._events_published = 0
         self._events_received = 0
+        # Auto-detect transport mode
+        self._use_http_stream = ws_url.startswith("http://") or ws_url.startswith("https://")
 
     @staticmethod
     def _build_url(base_url: str, api_key: str) -> str:
@@ -522,6 +549,104 @@ class PBPStreamer:
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         """Main loop: connect, receive, parse, update state, publish."""
+        mode = _PBP_MODE
+
+        if mode == "rest_poll":
+            await self._run_rest_poll(shutdown)
+        elif mode == "stream":
+            if self._use_http_stream:
+                await self._run_http_stream(shutdown)
+            else:
+                await self._run_websocket(shutdown)
+        else:
+            # Auto mode: try HTTP stream first, fall back to REST polling on 403
+            if self._use_http_stream:
+                success = await self._try_http_stream_once(shutdown)
+                if not success and not shutdown.is_set():
+                    logger.info(
+                        "pbp_streamer: Push feed unavailable (trial key?). "
+                        "Falling back to REST PBP polling mode."
+                    )
+                    await self._run_rest_poll(shutdown)
+            else:
+                await self._run_websocket(shutdown)
+
+        logger.info(
+            f"pbp_streamer: shutdown. Received={self._events_received} "
+            f"Published={self._events_published}"
+        )
+
+    # ── HTTP Chunked Streaming (Sportradar Push Feed) ─────────────────
+
+    async def _run_http_stream(self, shutdown: asyncio.Event) -> None:
+        """
+        Consume Sportradar-style HTTP chunked streaming (Push Feed).
+
+        Sportradar Push feeds use HTTP with Transfer-Encoding: chunked.
+        Each chunk is a JSON line (newline-delimited). Heartbeats are sent
+        every 5 seconds to keep the connection alive.
+        """
+        if aiohttp is None:
+            logger.error(
+                "pbp_streamer: 'aiohttp' package not installed. "
+                "Install with: pip install aiohttp"
+            )
+            return
+
+        while not shutdown.is_set():
+            try:
+                logger.info(f"pbp_streamer: connecting to HTTP stream {self._url[:80]}...")
+                timeout = aiohttp.ClientTimeout(total=None, sock_read=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(self._url) as resp:
+                        if resp.status != 200:
+                            logger.error(
+                                f"pbp_streamer: HTTP {resp.status} from feed. "
+                                f"Check your API key and access level."
+                            )
+                            await self._backoff_wait(shutdown)
+                            continue
+
+                        logger.info(
+                            f"pbp_streamer: HTTP stream connected (status={resp.status})"
+                        )
+                        self._reconnect_delay = _RECONNECT_BASE_DELAY
+
+                        # Read chunked response line by line
+                        buffer = ""
+                        async for chunk in resp.content.iter_any():
+                            if shutdown.is_set():
+                                break
+
+                            text = chunk.decode("utf-8", errors="replace")
+                            buffer += text
+
+                            # Process complete JSON lines
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                # Skip heartbeat messages
+                                if line.startswith("{") and '"heartbeat"' in line:
+                                    continue
+                                await self._handle_message(line)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if shutdown.is_set():
+                    break
+                logger.warning(
+                    f"pbp_streamer: HTTP stream lost ({type(e).__name__}: {e}). "
+                    f"Reconnecting in {self._reconnect_delay:.1f}s..."
+                )
+                await self._backoff_wait(shutdown)
+
+    # ── WebSocket Transport ───────────────────────────────────────────
+
+    async def _run_websocket(self, shutdown: asyncio.Event) -> None:
+        """Consume WebSocket play-by-play feed."""
         try:
             import websockets
         except ImportError:
@@ -533,14 +658,14 @@ class PBPStreamer:
 
         while not shutdown.is_set():
             try:
-                logger.info(f"pbp_streamer: connecting to {self._ws_url[:60]}...")
+                logger.info(f"pbp_streamer: connecting to WS {self._url[:60]}...")
                 async with websockets.connect(
-                    self._ws_url,
+                    self._url,
                     ping_interval=20,
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
-                    logger.info("pbp_streamer: connected successfully")
+                    logger.info("pbp_streamer: WebSocket connected successfully")
                     self._reconnect_delay = _RECONNECT_BASE_DELAY
 
                     async for raw_message in ws:
@@ -554,24 +679,335 @@ class PBPStreamer:
                 if shutdown.is_set():
                     break
                 logger.warning(
-                    f"pbp_streamer: connection lost ({type(e).__name__}: {e}). "
+                    f"pbp_streamer: WS connection lost ({type(e).__name__}: {e}). "
                     f"Reconnecting in {self._reconnect_delay:.1f}s..."
                 )
-                try:
-                    await asyncio.wait_for(
-                        shutdown.wait(), timeout=self._reconnect_delay
-                    )
-                    break  # shutdown signaled during wait
-                except asyncio.TimeoutError:
-                    pass  # normal: timeout expired, retry connection
-                self._reconnect_delay = min(
-                    self._reconnect_delay * _RECONNECT_MULTIPLIER,
-                    _RECONNECT_MAX_DELAY,
-                )
+                await self._backoff_wait(shutdown)
+
+    # ── Auto-detect: try push, fall back to REST ────────────────────
+
+    async def _try_http_stream_once(self, shutdown: asyncio.Event) -> bool:
+        """
+        Attempt one HTTP stream connection. Returns True if it worked
+        (stays running until shutdown), False if 403/unavailable.
+        """
+        if aiohttp is None:
+            return False
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self._url) as resp:
+                    if resp.status == 403:
+                        return False
+                    if resp.status != 200:
+                        return False
+                    # Stream is accessible — switch to full streaming mode
+                    # Cancel this probe and re-run with the full streaming loop
+                    pass
+        except Exception:
+            return False
+
+        # If we got here, stream works — run the full loop
+        await self._run_http_stream(shutdown)
+        return True
+
+    # ── REST PBP Polling (Trial Key Compatible) ───────────────────────
+
+    async def _run_rest_poll(self, shutdown: asyncio.Event) -> None:
+        """
+        Poll Sportradar REST PBP endpoint every few seconds.
+
+        Works with trial API keys. Fetches today's live games, then polls
+        their PBP endpoints for new events.
+
+        Flow:
+          1. Fetch today's schedule to find live game IDs
+          2. For each live game, fetch /games/{id}/pbp.json
+          3. Parse new events since last poll
+          4. Feed through the same state engine → publish to Redis
+          5. Sleep PBP_POLL_INTERVAL seconds
+        """
+        if aiohttp is None:
+            logger.error(
+                "pbp_streamer: 'aiohttp' package not installed. "
+                "Install with: pip install aiohttp"
+            )
+            return
 
         logger.info(
-            f"pbp_streamer: shutdown. Received={self._events_received} "
-            f"Published={self._events_published}"
+            f"pbp_streamer: starting REST PBP polling mode "
+            f"(interval={_PBP_POLL_INTERVAL}s)"
+        )
+
+        # Track last seen event index per game to avoid re-processing
+        last_event_idx: Dict[str, int] = {}
+
+        while not shutdown.is_set():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    # 1. Get today's live games
+                    live_game_ids = await self._fetch_live_game_ids(session)
+
+                    if not live_game_ids:
+                        # No live games — sleep longer
+                        try:
+                            await asyncio.wait_for(shutdown.wait(), timeout=30.0)
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+
+                    # 2. Poll PBP for each live game
+                    for game_id in live_game_ids:
+                        if shutdown.is_set():
+                            break
+
+                        new_events = await self._fetch_pbp_events(
+                            session, game_id, last_event_idx.get(game_id, 0)
+                        )
+
+                        for event in new_events:
+                            await self._handle_message(json.dumps(event))
+
+                        if new_events:
+                            last_event_idx[game_id] = (
+                                last_event_idx.get(game_id, 0) + len(new_events)
+                            )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"pbp_streamer: REST poll error: {e}")
+
+            # Sleep between polls
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=_PBP_POLL_INTERVAL)
+                break  # shutdown signaled
+            except asyncio.TimeoutError:
+                pass  # normal: poll again
+
+    async def _fetch_live_game_ids(self, session) -> List[str]:
+        """Fetch today's schedule from Sportradar and return live game IDs."""
+        today = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+        url = _SPORTRADAR_SCHEDULE_URL.format(date=today)
+        url += f"?api_key={self._api_key}" if self._api_key else ""
+
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    logger.debug(f"pbp_streamer: schedule fetch HTTP {resp.status}")
+                    return []
+                data = await resp.json()
+        except Exception as e:
+            logger.debug(f"pbp_streamer: schedule fetch failed: {e}")
+            return []
+
+        # Sportradar schedule response structure
+        games = data.get("games", [])
+        live_ids = []
+        for game in games:
+            status = game.get("status", "").lower()
+            if status in ("inprogress", "halftime", "live"):
+                game_id = game.get("id", "")
+                if game_id:
+                    live_ids.append(game_id)
+
+        if live_ids:
+            logger.debug(f"pbp_streamer: found {len(live_ids)} live game(s)")
+        return live_ids
+
+    async def _fetch_pbp_events(self, session, game_id: str,
+                                skip_count: int) -> List[dict]:
+        """
+        Fetch PBP for a game and return only new events (after skip_count).
+
+        Parses Sportradar PBP response into our normalized event format.
+        """
+        url = _SPORTRADAR_PBP_URL.format(game_id=game_id)
+        url += f"?api_key={self._api_key}" if self._api_key else ""
+
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 429:
+                    logger.warning("pbp_streamer: rate limited by Sportradar, backing off")
+                    await asyncio.sleep(5.0)
+                    return []
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+        except Exception as e:
+            logger.debug(f"pbp_streamer: PBP fetch failed for {game_id}: {e}")
+            return []
+
+        # Parse Sportradar PBP structure
+        return self._parse_sportradar_pbp(data, game_id, skip_count)
+
+    def _parse_sportradar_pbp(self, data: dict, game_id: str,
+                              skip_count: int) -> List[dict]:
+        """
+        Parse Sportradar PBP JSON into our normalized event list.
+
+        Sportradar PBP structure:
+        {
+            "id": "game_uuid",
+            "home": {"name": "Lakers", "id": "..."},
+            "away": {"name": "Celtics", "id": "..."},
+            "periods": [
+                {
+                    "number": 1,
+                    "events": [
+                        {
+                            "id": "event_uuid",
+                            "type": "turnover" | "twopointmade" | ...,
+                            "clock": "05:32",
+                            "description": "...",
+                            "home_points": 55,
+                            "away_points": 52,
+                            "attribution": {"name": "Lakers", "id": "..."},
+                            "player": {"full_name": "LeBron James", "id": "..."},
+                        }, ...
+                    ]
+                }, ...
+            ]
+        }
+        """
+        home_team = data.get("home", {}).get("name", "")
+        away_team = data.get("away", {}).get("name", "")
+        home_id = data.get("home", {}).get("id", "")
+        away_id = data.get("away", {}).get("id", "")
+
+        all_events: List[dict] = []
+        periods = data.get("periods", [])
+
+        for period_data in periods:
+            period_num = period_data.get("number", 1)
+            events = period_data.get("events", [])
+
+            for ev in events:
+                # Map Sportradar event type to our format
+                sr_type = ev.get("type", "").lower()
+                normalized_type = self._map_sportradar_event_type(sr_type)
+                if normalized_type is None:
+                    continue
+
+                # Determine team ("home" or "away")
+                attribution = ev.get("attribution", {})
+                attr_id = attribution.get("id", "")
+                if attr_id == home_id:
+                    team = "home"
+                elif attr_id == away_id:
+                    team = "away"
+                else:
+                    team = ""
+
+                # Parse clock "MM:SS" to seconds remaining
+                clock_str = ev.get("clock", "")
+                seconds_remaining = self._parse_clock(clock_str)
+
+                # Player info
+                player = ev.get("player", {})
+                player_name = player.get("full_name", "")
+                player_id = player.get("id", "")
+
+                # Determine points for scoring events
+                points = 0
+                if "threepoint" in sr_type and "made" in sr_type:
+                    points = 3
+                elif "twopoint" in sr_type and "made" in sr_type:
+                    points = 2
+                elif "freethrow" in sr_type and "made" in sr_type:
+                    points = 1
+
+                # Foul type
+                foul_type = "personal"
+                if "shooting" in sr_type:
+                    foul_type = "shooting"
+                elif "flagrant" in sr_type:
+                    foul_type = "flagrant"
+                elif "technical" in sr_type:
+                    foul_type = "technical"
+
+                all_events.append({
+                    "game_id": game_id,
+                    "event_type": normalized_type,
+                    "team": team,
+                    "player_id": player_id,
+                    "player_name": player_name,
+                    "period": period_num,
+                    "seconds_remaining": seconds_remaining,
+                    "shot_clock": None,
+                    "points": points,
+                    "foul_type": foul_type,
+                    "sub_in": ev.get("player", {}).get("id", "") if "substitution" in sr_type else "",
+                    "sub_out": "",
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_score": ev.get("home_points"),
+                    "away_score": ev.get("away_points"),
+                })
+
+        # Return only events we haven't seen yet
+        return all_events[skip_count:]
+
+    @staticmethod
+    def _map_sportradar_event_type(sr_type: str) -> Optional[str]:
+        """Map Sportradar event type strings to our canonical types."""
+        mapping = {
+            "twopointmade": "made_fg",
+            "twopointmiss": "missed_fg",
+            "threepointmade": "made_3pt",
+            "threepointmiss": "missed_3pt",
+            "freethrowmade": "free_throw_made",
+            "freethrowmiss": "free_throw_missed",
+            "offensiverebound": "offensive_rebound",
+            "defensiverebound": "defensive_rebound",
+            "rebound": "defensive_rebound",
+            "turnover": "turnover",
+            "steal": "steal",
+            "personalfoul": "foul",
+            "shootingfoul": "foul",
+            "flagrantfoul": "foul",
+            "technicalfoul": "foul",
+            "offensivefoul": "foul",
+            "substitution": "substitution",
+            "timeout": "timeout",
+            "jumpball": "jump_ball",
+            "periodstart": "period_start",
+            "periodend": "period_end",
+            "endperiod": "period_end",
+        }
+        # Handle compound types (e.g., "twopointmade", "personalfoul")
+        for key, value in mapping.items():
+            if key in sr_type.replace(" ", "").replace("_", ""):
+                return value
+        return None
+
+    @staticmethod
+    def _parse_clock(clock_str: str) -> float:
+        """Parse 'MM:SS' or 'M:SS' clock string to seconds remaining."""
+        if not clock_str or ":" not in clock_str:
+            return 0.0
+        try:
+            parts = clock_str.split(":")
+            minutes = int(parts[0])
+            seconds = int(parts[1]) if len(parts) > 1 else 0
+            return minutes * 60.0 + seconds
+        except (ValueError, IndexError):
+            return 0.0
+
+    # ── Shared Helpers ────────────────────────────────────────────────
+
+    async def _backoff_wait(self, shutdown: asyncio.Event) -> None:
+        """Wait with exponential backoff, respecting shutdown signal."""
+        try:
+            await asyncio.wait_for(
+                shutdown.wait(), timeout=self._reconnect_delay
+            )
+        except asyncio.TimeoutError:
+            pass
+        self._reconnect_delay = min(
+            self._reconnect_delay * _RECONNECT_MULTIPLIER,
+            _RECONNECT_MAX_DELAY,
         )
 
     async def _handle_message(self, raw: str) -> None:
