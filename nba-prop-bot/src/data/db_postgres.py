@@ -205,6 +205,27 @@ class PostgresDatabaseClient:
             except Exception as e:
                 logger.warning(f"TimescaleDB setup skipped (may not be installed): {e}")
 
+            # ── Migrations: add columns that may be missing on older DBs ──
+            _migrations = [
+                "ALTER TABLE games ADD COLUMN IF NOT EXISTS sr_id TEXT",
+                "ALTER TABLE line_history ADD COLUMN IF NOT EXISTS game_id TEXT",
+            ]
+            for _m in _migrations:
+                try:
+                    cur.execute(_m)
+                except Exception as _mig_err:
+                    logger.debug(f"Migration skipped: {_mig_err}")
+
+            # Indexes for new columns (safe to repeat)
+            for _idx in [
+                "CREATE INDEX IF NOT EXISTS idx_games_sr_id ON games(sr_id)",
+                "CREATE INDEX IF NOT EXISTS idx_line_history_game ON line_history(game_id, timestamp DESC)",
+            ]:
+                try:
+                    cur.execute(_idx)
+                except Exception:
+                    pass
+
             # Reset sequences so they stay ahead of existing max IDs.
             # Prevents duplicate key errors after data was inserted outside
             # the normal sequence path (e.g. manual inserts or migrations).
@@ -948,9 +969,12 @@ class PostgresDatabaseClient:
                             soft_books: tuple = ('draftkings', 'fanduel', 'betmgm', 'caesars'),
                             ) -> list:
         import pandas as pd
+        import warnings
         raw = self._pool.getconn()
         try:
-            df = pd.read_sql_query(
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=UserWarning, module='pandas')
+                df = pd.read_sql_query(
                 """
                 SELECT player_name, market, side, line,
                        bookmaker, odds, implied_prob, timestamp

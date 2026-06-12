@@ -50,6 +50,10 @@ class OddsApiClient:
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def get_event_odds(self, event_id: str, markets: List[str]) -> Dict[str, Any]:
+        if '-' in event_id:
+            logger.debug(f"Odds API: Skipping request for Sportradar ID {event_id}")
+            return {"bookmakers": []}
+            
         url = f"{self.BASE_URL}/{self.SPORT}/events/{event_id}/odds"
         params = {
             "apiKey": self.api_key,

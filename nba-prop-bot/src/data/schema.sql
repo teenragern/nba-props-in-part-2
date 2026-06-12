@@ -3,7 +3,8 @@ CREATE TABLE IF NOT EXISTS games (
     home_team TEXT,
     away_team TEXT,
     commence_time DATETIME,
-    status TEXT
+    status TEXT,
+    sr_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS teams (
@@ -139,6 +140,7 @@ CREATE TABLE IF NOT EXISTS line_history (
     side TEXT,
     odds REAL,
     implied_prob REAL,
+    game_id TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -377,3 +379,29 @@ CREATE TABLE IF NOT EXISTS subscribers (
     active     INTEGER NOT NULL DEFAULT 1,
     joined_at  DATETIME DEFAULT (datetime('now'))
 );
+
+-- ── Sportradar Integration ───────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS synergy_stats (
+    player_id       TEXT PRIMARY KEY,
+    player_name     TEXT,
+    team_id         TEXT,
+    season          TEXT,
+    play_type       TEXT,
+    points_per_poss REAL,
+    frequency_pct   REAL,
+    percentile      REAL,
+    last_updated    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS futures_odds (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_name     TEXT,
+    selection_name  TEXT,
+    odds            REAL,
+    implied_prob    REAL,
+    bookmaker       TEXT,
+    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_futures_odds_market ON futures_odds(market_name, timestamp);

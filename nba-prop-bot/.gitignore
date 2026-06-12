@@ -9,3 +9,4 @@ stats_cache.db
 backups/
 deploy/
 out.txt
+scratch/

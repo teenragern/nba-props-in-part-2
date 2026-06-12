@@ -52,8 +52,9 @@ import time
 from typing import Dict, Optional
 
 from src.clients.exchange_client import ExchangeClient
-from src.clients.odds_api import OddsApiClient
-from src.config import BANKROLL, KELLY_FRACTION, SHARP_BOOKS
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.sportradar_client import SportradarClient
+from src.config import BANKROLL, KELLY_FRACTION, SHARP_BOOKS, ELIMINATION_MODE, ELIMINATION_KELLY_MULT
 from src.data.db import get_db_client
 from src.events.bus import EventBus, get_bus
 from src.models.devig import devig_shin
@@ -88,7 +89,8 @@ def _kelly_stake(edge: float, kalshi_price: float) -> float:
     if denominator <= 0:
         return 0.0
     f_star = edge / denominator
-    raw = BANKROLL * KELLY_FRACTION * f_star
+    kelly = KELLY_FRACTION * (ELIMINATION_KELLY_MULT if ELIMINATION_MODE else 1.0)
+    raw = BANKROLL * kelly * f_star
     return max(0.50, min(_KALSHI_MAX_STAKE, raw))
 
 
@@ -161,6 +163,11 @@ _holdings: Dict[str, str] = {}
 # Keyed by game_id — cached EngineState to avoid repeated DB / API calls.
 _engine_states: Dict[str, EngineState] = {}
 
+# Track games where pre-game prob fetch failed so we can retry (up to 3 times)
+# instead of permanently skipping the game on a transient quota/network error.
+_pre_game_failures: Dict[str, int] = {}
+_PRE_GAME_MAX_RETRIES = 3
+
 
 def _load_holdings_from_db(db) -> int:
     """
@@ -200,8 +207,27 @@ def _load_pre_game_prob_sync(
     2. Devig using the Shin method (best for binary markets).
     3. Return None if no sharp line is found — caller must skip the game.
     """
+    data = {}
     try:
-        data = odds_client.get_event_odds(game_id, markets=["h2h"])
+        if game_id.startswith("sr:"):
+            logger.info(f"live_engine: game_id {game_id} is a Sportradar ID. Fetching directly from Sportradar.")
+            sr_client = SportradarClient()
+            data = sr_client.get_event_odds_oddsapi_format(game_id)
+        else:
+            try:
+                data = odds_client.get_event_odds(game_id, markets=["h2h"])
+            except OddsApiQuotaError:
+                logger.warning(f"live_engine: Odds API out of credits for {game_id}. Falling back to Sportradar.")
+                db = get_db_client()
+                with db.get_conn() as conn:
+                    row = conn.execute("SELECT sr_id FROM games WHERE game_id = ?", (game_id,)).fetchone()
+                    if row and row['sr_id']:
+                        sr_client = SportradarClient()
+                        data = sr_client.get_event_odds_oddsapi_format(row['sr_id'])
+    except Exception as e:
+        logger.warning(f"live_engine: pre-game prob fetch failed for {game_id}: {e}")
+        
+    try:
         bookmakers = data.get("bookmakers", [])
         priority = [b.lower() for b in SHARP_BOOKS] if SHARP_BOOKS else ["pinnacle"]
 
@@ -251,14 +277,32 @@ async def _get_or_load_engine_state(
     odds_client: OddsApiClient,
 ) -> Optional[EngineState]:
     """Load from cache or fetch pre-game prob for this game.
-    Returns None if no sharp line is available — caller must skip."""
+    Returns None if no sharp line is available — caller must skip.
+    Retries up to _PRE_GAME_MAX_RETRIES times on transient failures
+    before permanently giving up on the game."""
     if game_id in _engine_states:
         return _engine_states[game_id]
+
+    # Already exhausted retries for this game — don't keep hammering APIs
+    if _pre_game_failures.get(game_id, 0) >= _PRE_GAME_MAX_RETRIES:
+        return None
 
     pre_game_prob = await asyncio.to_thread(
         _load_pre_game_prob_sync, game_id, home_team, away_team, odds_client
     )
     if pre_game_prob is None:
+        _pre_game_failures[game_id] = _pre_game_failures.get(game_id, 0) + 1
+        attempts = _pre_game_failures[game_id]
+        if attempts < _PRE_GAME_MAX_RETRIES:
+            logger.info(
+                f"live_engine: pre-game prob unavailable for {game_id} "
+                f"(attempt {attempts}/{_PRE_GAME_MAX_RETRIES}) — will retry on next update"
+            )
+        else:
+            logger.warning(
+                f"live_engine: giving up on {game_id} after {_PRE_GAME_MAX_RETRIES} "
+                f"failed attempts to load pre-game probability"
+            )
         return None
 
     state = EngineState(

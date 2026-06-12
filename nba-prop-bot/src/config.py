@@ -15,6 +15,18 @@ MIN_PROJECTED_MINUTES = float(os.getenv("MIN_PROJECTED_MINUTES", "15.0"))
 PLAYOFF_EDGE_MIN              = float(os.getenv("PLAYOFF_EDGE_MIN", "0.06"))
 PLAYOFF_MIN_PROJECTED_MINUTES = float(os.getenv("PLAYOFF_MIN_PROJECTED_MINUTES", "18.0"))
 
+# Elimination-game guard. When every remaining game can end the series
+# (e.g. the Finals at 3-1), markets are the sharpest of the year and
+# blowout / garbage-time risk skews player props in both directions —
+# starters get pulled early whichever way the game breaks. When
+# ELIMINATION_MODE=true:
+#   - every edge floor is raised by ELIMINATION_EDGE_BUMP (additive)
+#   - every Kelly stake is multiplied by ELIMINATION_KELLY_MULT
+# Set it for the remainder of the series; clear it when the season ends.
+ELIMINATION_MODE       = os.getenv("ELIMINATION_MODE", "false").lower() in ("true", "1", "yes")
+ELIMINATION_EDGE_BUMP  = float(os.getenv("ELIMINATION_EDGE_BUMP", "0.03"))
+ELIMINATION_KELLY_MULT = float(os.getenv("ELIMINATION_KELLY_MULT", "0.5"))
+
 # Per-market edge-floor overrides (applied on top of the dynamic floor).
 # Floors are data-driven from settled bet history (negative ROI → raised floor).
 # Blocks / Assists / PRA were already raised from prior analysis.
@@ -24,7 +36,7 @@ PER_MARKET_EDGE_MIN: dict = {
     'player_points':                  float(os.getenv("EDGE_MIN_POINTS",   "0.08")),
     'player_threes':                  float(os.getenv("EDGE_MIN_THREES",   "0.07")),
     'player_blocks':                  float(os.getenv("EDGE_MIN_BLOCKS",   "0.09")),
-    'player_assists':                 float(os.getenv("EDGE_MIN_ASSISTS",  "0.25")),
+    'player_assists':                 float(os.getenv("EDGE_MIN_ASSISTS",  "0.10")),
     'player_points_rebounds_assists': float(os.getenv("EDGE_MIN_PRA",     "0.12")),
 }
 ODDS_REGION = os.getenv("ODDS_REGION", "us")
@@ -39,8 +51,15 @@ BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 
 # Scheduler credit-conservation settings
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "90"))
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "45"))
 QUOTA_FLOOR = int(os.getenv("QUOTA_FLOOR", "30"))
+
+# Off-season hibernation.
+# "auto" (default): hibernate after OFF_SEASON_AFTER_SYNCS consecutive daily
+# syncs return zero upcoming NBA events; wake automatically when events return.
+# "true" / "false": force hibernation on or off regardless of the schedule.
+OFF_SEASON             = os.getenv("OFF_SEASON", "auto").strip().lower()
+OFF_SEASON_AFTER_SYNCS = int(os.getenv("OFF_SEASON_AFTER_SYNCS", "3"))
 NEWS_POLL_INTERVAL     = int(os.getenv("NEWS_POLL_INTERVAL",     "60"))
 TWITTER_POLL_INTERVAL  = int(os.getenv("TWITTER_POLL_INTERVAL",  "15"))
 

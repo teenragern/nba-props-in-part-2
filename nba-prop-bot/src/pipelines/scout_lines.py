@@ -17,7 +17,8 @@ import dateutil.parser
 from datetime import datetime, timezone
 from typing import Dict, List
 
-from src.clients.odds_api import OddsApiClient
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.sportradar_client import SportradarClient
 from src.config import PROP_MARKETS, BDL_SHARP_SCAN_INTERVAL
 from src.data.db import DatabaseClient, get_db_client
 from src.utils.logging_utils import get_logger
@@ -128,7 +129,23 @@ def scout_lines(odds_client: OddsApiClient = None) -> Dict:
             continue
 
         try:
-            data = odds_client.get_event_odds(event['game_id'], markets=PROP_MARKETS)
+            if event['game_id'].startswith("sr:"):
+                logger.info(f"Scout: event_id {event['game_id']} is a Sportradar ID. Fetching directly from Sportradar.")
+                sr_client = SportradarClient()
+                data = sr_client.get_event_odds_oddsapi_format(event['game_id'])
+            else:
+                try:
+                    data = odds_client.get_event_odds(event['game_id'], markets=PROP_MARKETS)
+                except OddsApiQuotaError:
+                    logger.warning(f"Scout: Odds API out of credits for {event['game_id']}. Falling back to Sportradar.")
+                    with db.get_conn() as conn:
+                        row = conn.execute("SELECT sr_id FROM games WHERE game_id = ?", (event['game_id'],)).fetchone()
+                        if row and row['sr_id']:
+                            sr_client = SportradarClient()
+                            data = sr_client.get_event_odds_oddsapi_format(row['sr_id'])
+                        else:
+                            raise Exception("No sr_id available for fallback.")
+
             bookmakers = data.get('bookmakers', [])
             records = _extract_line_records(event['game_id'], bookmakers)
             if records:

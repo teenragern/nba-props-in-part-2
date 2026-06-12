@@ -10,8 +10,11 @@ CREATE TABLE IF NOT EXISTS games (
     home_team   TEXT,
     away_team   TEXT,
     commence_time TIMESTAMPTZ,
-    status      TEXT
+    status      TEXT,
+    sr_id       TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_games_sr_id ON games(sr_id);
 
 CREATE TABLE IF NOT EXISTS teams (
     team_id     BIGINT PRIMARY KEY,
@@ -154,6 +157,7 @@ CREATE TABLE IF NOT EXISTS line_history (
     side         TEXT,
     odds         REAL,
     implied_prob REAL,
+    game_id      TEXT,
     timestamp    TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (id, timestamp)   -- composite PK required for hypertable
 );
@@ -162,6 +166,8 @@ CREATE INDEX IF NOT EXISTS idx_line_history_ts
     ON line_history(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_line_history_player_market
     ON line_history(player_name, market, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_line_history_game
+    ON line_history(game_id, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS bookmaker_profiles (
     bookmaker              TEXT PRIMARY KEY,
@@ -437,3 +443,29 @@ CREATE INDEX IF NOT EXISTS idx_live_trades_game_id
 -- Migration: add probability columns to alerts_sent for calibration fix
 ALTER TABLE alerts_sent ADD COLUMN IF NOT EXISTS raw_model_prob REAL;
 ALTER TABLE alerts_sent ADD COLUMN IF NOT EXISTS model_prob REAL;
+
+-- ── Sportradar Integration ───────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS synergy_stats (
+    player_id       TEXT PRIMARY KEY,
+    player_name     TEXT,
+    team_id         TEXT,
+    season          TEXT,
+    play_type       TEXT,
+    points_per_poss REAL,
+    frequency_pct   REAL,
+    percentile      REAL,
+    last_updated    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS futures_odds (
+    id              BIGSERIAL PRIMARY KEY,
+    market_name     TEXT,
+    selection_name  TEXT,
+    odds            REAL,
+    implied_prob    REAL,
+    bookmaker       TEXT,
+    timestamp       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_futures_odds_market ON futures_odds(market_name, timestamp DESC);

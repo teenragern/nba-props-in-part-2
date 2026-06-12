@@ -26,7 +26,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from src.clients.exchange_client import ExchangeClient
-from src.clients.odds_api import OddsApiClient
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.sportradar_client import SportradarClient
 from src.clients.telegram_bot import TelegramBotClient
 from src.config import SHARP_BOOKS
 from src.data.db import get_db_client
@@ -67,6 +68,7 @@ def _get_sharp_probs(
     game_id: str,
     home_team: str,
     away_team: str,
+    db,
 ) -> Optional[Tuple[float, float]]:
     """
     Fetch h2h moneyline from the sharpest available book and return
@@ -75,8 +77,24 @@ def _get_sharp_probs(
     Uses Shin devig (most accurate for 2-way markets).
     Returns None when no sharp line is available.
     """
+    data = {}
     try:
-        data = odds_client.get_event_odds(game_id, markets=["h2h"])
+        if game_id.startswith("sr:"):
+            logger.info(f"game_arb: game_id {game_id} is a Sportradar ID. Fetching directly from Sportradar.")
+            sr_client = SportradarClient()
+            data = sr_client.get_event_odds_oddsapi_format(game_id)
+        else:
+            data = odds_client.get_event_odds(game_id, markets=["h2h"])
+    except OddsApiQuotaError:
+        logger.warning(f"game_arb: Odds API out of credits for {game_id}. Falling back to Sportradar.")
+        with db.get_conn() as conn:
+            row = conn.execute("SELECT sr_id FROM games WHERE game_id = ?", (game_id,)).fetchone()
+            if row and row['sr_id']:
+                try:
+                    sr_client = SportradarClient()
+                    data = sr_client.get_event_odds_oddsapi_format(row['sr_id'])
+                except Exception as e:
+                    logger.warning(f"game_arb: fallback Sportradar odds fetch failed: {e}")
     except Exception as e:
         logger.warning(f"game_arb: odds fetch failed for {game_id}: {e}")
         return None
@@ -231,7 +249,7 @@ def run_game_arb() -> Dict:
         away_team = game["away_team"]
 
         # 1. Sharp win probabilities
-        probs = _get_sharp_probs(odds_client, game_id, home_team, away_team)
+        probs = _get_sharp_probs(odds_client, game_id, home_team, away_team, db)
         if probs is None:
             continue
         home_prob, away_prob = probs

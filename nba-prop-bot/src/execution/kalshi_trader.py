@@ -45,6 +45,7 @@ from typing import Dict, Optional
 from src.clients.exchange_client import ExchangeClient
 from src.data.db import get_db_client
 from src.events.bus import EventBus, get_bus
+from src.models.portfolio_risk import PortfolioRiskManager, ProposedTrade
 from src.utils.async_bridge import make_event_bridge
 from src.utils.logging_utils import get_logger
 
@@ -382,6 +383,31 @@ async def execute_buy(
     if not ok:
         await _log_rejection(sig, reason, db, state)
         return False
+
+    # ── Portfolio Risk Manager (Covariance Sizing) ────────────────────
+    risk_mgr = PortfolioRiskManager(db, bankroll=float(os.getenv("BANKROLL", "1000.0")))
+    proposed = ProposedTrade(
+        ticker=ticker,
+        game_id=game_id,
+        team=team,
+        side=side,
+        market_type=sig.get("market_type", "unknown"),
+        player_name=sig.get("player_name"),
+        model_prob=model_prob,
+        kalshi_price=kalshi_price,
+        edge=edge,
+        raw_kelly_stake=stake_usd,
+        score_diff=sig.get("score_diff", 0),
+        period=sig.get("period", 1),
+        minutes_elapsed=sig.get("minutes_elapsed", 0.0),
+    )
+    sizing = await risk_mgr.size_position(proposed)
+    
+    if sizing.adjusted_stake <= 0:
+        await _log_rejection(sig, f"portfolio risk: {sizing.reason}", db, state)
+        return False
+        
+    stake_usd = sizing.adjusted_stake
 
     ok, reason = await _check_exposure(game_id, team, stake_usd, db)
     if not ok:

@@ -50,11 +50,15 @@ from src.pipelines.sync_injuries import sync_injuries
 from src.pipelines.scout_lines import scout_lines
 from src.execution.executor import session_summary
 from src.pipelines.backup_db import backup_db
-from src.config import SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL, BDL_SHARP_SCAN_INTERVAL
+from src.config import (
+    SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL,
+    BDL_SHARP_SCAN_INTERVAL, OFF_SEASON, OFF_SEASON_AFTER_SYNCS,
+)
 from src.events.bus import get_bus, EventBus
 from src.clients.ws_live_feed import start_live_feed
 from src.pipelines.exchange_arb import run_exchange_arb
 from src.pipelines.game_arb import run_game_arb
+from src.pipelines.sync_sportradar import sync_sportradar_schedule, sync_sportradar_lineups, audit_finished_games
 
 _WATCHDOG_TIMEOUT_SEC = int(os.getenv('WATCHDOG_TIMEOUT_SEC', '300'))  # 5 min default
 # Minimum seconds between scan submissions to prevent duplicate triggers.
@@ -70,6 +74,10 @@ _pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='sched-worker')
 _odds_client: OddsApiClient = OddsApiClient()
 # Number of NBA games scheduled for today (set by job_sync).
 _today_game_count: int = 0
+# Off-season hibernation state (see _update_hibernation).
+_hibernating: bool = (OFF_SEASON == 'true')
+# Consecutive successful syncs that returned zero upcoming events.
+_empty_sync_streak: int = 0
 # Twitter/Nitter monitor — persists across polls to track seen tweet IDs.
 _news_monitor: TwitterNitterMonitor = TwitterNitterMonitor()
 
@@ -127,13 +135,104 @@ def _quota_ok() -> bool:
 
 
 def _is_scan_window() -> bool:
-    """True between 11 AM and 11 PM Eastern Time."""
-    return 11 <= datetime.now(ET).hour < 23
+    """True between 11 AM and 1 AM Eastern Time (next day).
+
+    Extended past midnight for late playoff games (West Coast tips at
+    ~10 PM ET routinely run past midnight).
+    """
+    h = datetime.now(ET).hour
+    return h >= 11 or h < 1
 
 
 def _has_games() -> bool:
     """True when today has at least one NBA game."""
     return _today_game_count > 0
+
+
+# ---------------------------------------------------------------------------
+# Off-season hibernation
+# ---------------------------------------------------------------------------
+
+def _update_hibernation(n_events: int):
+    """
+    Toggle hibernation from the upcoming-event count of a *successful* sync
+    (API failures never advance the streak, so an outage can't hibernate us).
+
+    Auto mode: the Odds API always lists games a few days out in-season —
+    even across the All-Star break — so zero upcoming events for
+    OFF_SEASON_AFTER_SYNCS consecutive daily syncs means the season is over.
+    Wake as soon as events reappear (preseason in October).
+
+    Note: the streak resets on process restart, so a mid-summer redeploy
+    takes OFF_SEASON_AFTER_SYNCS days to re-hibernate. Set OFF_SEASON=true
+    to force it immediately.
+    """
+    global _hibernating, _empty_sync_streak
+
+    if OFF_SEASON == 'true':
+        _hibernating = True
+        return
+    if OFF_SEASON == 'false':
+        _hibernating = False
+        return
+
+    if n_events == 0:
+        _empty_sync_streak += 1
+        if not _hibernating and _empty_sync_streak >= OFF_SEASON_AFTER_SYNCS:
+            _hibernating = True
+            logger.info(
+                f"Entering off-season hibernation "
+                f"({_empty_sync_streak} consecutive syncs with no upcoming events)."
+            )
+            try:
+                bot.send_message(
+                    "😴 <b>Off-season hibernation</b>\n\n"
+                    f"No upcoming NBA events for {_empty_sync_streak} days — season over.\n"
+                    "Pausing scans, injury polling, retrains and daily analytics.\n"
+                    "Daily 1-credit sync continues; the bot wakes itself when the "
+                    "schedule returns. Weekly check-in every Monday."
+                )
+            except Exception:
+                pass
+    else:
+        _empty_sync_streak = 0
+        if _hibernating:
+            _hibernating = False
+            logger.info(f"Waking from hibernation: {n_events} upcoming event(s) found.")
+            try:
+                bot.send_message(
+                    "🌅 <b>Season's back!</b>\n\n"
+                    f"{n_events} upcoming NBA event(s) on the schedule.\n"
+                    "Resuming full scanning, analytics and training cadence."
+                )
+            except Exception:
+                pass
+
+
+def _hibernate_heartbeat():
+    """Weekly Monday check-in + DB backup while hibernating."""
+    if datetime.now(ET).weekday() != 0:
+        return
+    try:
+        bot.send_message(
+            "😴 <b>Hibernation check-in</b>\n"
+            f"No upcoming NBA events ({_empty_sync_streak} day streak).\n"
+            f"Credits remaining: {_odds_client.requests_remaining}\n"
+            "Will wake automatically when the schedule returns."
+        )
+    except Exception:
+        pass
+    submit_job("Backup [hibernate]", backup_db)
+
+
+def unless_hibernating(func, job_name: str):
+    """Wrap a scheduled job so it no-ops during off-season hibernation."""
+    def _wrapped():
+        if _hibernating:
+            logger.debug(f"{job_name} skipped: off-season hibernation.")
+            return
+        return func()
+    return _wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +305,11 @@ def job_sync():
         )
         logger.info(f"Sync: {_today_game_count} NBA game(s) today ({today_str}). "
                     f"Quota remaining: {_odds_client.requests_remaining}")
+        _update_hibernation(len(fetched_events))
+        if _hibernating:
+            logger.info("Sync: off-season hibernation active — daily jobs paused.")
+            _hibernate_heartbeat()
+            return
         if _today_game_count > 0:
             bot.send_message(
                 f"📅 <b>Today:</b> {_today_game_count} NBA game(s). Scanning active.\n"
@@ -216,6 +320,8 @@ def job_sync():
     except Exception as e:
         logger.error(f"Sync quota check failed: {e}")
 
+    if _hibernating:
+        return
     # Pass the already-fetched events so sync_events doesn't need a second get_events() call.
     notify("Sync", sync_events, fetched_events or None)
 
@@ -230,10 +336,9 @@ def job_scan():
     if not _quota_ok():
         msg = (f"⚠️ Odds API quota low "
                f"({_odds_client.requests_remaining} credits remaining, floor={QUOTA_FLOOR})"
-               f" — scan suspended.")
+               f" — relying on Sportradar fallback.")
         logger.warning(msg)
-        bot.send_message(msg)
-        return
+        # We no longer return early here, so the Sportradar fallback can execute.
 
     def _run_and_summarise():
         scan_props()
@@ -267,8 +372,7 @@ def job_clv():
     if not _has_games():
         return
     if not _quota_ok():
-        logger.warning("CLV update skipped: quota low.")
-        return
+        logger.warning("CLV update: Odds API quota low — relying on Sportradar fallback.")
     submit_job("Update CLV", update_clv_lines)
 
 
@@ -300,8 +404,7 @@ def job_scout_lines():
     if not _is_scan_window():
         return
     if not _quota_ok():
-        logger.warning("Scout skipped: quota low.")
-        return
+        logger.warning("Scout: Odds API quota low — relying on Sportradar fallback.")
     try:
         result = scout_lines(_odds_client)
         if result['records_written'] > 0:
@@ -463,6 +566,18 @@ def job_exchange_arb():
     submit_job("Exchange Arb", run_exchange_arb)
 
 
+def job_sr_lineups():
+    """Sync official lineups from Sportradar (once every 30m)."""
+    if not _has_games() or not _is_scan_window():
+        return
+    submit_job("Sportradar Lineups", sync_sportradar_lineups)
+
+
+def job_sr_audit():
+    """Audit finished games via Sportradar boxscores/PBP."""
+    notify("Sportradar Audit", audit_finished_games)
+
+
 def job_game_arb():
     """Compare model win probs vs Kalshi game markets. No-op when KALSHI_API_KEY unset."""
     if not _has_games():
@@ -495,22 +610,28 @@ def start_scheduler():
         bus.subscribe(EventBus.INJURY_NEWLY_OUT, _on_injury_event)
         logger.info("Redis EventBus subscriptions active.")
 
-    # --- Daily free jobs (run every day regardless of game schedule) ---
-    schedule.every().day.at("01:00").do(job_train_calibration) # Nightly calibration model training
-    schedule.every().day.at("03:00").do(job_backup_db)       # daily DB backup
-    schedule.every().day.at("04:00").do(job_settle)         # settle previous night
-    schedule.every().day.at("04:30").do(job_execution_summary)  # paper P&L recap
-    schedule.every().day.at("05:00").do(job_drift_monitor)  # drift check after settlement
-    schedule.every().day.at("09:00").do(job_sync)           # 1 credit; sets game count
-    schedule.every().day.at("09:05").do(job_morning_briefing)  # subscriber daily briefing
-    schedule.every().day.at("09:15").do(job_stats)
-    schedule.every().day.at("09:30").do(job_calibration)
-    schedule.every().day.at("09:45").do(job_tune)
-    schedule.every().day.at("10:00").do(job_market_stats)
-    schedule.every().day.at("10:15").do(job_timing_analysis)
-    schedule.every(6).hours.do(job_exposure)
-    schedule.every().sunday.at("03:00").do(job_train_ml)    # weekly ML retrain (off-peak)
-    schedule.every(30).days.at("04:00").do(job_train_clv_ml)  # monthly CLV-weighted retrain
+    # --- Daily free jobs (run every day in-season; paused during hibernation,
+    #     when there is no new data to settle, analyze or train on) ---
+    def daily(t, func, name):
+        schedule.every().day.at(t).do(unless_hibernating(func, name))
+
+    daily("01:00", job_train_calibration, "Train Calibration")  # nightly calibration training
+    daily("03:00", job_backup_db,         "Backup DB")          # daily DB backup (weekly while hibernating)
+    daily("04:00", job_settle,            "Settle")             # settle previous night
+    daily("04:15", job_sr_audit,          "Sportradar Audit")   # post-game audit
+    daily("04:30", job_execution_summary, "Execution Summary")  # paper P&L recap
+    daily("05:00", job_drift_monitor,     "Drift Monitor")      # drift check after settlement
+    schedule.every().day.at("09:00").do(job_sync)               # 1 credit; sets game count + hibernation
+    daily("09:00", sync_sportradar_schedule, "Sportradar Schedule")
+    daily("09:05", job_morning_briefing,  "Morning Briefing")   # subscriber daily briefing
+    daily("09:15", job_stats,             "Stats")
+    daily("09:30", job_calibration,       "Calibration")
+    daily("09:45", job_tune,              "Tune")
+    daily("10:00", job_market_stats,      "Market Stats")
+    daily("10:15", job_timing_analysis,   "Timing Analysis")
+    schedule.every(6).hours.do(unless_hibernating(job_exposure, "Exposure"))
+    schedule.every().sunday.at("03:00").do(unless_hibernating(job_train_ml, "Train ML"))  # weekly retrain
+    schedule.every(30).days.at("04:00").do(unless_hibernating(job_train_clv_ml, "Train ML [CLV]"))
 
     # --- Game-day guarded jobs (skip when no games or outside window) ---
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # ~11 credits each
@@ -520,7 +641,9 @@ def start_scheduler():
     schedule.every(5).minutes.do(job_game_arb)                  # 0 credits (Kalshi game markets, no-op when key unset)
     schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
     # Injury feed: free (BDL/scrape). Run frequently — late scratches move minutes hard.
-    schedule.every(15).minutes.do(job_sync_injuries)
+    schedule.every(15).minutes.do(unless_hibernating(job_sync_injuries, "Sync Injuries"))
+    # Sportradar Lineup Verification (official starters)
+    schedule.every(30).minutes.do(job_sr_lineups)
     # Fast line scout: 1 credit/game, fetches sharp lines between full scans.
     # Feeds steam detection with data every BDL_SHARP_SCAN_INTERVAL (default 30 min)
     # rather than every 90 min scan cycle.
@@ -533,18 +656,21 @@ def start_scheduler():
 
     # Run sync immediately so _today_game_count is set before first scan.
     job_sync()
-    # Prime injury cache before first scan so projections see fresh status.
-    job_sync_injuries()
-    # Attempt an immediate scan if there are games today (non-blocking).
-    if _has_games() and _is_scan_window() and _quota_ok():
-        _maybe_submit_scan("STARTUP")
+    if not _hibernating:
+        # Prime injury cache before first scan so projections see fresh status.
+        job_sync_injuries()
+        # Attempt an immediate scan if there are games today (non-blocking).
+        if _has_games() and _is_scan_window() and _quota_ok():
+            _maybe_submit_scan("STARTUP")
 
     logger.info(
         f"Scheduler live. "
         f"Scan every {SCAN_INTERVAL_MINUTES}min | "
         f"Quota floor: {QUOTA_FLOOR} credits | "
         f"Twitter poll: every {TWITTER_POLL_INTERVAL}s | "
-        f"Active window: 11am–11pm ET on game days only."
+        f"Active window: 11am–11pm ET on game days only | "
+        f"Off-season mode: {OFF_SEASON}"
+        + (" (HIBERNATING)" if _hibernating else "")
     )
 
     while True:

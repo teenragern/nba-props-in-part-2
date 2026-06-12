@@ -24,7 +24,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 
 from src.data.db import get_db_client
-from src.clients.odds_api import OddsApiClient
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.sportradar_client import SportradarClient
 from src.models.devig import decimal_to_implied_prob
 from src.utils.logging_utils import get_logger
 
@@ -139,10 +140,25 @@ def update_clv_lines() -> None:
         # One API call per event (not per player)
         markets_needed = list({t['market'] for t in trackers})
         try:
-            odds_data = odds_client.get_event_odds(
-                event_id=event_id,
-                markets=markets_needed,
-            )
+            if event_id.startswith("sr:"):
+                logger.info(f"CLV: event_id {event_id} is a Sportradar ID. Fetching directly from Sportradar.")
+                sr_client = SportradarClient()
+                odds_data = sr_client.get_event_odds_oddsapi_format(event_id)
+            else:
+                try:
+                    odds_data = odds_client.get_event_odds(
+                        event_id=event_id,
+                        markets=markets_needed,
+                    )
+                except OddsApiQuotaError:
+                    logger.warning(f"CLV: Odds API out of credits for event {event_id}. Falling back to Sportradar.")
+                    with db.get_conn() as conn:
+                        row = conn.execute("SELECT sr_id FROM games WHERE game_id = ?", (event_id,)).fetchone()
+                        if row and row['sr_id']:
+                            sr_client = SportradarClient()
+                            odds_data = sr_client.get_event_odds_oddsapi_format(row['sr_id'])
+                        else:
+                            raise Exception("No sr_id available for fallback.")
         except Exception as exc:
             logger.warning(f"CLV: odds fetch failed for event {event_id}: {exc}")
             continue

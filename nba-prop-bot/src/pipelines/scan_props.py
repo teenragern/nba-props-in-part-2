@@ -31,9 +31,12 @@ from typing import List, Dict, Any, Tuple, Optional
 import os
 import pandas as pd
 
+from src.data.db import get_db_client
+from src.events.bus import get_bus
 from src.utils.logging_utils import get_logger
-from src.data.db import DatabaseClient, get_db_client
+from src.data.db import DatabaseClient
 from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.sportradar_client import SportradarClient
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
@@ -43,7 +46,11 @@ from src.config import (
     PLAYOFF_EDGE_MIN, PLAYOFF_SHARP_EDGE_MIN,
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
+    ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
 )
+
+# Elimination games: bump every floor; 0.0 keeps regular behaviour.
+_ELIM_BUMP = ELIMINATION_EDGE_BUMP if ELIMINATION_MODE else 0.0
 from src.models.projections import build_player_projection
 from src.models.distributions import (
     get_probability_distribution,
@@ -873,8 +880,17 @@ def scan_props():
                     sharp_bookmakers = sharp_odds.get('bookmakers', [])
                 except OddsApiQuotaError:
                     ODDS_API_DEAD = True
-                    logger.warning(f"Odds API quota exceeded — skipping sharp fetch for {event_id}")
+                    logger.warning(f"Odds API quota exceeded — falling back to Sportradar for {event_id}")
                     sharp_bookmakers = []
+                    
+                    if bdl_game_id:
+                        with db.get_conn() as conn:
+                            cur = conn.execute("SELECT sr_id FROM games WHERE game_id = %s", (str(event_id),))
+                            row = cur.fetchone()
+                            if row and row['sr_id']:
+                                sr_client = SportradarClient()
+                                sr_odds = sr_client.get_event_odds_oddsapi_format(row['sr_id'])
+                                sharp_bookmakers = sr_odds.get('bookmakers', [])
                 except Exception as _se:
                     logger.debug(f"Sharp book fetch skipped for {event_id}: {_se}")
             elif not ODDS_API_DEAD:
@@ -916,8 +932,18 @@ def scan_props():
                 )
             except OddsApiQuotaError:
                 ODDS_API_DEAD = True
-                logger.error("Odds API out of credits during legacy scan.")
-                continue
+                logger.error("Odds API out of credits during legacy scan. Falling back to Sportradar.")
+                
+                # We don't have bdl_game_id here usually, try fetching sr_id by home_team
+                with db.get_conn() as conn:
+                    cur = conn.execute("SELECT sr_id FROM games WHERE home_team ILIKE %s AND commence_time::date = %s", 
+                                       (f"%{home_team}%", today))
+                    row = cur.fetchone()
+                    if row and row['sr_id']:
+                        sr_client = SportradarClient()
+                        odds_data = sr_client.get_event_odds_oddsapi_format(row['sr_id'])
+                    else:
+                        continue
             except Exception:
                 continue
 
@@ -1800,6 +1826,7 @@ def scan_props():
 
                     # ── Playoff Rotation Adjustments ──────────────────────────
                     if PLAYOFF_MODE:
+                        _is_deep_bench = False
                         if starter_flag:
                             # Starters play heavier minutes in the playoffs (boost by ~10%).
                             # Cap at 43 normally, lift to 47 in elimination/closeout games
@@ -1807,10 +1834,12 @@ def scan_props():
                             _elim = bool(proj.get('must_win') or proj.get('closeout_opportunity'))
                             _cap  = 47.0 if _elim else 43.0
                             proj['projected_minutes'] = min(_cap, proj['projected_minutes'] * 1.10)
-                            proj['mean'] *= 1.10
+                            # Mean scales naturally with minutes; only apply usage
+                            # consolidation bump below, not a duplicate 10% here.
                             # Minutes are more predictable for starters, reducing variance
                             proj['variance_scale'] = proj.get('variance_scale', 1.0) * 0.85
                         elif proj['projected_minutes'] < 16.0:
+                            _is_deep_bench = True
                             # Deep bench gets squeezed out of the rotation
                             proj['projected_minutes'] *= 0.50
                             proj['mean'] *= 0.50
@@ -1824,18 +1853,47 @@ def scan_props():
                         # heavy-minute playoff games; non-starters get frozen out.
                         if starter_flag and proj['projected_minutes'] > 36.0:
                             proj['mean'] *= 1.03
-                        elif not starter_flag:
+                        elif not starter_flag and not _is_deep_bench:
+                            # Only apply usage freeze-out to regular bench, not deep
+                            # bench who already got the 0.50 cut above.
                             proj['mean'] *= 0.88
 
                     # XGBoost blend
                     _league_avg_pace = pace_info.get('league_avg', 99.0)
+                    _home_pace = pace_info['home_pace']
+                    _away_pace = pace_info['away_pace']
                     if PLAYOFF_MODE:
                         # Playoff pace runs ~3% slower than regular season.
+                        # Dampen team paces too — RS averages overstate playoff tempo.
                         _league_avg_pace = min(_league_avg_pace, 96.0)
+                        _home_pace = _home_pace * 0.97
+                        _away_pace = _away_pace * 0.97
                     _pace_factor = (
-                        (pace_info['home_pace'] + pace_info['away_pace'])
+                        (_home_pace + _away_pace)
                         / (2.0 * _league_avg_pace)
                     )
+                    # ── Live Usage Adjustment (Redis-backed) ──────────────────
+                    live_usage = {}
+                    if player_id_int:
+                        bus = get_bus()
+                        if bus.is_available():
+                            redis_client = bus._client
+                            try:
+                                live_data = redis_client.hgetall(f"live_usage:{player_id_int}")
+                                if live_data:
+                                    live_usage = {
+                                        'real_usage_pct': float(live_data.get('real_usage_pct', 0.0)),
+                                        'ts_pct': float(live_data.get('ts_pct_5g', 0.0)),
+                                        'confidence': float(live_data.get('confidence', 0.0))
+                                    }
+                                    if live_usage['confidence'] >= 0.3:
+                                        logger.info(
+                                            f"Live usage hit: {player_name} usage={live_usage['real_usage_pct']:.3f} "
+                                            f"ts={live_usage['ts_pct']:.3f} (confidence={live_usage['confidence']:.2f})"
+                                        )
+                            except Exception as e:
+                                logger.debug(f"Redis live_usage lookup failed for {player_name}: {e}")
+
                     _opp_abbr_ml = TEAM_NAME_TO_ABBR.get(opp_team, opp_team.split()[-1][:3].upper())
                     ml_mean = get_ml_projection(
                         base_mkt, logs, proj['projected_minutes'], home_flag, rest_days,
@@ -1849,7 +1907,7 @@ def scan_props():
                         travel_miles=_fatigue['miles_traveled'],
                         tz_shift_hours=_fatigue['tz_shift_hours'],
                         altitude_flag=_fatigue['altitude_flag'],
-                        real_usage_pct=_bdl_profile.get('real_usage_pct', 0.0),
+                        real_usage_pct=live_usage.get('real_usage_pct') or _bdl_profile.get('real_usage_pct', 0.0),
                         avg_touches=_bdl_profile.get('avg_touches', 0.0),
                         pnr_bh_freq=_bdl_profile.get('pnr_bh_freq', 0.0),
                         pnr_roll_freq=_bdl_profile.get('pnr_roll_freq', 0.0),
@@ -1858,7 +1916,7 @@ def scan_props():
                         transition_freq=_bdl_profile.get('transition_freq', 0.0),
                         postup_freq=_bdl_profile.get('postup_freq', 0.0),
                         drives_per_game=_bdl_profile.get('drives_per_game', 0.0),
-                        ts_pct=_bdl_profile.get('ts_pct', 0.0),
+                        ts_pct=live_usage.get('ts_pct') or _bdl_profile.get('ts_pct', 0.0),
                         avg_speed=_bdl_profile.get('avg_speed', 0.0),
                         avg_contested_fg_pct=_bdl_profile.get('avg_contested_fg_pct', 0.0),
                         avg_deflections=_bdl_profile.get('avg_deflections', 0.0),
@@ -1867,7 +1925,11 @@ def scan_props():
                         player_foul_rate=_player_foul_rate,
                     )
                     if ml_mean is not None and ml_mean > 0:
-                        proj['mean'] = 0.5 * proj['mean'] + 0.5 * ml_mean
+                        # In playoffs, lean on the Bayesian projection (recency-
+                        # weighted averages) since the ML model was trained mostly
+                        # on regular-season data with limited playoff samples.
+                        _bayes_w = 0.60 if PLAYOFF_MODE else 0.50
+                        proj['mean'] = _bayes_w * proj['mean'] + (1.0 - _bayes_w) * ml_mean
                         proj['ml_blend'] = True
 
                     # BDL playtype × opponent boost
@@ -2041,7 +2103,16 @@ def scan_props():
                         "sharp_line_shift": _sharp_shift,
                     }
 
-                    if best_over.get('price', 0) > 0 and imp_over > 0:
+                    # ── Line sanity check ─────────────────────────────────
+                    # Reject lines that are physically implausible given the
+                    # model's projection.  A line > 1.5x mean (OVER) or
+                    # < 0.30x mean (UNDER) almost always means a stale
+                    # alt-line with inflated model probability.
+                    _proj_mean = proj.get('mean', 0.0)
+                    _line_too_high = _proj_mean > 0 and line > _proj_mean * 1.5
+                    _line_too_low  = _proj_mean > 0 and line < _proj_mean * 0.30
+
+                    if best_over.get('price', 0) > 0 and imp_over > 0 and not _line_too_high:
                         over_metrics = db.get_market_metrics(player_name, mkt, line, "OVER")
                         _ts_over = _check_timestamp_staleness(
                             sharp_bookmakers, mkt, best_over.get('book')
@@ -2055,8 +2126,13 @@ def scan_props():
                             "implied_prob": imp_over,
                             **over_metrics, **_ts_over,
                         })
+                    elif _line_too_high:
+                        logger.info(
+                            f"Sanity filter: {player_name} {base_mkt} OVER {line} "
+                            f"skipped — {line:.1f} > 1.5x proj mean {_proj_mean:.1f}"
+                        )
 
-                    if best_under.get('price', 0) > 0 and imp_under > 0:
+                    if best_under.get('price', 0) > 0 and imp_under > 0 and not _line_too_low:
                         under_metrics = db.get_market_metrics(player_name, mkt, line, "UNDER")
                         _ts_under = _check_timestamp_staleness(
                             sharp_bookmakers, mkt, best_under.get('book')
@@ -2085,7 +2161,7 @@ def scan_props():
                                 continue
                             rec_implied = decimal_to_implied_prob(rec_price)
                             sharp_gap = true_prob - rec_implied
-                            _sharp_edge_min = PLAYOFF_SHARP_EDGE_MIN if PLAYOFF_MODE else SHARP_EDGE_MIN
+                            _sharp_edge_min = (PLAYOFF_SHARP_EDGE_MIN if PLAYOFF_MODE else SHARP_EDGE_MIN) + _ELIM_BUMP
                             if sharp_gap < _sharp_edge_min:
                                 continue
                             dedup_key = (player_name, mkt, line, chk_side)
@@ -2127,7 +2203,7 @@ def scan_props():
     # ── Rank and alert ────────────────────────────────────────────────
     candidates = calibrate_candidates(candidates, playoff_mode=PLAYOFF_MODE)
     ranked_edges = rank_edges(candidates)
-    _edge_min_floor = PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN
+    _edge_min_floor = (PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN) + _ELIM_BUMP
     actionable = [e for e in ranked_edges if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)]
 
     logger.info(

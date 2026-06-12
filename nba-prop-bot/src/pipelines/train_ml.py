@@ -71,13 +71,36 @@ def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
     if team_stats_df is not None and not team_stats_df.empty and 'PACE' in team_stats_df.columns:
         league_avg_pace = float(team_stats_df['PACE'].mean())
 
+    # Map names to BDL IDs for efficient cache lookup
+    logger.info("Fetching BDL player mapping...")
+    bdl_client = BDLClient()
+    bdl_players = bdl_client.get_active_players()
+    name_to_bdl_id = {
+        f"{p['first_name']} {p['last_name']}".strip().lower(): p['id']
+        for p in bdl_players
+    }
+    
+    # Also get NBA ID -> Name mapping to bridge the two
+    from nba_api.stats.static import players as nba_players
+    nba_id_to_name = {
+        p['id']: p['full_name'].lower()
+        for p in nba_players.get_players() if p['is_active']
+    }
+
     # Collect all logs
     player_logs: List[pd.DataFrame] = []
     for idx, pid in enumerate(player_ids):
+        name = nba_id_to_name.get(pid)
+        bdl_id = name_to_bdl_id.get(name) if name else None
+        
+        if not bdl_id:
+            logger.warning(f"Could not find BDL ID for player {name} ({pid}). Skipping.")
+            continue
+
         season_dfs = []
         for season in seasons:
             szn_int = int(season.split('-')[0])
-            df = bdl_logs.get_player_game_logs(pid, szn_int, ignore_ttl=True)
+            df = bdl_logs.get_player_game_logs(bdl_id, szn_int, ignore_ttl=True)
             if not df.empty:
                 season_dfs.append(df)
 

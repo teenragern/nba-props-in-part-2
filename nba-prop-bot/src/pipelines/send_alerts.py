@@ -3,7 +3,8 @@ from typing import Dict, Any, List, Optional
 from src.utils.logging_utils import get_logger
 from src.clients.telegram_bot import TelegramBotClient
 from src.data.db import DatabaseClient, get_db_client
-from src.config import BANKROLL, KELLY_FRACTION
+from src.clients.sportradar_client import SportradarClient
+from src.config import BANKROLL, KELLY_FRACTION, ELIMINATION_MODE, ELIMINATION_KELLY_MULT
 from src.execution.executor import record_execution
 
 logger = get_logger(__name__)
@@ -21,6 +22,9 @@ _MARKET_SHORT: Dict[str, str] = {
 
 
 _CROSS_GAME_KELLY_MULTIPLIER = 0.5   # cross-game parlays have no structural edge
+
+# Elimination games: stakes cut across the board (garbage-time variance).
+_ELIM_KELLY_MULT = ELIMINATION_KELLY_MULT if ELIMINATION_MODE else 1.0
 
 
 def _parlay_kelly_stake(
@@ -45,6 +49,7 @@ def _parlay_kelly_stake(
     event_ids = {leg.get('event_id', '') for leg in legs if leg.get('event_id')}
     is_sgp = len(event_ids) <= 1
     effective_kelly = KELLY_FRACTION if is_sgp else KELLY_FRACTION * _CROSS_GAME_KELLY_MULTIPLIER
+    effective_kelly *= _ELIM_KELLY_MULT
 
     stake = BANKROLL * (ev / (combined_decimal - 1)) * effective_kelly
     stake = min(stake, BANKROLL * max_pct)
@@ -123,7 +128,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     else:
         isotonic_confidence_multiplier = 1.0
 
-    dynamic_kelly = KELLY_FRACTION * covariance_multiplier * isotonic_confidence_multiplier
+    dynamic_kelly = KELLY_FRACTION * covariance_multiplier * isotonic_confidence_multiplier * _ELIM_KELLY_MULT
 
     # Kelly formula: f* = ev / (odds - 1)
     ev    = edge_data.get('ev', 0.0)
@@ -185,6 +190,15 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         )
         + f"\n<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
     )
+
+    # Attempt to attach Sportradar Logo
+    # This requires a Sportradar player ID, which we may look up or receive via edge_data
+    sr_player_id = edge_data.get('sr_player_id')
+    if sr_player_id:
+        sr_client = SportradarClient()
+        logo_url = sr_client.get_player_logo_url(sr_player_id)
+        # Add an invisible link to force Telegram link preview of the image
+        msg = f"<a href='{logo_url}'>&#8205;</a>" + msg
 
     # Send immediately to all subscribers so they get the edge before the line moves.
     try:

@@ -5,6 +5,8 @@ from src.config import (
     PLAYOFF_EDGE_MIN,
     PER_MARKET_EDGE_MIN,
     ALT_TO_BASE_MARKET,
+    ELIMINATION_MODE,
+    ELIMINATION_EDGE_BUMP,
 )
 from src.models.distributions import get_probability_distribution
 
@@ -112,11 +114,17 @@ def compute_dynamic_edge_min(hours_to_tipoff: float, market: str = '') -> float:
     late = max(_LATE_EDGE_MIN, market_floor)
 
     if hours_to_tipoff >= _EARLY_HOURS:
-        return early
-    if hours_to_tipoff <= _LATE_HOURS:
-        return late
-    t = (hours_to_tipoff - _LATE_HOURS) / (_EARLY_HOURS - _LATE_HOURS)
-    return round(late + t * (early - late), 4)
+        floor = early
+    elif hours_to_tipoff <= _LATE_HOURS:
+        floor = late
+    else:
+        t = (hours_to_tipoff - _LATE_HOURS) / (_EARLY_HOURS - _LATE_HOURS)
+        floor = round(late + t * (early - late), 4)
+
+    if ELIMINATION_MODE:
+        # Elimination games: sharpest markets of the year + garbage-time risk.
+        floor += ELIMINATION_EDGE_BUMP
+    return floor
 
 
 def set_db(db):
@@ -215,9 +223,11 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif velocity < -0.02 and edge > 0:
             edge *= 0.80  # fade anti-steam
 
-        # Real-time stale line: sharp repriced within 2 min, retail hasn't caught up
+        # Real-time stale line: sharp repriced within 2 min, retail hasn't caught up.
+        # In playoffs sharp books suspend markets faster, so a stale timestamp
+        # is more likely a pulled market than a hidden edge — use a smaller boost.
         if c.get('timestamp_stale') and edge > 0:
-            edge *= 1.20  # velocity premium — chase before retail wakes up
+            edge *= 1.10 if _state.get('playoff_mode') else 1.20
 
         if dispersion > 0.04:
             edge *= 1.05  # inefficient market
