@@ -195,12 +195,19 @@ class TelegramBotClient:
                 return False
 
         def _send(chat_id, text):
+            # Sent as PLAIN TEXT (no parse_mode): copilot answers are free-form
+            # LLM prose and routinely contain '<', '>' or '&' (e.g. "prob > implied"),
+            # which Telegram's HTML parser rejects with a 400. requests.post does not
+            # raise on a 400, so an HTML send would fail silently and the user would
+            # get nothing. The /start and /stats handlers build their own safe HTML.
             try:
-                requests.post(
+                resp = requests.post(
                     f"{self.base_url}/sendMessage",
-                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                    json={"chat_id": chat_id, "text": text},
                     timeout=10,
                 )
+                if not resp.ok:
+                    logger.warning("Telegram send failed (%s): %s", resp.status_code, resp.text[:200])
             except Exception as e:
                 logger.debug(f"Telegram send error: {e}")
 
