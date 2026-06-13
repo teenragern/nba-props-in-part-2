@@ -52,7 +52,7 @@ def _fetch_settled(db: DatabaseClient, limit: Optional[int] = None,
     Return [(model_prob, won)] from settled non-push alerts, newest-first.
     model_prob = edge + 1/odds  (reconstructed; same as train_calibration.py).
     """
-    where_clauses = ["b.push = 0", "b.won IS NOT NULL", "a.odds > 1.0"]
+    where_clauses = ["b.push = FALSE", "b.won IS NOT NULL", "a.odds > 1.0"]
     if market:
         where_clauses.append("a.market = ?")
     where = " AND ".join(where_clauses)

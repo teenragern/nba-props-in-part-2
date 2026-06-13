@@ -469,3 +469,19 @@ CREATE TABLE IF NOT EXISTS futures_odds (
 );
 
 CREATE INDEX IF NOT EXISTS idx_futures_odds_market ON futures_odds(market_name, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS lineups_official (
+    game_id     TEXT    NOT NULL,
+    player_name TEXT    NOT NULL,
+    team        TEXT    NOT NULL,
+    is_starter  BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (game_id, player_name)
+);
+
+CREATE TABLE IF NOT EXISTS sportradar_audit_logs (
+    game_id      TEXT PRIMARY KEY,
+    pbp_saved    BOOLEAN DEFAULT FALSE,
+    box_saved    BOOLEAN DEFAULT FALSE,
+    audited_at   TIMESTAMPTZ DEFAULT NOW()
+);
