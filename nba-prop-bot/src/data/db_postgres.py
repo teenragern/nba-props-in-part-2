@@ -1130,6 +1130,32 @@ class PostgresDatabaseClient:
             )
             return cur.fetchone()['id']
 
+    def get_recent_alerts(self, limit: int = 20, hours_back: int = 36) -> list:
+        """
+        Return recent alerts_sent rows (most recent first), LEFT JOINed with
+        their settled result, for the Quant Edge Copilot to narrate over.
+
+        Mirrors DatabaseClient.get_recent_alerts. The time cutoff is computed
+        in Python so the query stays identical across both backends.
+        """
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_conn() as conn:
+            cur = conn.execute(
+                """
+                SELECT a.id, a.player_name, a.market, a.line, a.side, a.edge,
+                       a.book, a.odds, a.stake, a.raw_model_prob, a.model_prob,
+                       a.timestamp, b.won, b.push, b.actual_result
+                FROM alerts_sent a
+                LEFT JOIN bet_results b ON b.alert_id = a.id
+                WHERE a.timestamp >= %s
+                ORDER BY a.timestamp DESC
+                LIMIT %s
+                """,
+                (cutoff, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def get_pending_alerts(self, unsent_only: bool = True) -> list:
         where = "WHERE sent_at IS NULL" if unsent_only else ""
         with self.get_conn() as conn:

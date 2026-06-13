@@ -133,13 +133,92 @@ class TelegramBotClient:
             logger.error(f"Async broadcast failed: {e}")
             return 0
 
-    def start_listener(self, db):
+    def start_listener(self, db, copilot=None):
         """
-        Starts a background daemon thread that polls Telegram for /start and /stats.
+        Starts a background daemon thread that polls Telegram for commands and,
+        when the Quant Edge Copilot is enabled, answers free-text questions
+        about the current picks.
+
+        Commands:
+            /start            subscribe to alerts
+            /stats            bot performance summary
+            /ask <question>   ask the copilot (any non-command message also works)
+
+        The copilot is NARRATION-ONLY (it explains picks the quant stack already
+        produced — it never computes edges or invents stats). Access is gated to
+        the owner chat and active subscribers, and rate-limited per chat. Pass
+        `copilot` to inject a custom instance (e.g. in tests); otherwise one is
+        built lazily from config when COPILOT_ENABLED.
         """
         import threading
         import time
         import requests
+        from collections import defaultdict, deque
+
+        from src.config import COPILOT_ENABLED, COPILOT_RATE_MAX, COPILOT_RATE_WINDOW_S
+
+        # Build the copilot lazily; a missing API key simply leaves it disabled.
+        if copilot is None and COPILOT_ENABLED:
+            try:
+                from src.clients.copilot import QuantCopilot
+                copilot = QuantCopilot(db)
+                logger.info("Quant Edge Copilot enabled for Telegram listener.")
+            except Exception as e:
+                logger.warning(f"Copilot disabled (init failed): {e}")
+                copilot = None
+
+        # In-memory per-chat sliding-window rate limiter for copilot questions.
+        _rate: dict = defaultdict(deque)
+
+        def _rate_ok(chat_id: str) -> bool:
+            now = time.time()
+            dq = _rate[chat_id]
+            while dq and now - dq[0] > COPILOT_RATE_WINDOW_S:
+                dq.popleft()
+            if len(dq) >= COPILOT_RATE_MAX:
+                return False
+            dq.append(now)
+            return True
+
+        def _is_allowed(chat_id: str) -> bool:
+            """Owner chat is always allowed; everyone else must be an active subscriber."""
+            if self.chat_id and str(chat_id) == str(self.chat_id):
+                return True
+            try:
+                # NB: '?' placeholder matches the rest of this listener (SQLite path).
+                with db.get_conn() as conn:
+                    row = conn.execute(
+                        "SELECT active FROM subscribers WHERE chat_id = ?", (chat_id,)
+                    ).fetchone()
+                return bool(row and row["active"])
+            except Exception:
+                return False
+
+        def _send(chat_id, text):
+            try:
+                requests.post(
+                    f"{self.base_url}/sendMessage",
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.debug(f"Telegram send error: {e}")
+
+        def _handle_question(chat_id, question):
+            if copilot is None:
+                return  # feature disabled — stay silent on free text
+            if not _is_allowed(chat_id):
+                _send(chat_id, "Send /start to subscribe before using the copilot.")
+                return
+            if not _rate_ok(str(chat_id)):
+                _send(chat_id, "⏳ Too many questions just now — give me a moment and try again.")
+                return
+            try:
+                answer = copilot.answer(question)
+            except Exception as e:
+                logger.warning(f"Copilot answer failed: {e}")
+                answer = "The copilot hit an error. Please try again shortly."
+            _send(chat_id, answer)
 
         def _poll():
             offset = None
@@ -152,17 +231,17 @@ class TelegramBotClient:
                         params["offset"] = offset
                     resp = requests.get(url, params=params, timeout=40)
                     data = resp.json()
-                    
+
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
                         msg = update.get("message")
                         if not msg:
                             continue
-                            
+
                         text = msg.get("text", "").strip()
                         chat_id = str(msg["chat"]["id"])
                         username = msg["from"].get("username", "Unknown")
-                        
+
                         if text == "/start":
                             with db.get_conn() as conn:
                                 conn.execute(
@@ -173,14 +252,20 @@ class TelegramBotClient:
                                     "UPDATE subscribers SET active = 1, username = ? WHERE chat_id = ?",
                                     (username, chat_id)
                                 )
+                            copilot_line = (
+                                "\n💬 Ask me about any pick — e.g. <i>\"why the edge on the "
+                                "best assists prop?\"</i> — or use <code>/ask &lt;question&gt;</code>.\n"
+                                if copilot is not None else "\n"
+                            )
                             welcome = (
                                 "👋 <b>Welcome to NBA Prop Bot!</b>\n\n"
-                                "You are now subscribed to receive +EV prop alerts.\n\n"
+                                "You are now subscribed to receive +EV prop alerts.\n"
+                                f"{copilot_line}\n"
                                 "<i>Disclaimer: All alerts are for informational purposes only. "
                                 "Sports betting involves financial risk. Please bet responsibly.</i>"
                             )
                             requests.post(f"{self.base_url}/sendMessage", json={"chat_id": chat_id, "text": welcome, "parse_mode": "HTML"})
-                            
+
                         elif text == "/stats":
                             with db.get_conn() as conn:
                                 row = conn.execute(
@@ -192,7 +277,14 @@ class TelegramBotClient:
                             win_rate = (w / n * 100) if n > 0 else 0
                             stats_msg = f"📊 <b>Bot Performance</b>\nTotal Settled: {n}\nWin Rate: {win_rate:.1f}%"
                             requests.post(f"{self.base_url}/sendMessage", json={"chat_id": chat_id, "text": stats_msg, "parse_mode": "HTML"})
-                            
+
+                        elif text.startswith("/ask"):
+                            _handle_question(chat_id, text[len("/ask"):].strip())
+
+                        elif text and not text.startswith("/"):
+                            # Any non-command message is treated as a copilot question.
+                            _handle_question(chat_id, text)
+
                 except Exception as e:
                     logger.debug(f"Telegram listener error: {e}")
                     time.sleep(5)

@@ -120,3 +120,35 @@ ALT_TO_BASE_MARKET: dict = {
     "player_blocks_alternate":                  "player_blocks",
     "player_steals_alternate":                  "player_steals",
 }
+
+# ── Quant Edge Copilot (OpenRouter LLM narration layer) ───────────────────────
+# The copilot is a NARRATION-ONLY assistant: it explains picks the quant stack
+# (XGBoost + calibration + edge_ranker) has ALREADY produced. It never computes
+# edges, never invents statistics, and never makes betting decisions. All
+# numbers it cites come verbatim from alerts_sent rows we hand it.
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+COPILOT_ENABLED     = bool(OPENROUTER_API_KEY) and \
+    os.getenv("COPILOT_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Model slugs MUST be valid OpenRouter ids — verify at https://openrouter.ai/models.
+# Narration is a cheap/fast task, so default to a low-cost model; fall back to a
+# stronger model only if the primary errors. Defaults reuse slugs already proven
+# in the sibling unified-sports-bot client.
+COPILOT_MODEL = os.getenv("COPILOT_MODEL", "google/gemini-2.5-flash")
+COPILOT_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv(
+        "COPILOT_FALLBACK_MODELS", "anthropic/claude-sonnet-4,deepseek/deepseek-r1"
+    ).split(",") if m.strip()
+]
+
+# Hard daily spend cap (USD, approximate) before the copilot stops answering.
+COPILOT_DAILY_USD_LIMIT = float(os.getenv("COPILOT_DAILY_USD_LIMIT", "2.0"))
+
+# Per-chat throttle: at most COPILOT_RATE_MAX questions per rolling window.
+COPILOT_RATE_MAX      = int(os.getenv("COPILOT_RATE_MAX", "5"))
+COPILOT_RATE_WINDOW_S = int(os.getenv("COPILOT_RATE_WINDOW_S", "60"))
+
+# Grounding context size: how many recent picks to feed the copilot, how far back.
+COPILOT_CONTEXT_ALERTS = int(os.getenv("COPILOT_CONTEXT_ALERTS", "20"))
+COPILOT_CONTEXT_HOURS  = int(os.getenv("COPILOT_CONTEXT_HOURS", "36"))
